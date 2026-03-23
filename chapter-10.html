@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light only">
+  <title>Chapter 10: Implementation Roadmap — BSearch Technical Guide</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="page-wrapper">
+  <nav class="chapter-nav">
+    <a href="chapter-09.html">&larr; Previous: Infrastructure &amp; Deployment</a>
+    <span class="nav-spacer">|</span>
+    <a href="index.html">Contents</a>
+    <span class="nav-spacer">|</span>
+    <a href="chapter-11.html">Next: Key Design Decisions &rarr;</a>
+  </nav>
+  <div class="chapter-header">
+    <div class="chapter-number">Chapter 10</div>
+    <h1>Implementation Roadmap</h1>
+    <p class="chapter-subtitle">The 6-phase build plan, acceptance tests, and what comes after v1.</p>
+  </div>
+
+  <p>Building BSearch is not a single monolithic effort. It&rsquo;s a sequence of <strong>six phases</strong>, each producing a testable milestone &mdash; something you can run, poke at, and verify before moving on. This chapter lays out those phases, the acceptance tests that confirm the system works end-to-end, the features deliberately left out of v1, and the roadmap for what comes next.</p>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>Think of each phase like a workstream in a sell-side process. You don&rsquo;t try to do everything at once &mdash; you run the data room setup, then the marketing materials, then buyer outreach, then management presentations, then final bids. Each workstream has a deliverable that gates the next one. Same idea here.</p>
+  </div>
+
+  <!-- TIMELINE DIAGRAM -->
+  <h2><span class="section-number">10.1</span> Build Timeline</h2>
+
+  <p>Here&rsquo;s the full build sequence. Each phase has two time estimates: <strong>human time</strong> (how long you&rsquo;ll spend reviewing, testing, and making decisions) and <strong>Claude Code time</strong> (how long the AI takes to write the code). The human time is the bottleneck.</p>
+
+  <pre class="mermaid">
+gantt
+    title BSearch v1 Build Timeline
+    dateFormat  YYYY-MM-DD
+    axisFormat  %b %d
+
+    section Phase 1
+    Scaffold + Infra           :p1, 2026-03-24, 2d
+
+    section Phase 2
+    Parsers + Chunking         :p2, after p1, 5d
+
+    section Phase 3
+    Index + Ingestion          :p3, after p2, 5d
+
+    section Phase 4
+    Query Pipeline             :p4, after p3, 5d
+
+    section Phase 5
+    Web App                    :p5, after p4, 5d
+
+    section Phase 6
+    Integration + Acceptance   :p6, after p5, 3d
+  </pre>
+
+  <p>Total wall-clock time: <strong>~5&ndash;6 weeks</strong> of human effort. Total Claude Code generation time across all phases: roughly <strong>2.5 hours</strong>. The vast majority of your time is spent reviewing generated code, running tests, and making judgment calls &mdash; not writing code yourself.</p>
+
+  <!-- PHASE DEPENDENCY DIAGRAM -->
+  <h2><span class="section-number">10.2</span> Phase Dependencies</h2>
+
+  <p>Each phase builds on the output of the previous one. You can&rsquo;t build the query pipeline until the search index exists, and you can&rsquo;t build the web app until the API is running.</p>
+
+  <pre class="mermaid">
+flowchart LR
+    P1["Phase 1\nScaffold + Infra"] --> P2["Phase 2\nParsers + Chunking"]
+    P2 --> P3["Phase 3\nIndex + Ingestion"]
+    P3 --> P4["Phase 4\nQuery Pipeline"]
+    P4 --> P5["Phase 5\nWeb App"]
+    P5 --> P6["Phase 6\nIntegration +\nAcceptance"]
+
+    style P1 fill:#f5e6d3,stroke:#D4793A,color:#3B2F2F
+    style P2 fill:#f5e6d3,stroke:#D4793A,color:#3B2F2F
+    style P3 fill:#dbeafe,stroke:#4A7FB5,color:#3B2F2F
+    style P4 fill:#dbeafe,stroke:#4A7FB5,color:#3B2F2F
+    style P5 fill:#d4edda,stroke:#2E7D5B,color:#3B2F2F
+    style P6 fill:#d4edda,stroke:#2E7D5B,color:#3B2F2F
+  </pre>
+
+  <hr>
+
+  <!-- THE 6 PHASES -->
+  <h2><span class="section-number">10.3</span> The 6 Phases</h2>
+
+  <!-- PHASE 1 -->
+  <h3>Phase 1: Project Scaffold + Infrastructure</h3>
+  <p><strong>Human: ~2 days &nbsp;|&nbsp; Claude Code: ~20 min</strong></p>
+
+  <p><strong>What gets built:</strong></p>
+  <ul>
+    <li><strong>Monorepo structure</strong> &mdash; the folder layout for the entire project, with separate directories for the API, web app, infrastructure templates, and shared code</li>
+    <li><strong>Bicep templates</strong> &mdash; infrastructure-as-code files that define every Azure resource (search index, function app, Cosmos DB, etc.) so environments can be provisioned with a single command</li>
+    <li><strong>Development environment</strong> &mdash; Python virtual environment, dependency management, linting rules</li>
+    <li><strong>Config system</strong> &mdash; centralized settings using Pydantic BaseSettings (a Python library that validates configuration values and loads them from environment variables)</li>
+    <li><strong>Data models</strong> &mdash; Python type definitions for documents, chunks, entities, and other core objects</li>
+    <li><strong>Graph API client</strong> &mdash; the module for talking to Microsoft&rsquo;s SharePoint API</li>
+    <li><strong>Neo4j Aura provisioning</strong> &mdash; setting up the hosted graph database instance</li>
+  </ul>
+
+  <p><strong>Testable output:</strong> Run <code>az deployment group create</code> and all Azure resources provision successfully. The project structure exists, dependencies install, and the config system loads settings.</p>
+
+  <p><strong>Key risks:</strong> Azure subscription permissions and quota limits. If your subscription doesn&rsquo;t have the right resource providers registered, provisioning will fail with obscure error messages.</p>
+
+  <!-- PHASE 2 -->
+  <h3>Phase 2: Format-Aware Parsers + Chunking</h3>
+  <p><strong>Human: ~1 week &nbsp;|&nbsp; Claude Code: ~30 min</strong></p>
+
+  <p><strong>What gets built:</strong></p>
+  <ul>
+    <li><strong>All 4 parsers</strong> &mdash; Word, Excel, PowerPoint, and PDF (see <a href="chapter-04.html">Chapter 4</a> for details on each)</li>
+    <li><strong>Table splitter</strong> &mdash; hierarchical row-group detection that finds smart split points in large financial tables</li>
+    <li><strong>Document summary generation</strong> &mdash; Haiku-powered summaries for long documents</li>
+    <li><strong>Deal summary generation</strong> &mdash; Haiku + Neo4j entity data to create deal-level overviews</li>
+    <li><strong>Metadata extraction</strong> &mdash; document type classification, deal identification, entity extraction</li>
+    <li><strong>Neo4j client + entity registry + graph cleanup</strong> &mdash; the code that writes entities to the knowledge graph and handles deduplication</li>
+    <li><strong>Embedding provider abstraction</strong> &mdash; a clean interface around the Voyage AI embedding model, designed so the provider can be swapped later without changing the rest of the code</li>
+  </ul>
+
+  <p><strong>Testable output:</strong> Feed a real CIM through the pipeline. Verify that chunks look right &mdash; narrative sections are properly bounded, tables split at logical row groups, slide chunks carry their titles. Inspect the Neo4j graph and see entities with correct relationships.</p>
+
+  <p><strong>Key risks:</strong> Edge cases in real documents. The parsers will work perfectly on clean test files and then encounter a 2018 CIM with nested tables inside text boxes inside grouped shapes. Budget time for iterating on real-world documents.</p>
+
+  <!-- PHASE 3 -->
+  <h3>Phase 3: Search Index + Ingestion Orchestrator</h3>
+  <p><strong>Human: ~1 week &nbsp;|&nbsp; Claude Code: ~30 min</strong></p>
+
+  <p><strong>What gets built:</strong></p>
+  <ul>
+    <li><strong>Azure AI Search index</strong> &mdash; the full schema with all fields, vector configuration, scoring profiles, and synonym maps</li>
+    <li><strong>Durable Functions orchestrator</strong> &mdash; the fan-out/fan-in workflow engine that processes batches of documents in parallel (fan out to parse each file, fan in to collect results and push to the index)</li>
+    <li><strong>Webhook receiver + subscription management</strong> &mdash; the endpoint that SharePoint calls when files change, plus the background job that keeps webhook subscriptions alive</li>
+    <li><strong>Delta sync with Cosmos DB tokens</strong> &mdash; the periodic catch-up mechanism that queries SharePoint for changes since the last known state</li>
+    <li><strong>Near-duplicate dedup</strong> &mdash; filename normalization + embedding similarity to catch &ldquo;v3 FINAL FINAL&rdquo; copies</li>
+    <li><strong>Blue-green re-indexing orchestrator</strong> &mdash; the ability to build a new index alongside the live one and swap them atomically, so re-indexing never causes downtime</li>
+  </ul>
+
+  <div class="definition">
+    <span class="term">Fan-out/fan-in:</span> A pattern where a single job spawns many parallel sub-jobs (fan out) and then waits for all of them to finish before continuing (fan in). Like assigning 10 analysts to each comp a different company, then collecting all the comp sheets to build the final page.
+  </div>
+
+  <p><strong>Testable output:</strong> Ingest 100 real documents. Query Azure AI Search directly and see results with correct metadata, embeddings, and entity fields.</p>
+
+  <p><strong>Key risks:</strong> Webhook reliability and Graph API rate limits. Microsoft throttles API calls per tenant, and webhook notifications can arrive out of order or be delayed. The delta sync fallback exists precisely because webhooks alone aren&rsquo;t 100% reliable.</p>
+
+  <!-- PHASE 4 -->
+  <h3>Phase 4: Query Pipeline</h3>
+  <p><strong>Human: ~1 week &nbsp;|&nbsp; Claude Code: ~30 min</strong></p>
+
+  <p><strong>What gets built:</strong></p>
+  <ul>
+    <li><strong>FastAPI app with SSE endpoint</strong> &mdash; the API server that receives search queries and streams answers back in real time (SSE = Server-Sent Events, the technology that lets the answer appear word by word)</li>
+    <li><strong>Query classifier</strong> &mdash; regex patterns + Haiku to determine query type (file lookup, data extraction, precedent search, or multi-doc synthesis)</li>
+    <li><strong>Query expander</strong> &mdash; static synonyms + Haiku + Neo4j aliases to broaden queries (so &ldquo;multiple&rdquo; also searches for &ldquo;EV/EBITDA&rdquo;)</li>
+    <li><strong>Search client</strong> &mdash; hybrid search (keyword + vector) with entity-based filters</li>
+    <li><strong>Reranker + health monitoring</strong> &mdash; the cross-encoder model that re-scores results for relevance, with automatic fallback if the reranker service degrades</li>
+    <li><strong>Claude synthesis</strong> &mdash; three prompt strategies tailored to different query types</li>
+    <li><strong>Auth</strong> &mdash; Azure AD token validation and SharePoint folder-level permission checks</li>
+  </ul>
+
+  <p><strong>Testable output:</strong> Ask a question via the API. Get a streaming answer with citations that link back to specific chunks and source documents.</p>
+
+  <p><strong>Key risks:</strong> Latency. The query pipeline chains multiple API calls (classify, expand, search, rerank, synthesize), and each adds latency. If any step is slow, the user stares at a blank screen. Time-to-first-token (how quickly the first word of the answer appears) is the critical metric.</p>
+
+  <!-- PHASE 5 -->
+  <h3>Phase 5: Web App</h3>
+  <p><strong>Human: ~1 week &nbsp;|&nbsp; Claude Code: ~30 min</strong></p>
+
+  <p><strong>What gets built:</strong></p>
+  <ul>
+    <li><strong>Vite + React SPA</strong> &mdash; a single-page web application using modern JavaScript tooling</li>
+    <li><strong>Search bar &rarr; SSE stream &rarr; progressive markdown rendering</strong> &mdash; the user types a question, the answer streams in word by word, and formatting (bold, bullet points, tables) renders as it arrives</li>
+    <li><strong>Confidence banners</strong> &mdash; yellow banner for LOW confidence answers, orange banner when the reranker is degraded</li>
+    <li><strong>Deep search indicator</strong> &mdash; visual feedback for multi-document queries that take longer to process</li>
+    <li><strong>Source cards with SharePoint deep links</strong> &mdash; clickable citations that open the source document directly in SharePoint</li>
+    <li><strong>Conversation history</strong> &mdash; past searches are saved and browsable</li>
+    <li><strong>Azure AD auth via Static Web Apps</strong> &mdash; single sign-on using the same firm credentials everyone already has</li>
+  </ul>
+
+  <p><strong>Testable output:</strong> Open a browser, navigate to the app, search for something, and see a streaming answer with citations and source links. Click a source card and land on the right file in SharePoint.</p>
+
+  <p><strong>Key risks:</strong> SSE streaming edge cases in browsers. Some corporate proxy configurations can buffer SSE streams, making the &ldquo;word by word&rdquo; effect appear as a delayed dump. Worth testing from the actual office network early.</p>
+
+  <!-- PHASE 6 -->
+  <h3>Phase 6: Integration + Acceptance Testing</h3>
+  <p><strong>Human: ~3 days &nbsp;|&nbsp; Claude Code: ~20 min</strong></p>
+
+  <p><strong>What gets built:</strong></p>
+  <ul>
+    <li><strong>Full Azure deployment</strong> &mdash; deploy everything to production infrastructure</li>
+    <li><strong>Relevance gate calibration</strong> &mdash; run 30+ queries, analyze score distributions, and set the thresholds that determine when BSearch says &ldquo;I don&rsquo;t know&rdquo; vs. returning low-confidence results</li>
+    <li><strong>BM25 boost weight calibration</strong> &mdash; tune how much keyword match scores are weighted vs. vector similarity scores</li>
+    <li><strong>5 acceptance test queries</strong> &mdash; the final validation suite (detailed below)</li>
+    <li><strong>Scale-up to full document set</strong> &mdash; index all ~550,000 documents and verify performance at scale</li>
+  </ul>
+
+  <p><strong>Testable output:</strong> All 5 acceptance queries return correct answers. The system handles the full 550K document corpus without performance degradation.</p>
+
+  <p><strong>Key risks:</strong> Threshold calibration is empirical, not theoretical. You have to look at real score distributions across dozens of queries to find the right cutoffs. This is more art than science &mdash; expect a few iterations.</p>
+
+  <hr>
+
+  <!-- ACCEPTANCE TESTS -->
+  <h2><span class="section-number">10.4</span> The 5 Acceptance Test Queries</h2>
+
+  <p>These five queries are the final exam. Each one exercises a different capability, and together they validate that the entire system &mdash; from ingestion to synthesis &mdash; works correctly. If all five return good answers, v1 is ready to ship.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Query</th>
+        <th>Type</th>
+        <th>Expected Result</th>
+        <th>What It Validates</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>1</strong></td>
+        <td>&ldquo;Where&rsquo;s the latest GovTech deck?&rdquo;</td>
+        <td>File lookup</td>
+        <td>Latest version with SharePoint link</td>
+        <td>Regex fast path, BM25 on file_name, recency boost</td>
+      </tr>
+      <tr>
+        <td><strong>2</strong></td>
+        <td>&ldquo;Which firms did we reach out to for Govini?&rdquo;</td>
+        <td>Data extraction</td>
+        <td>Firm names with source citations</td>
+        <td>Entity extraction, precise synthesis</td>
+      </tr>
+      <tr>
+        <td><strong>3</strong></td>
+        <td>&ldquo;Find me a good situation overview slide&rdquo;</td>
+        <td>Precedent search</td>
+        <td>Slide-level result from historical deck</td>
+        <td>Slide chunking, cross-deal search</td>
+      </tr>
+      <tr>
+        <td><strong>4</strong></td>
+        <td>&ldquo;What multiple did we use for [deal]?&rdquo;</td>
+        <td>Data extraction</td>
+        <td>EV/EBITDA value from model/summary</td>
+        <td>Synonym expansion (&ldquo;multiple&rdquo; &rarr; &ldquo;EV/EBITDA&rdquo;)</td>
+      </tr>
+      <tr>
+        <td><strong>5</strong></td>
+        <td>&ldquo;Where do we stand on active deals?&rdquo;</td>
+        <td>Multi-doc synthesis</td>
+        <td>Deal-by-deal overview with citations</td>
+        <td>Deal summaries, extended thinking, deep search UX</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <div class="callout-title">Why These 5?</div>
+    <p>Each query maps to a real pattern of how bankers search for information. Query 1 is the most common (&ldquo;where&rsquo;s that file?&rdquo;). Query 5 is the most demanding (&ldquo;synthesize across multiple deals&rdquo;). Together they cover the full spectrum from simple file retrieval to complex multi-document analysis, and they exercise every major subsystem: the regex classifier, keyword search, vector search, entity extraction, synonym expansion, the reranker, and Claude synthesis.</p>
+  </div>
+
+  <hr>
+
+  <!-- NOT IN V1 -->
+  <h2><span class="section-number">10.5</span> What&rsquo;s NOT in v1</h2>
+
+  <p>Scope discipline matters. These features were considered and deliberately deferred. Each one has a clear rationale for why it&rsquo;s not worth the complexity in the initial release.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Item</th>
+        <th>Rationale</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Email ingestion</td>
+        <td>File search alone solves the core pain points. Emails add significant parsing complexity (threads, attachments, forwarding chains) for lower marginal value.</td>
+      </tr>
+      <tr>
+        <td>Teams bot (@BSearch)</td>
+        <td>The web app is the primary interface for v1. A Teams bot is a nice-to-have, not a must-have.</td>
+      </tr>
+      <tr>
+        <td>Claude Vision (image/chart OCR)</td>
+        <td>Text content covers the vast majority of IB document types. Charts and images are rarely the thing people search for.</td>
+      </tr>
+      <tr>
+        <td>Excel model summaries</td>
+        <td>Basic sheet-level chunking first. Deep model comprehension is a v2 feature.</td>
+      </tr>
+      <tr>
+        <td>Full nightly reconciliation</td>
+        <td>Webhooks + delta sync cover most cases. A full reconciliation job (comparing every file in SharePoint against every entry in the index) is an insurance policy, not a launch requirement.</td>
+      </tr>
+      <tr>
+        <td>Multi-tenant / external users</td>
+        <td>BSearch is an internal firm tool. No need for tenant isolation or external access controls.</td>
+      </tr>
+      <tr>
+        <td>Mobile-optimized UI</td>
+        <td>Desktop-first for IB workflows. Bankers search for documents at their desks, not on their phones.</td>
+      </tr>
+      <tr>
+        <td>CI/CD pipeline</td>
+        <td>Set up after v1 ships. Manual deployment is fine for a single-developer project during initial development.</td>
+      </tr>
+      <tr>
+        <td>Rate limiting</td>
+        <td>18 trusted internal users. No risk of abuse or overload at this scale.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout tip">
+    <div class="callout-title">The Scope Rule</div>
+    <p>Every feature that&rsquo;s &ldquo;not in v1&rdquo; could be added in v2 without rearchitecting the system. The design accounts for these future capabilities &mdash; but building them before the core search experience works would be premature optimization.</p>
+  </div>
+
+  <hr>
+
+  <!-- V2+ ROADMAP -->
+  <h2><span class="section-number">10.6</span> v2+ Roadmap</h2>
+
+  <p>Once v1 is live and the team is using it daily, these are the highest-value additions &mdash; roughly in priority order:</p>
+
+  <ul>
+    <li><strong>Full nightly reconciliation job</strong> &mdash; a scheduled sweep that compares every file in SharePoint against the search index, catching anything webhooks and delta sync missed. The ultimate safety net.</li>
+    <li><strong>Adaptive model routing</strong> &mdash; use Haiku for simple queries (file lookups, quick extractions) and Sonnet or Opus for complex ones (multi-doc synthesis, nuanced analysis). Saves cost on easy questions, improves quality on hard ones.</li>
+    <li><strong>User feedback (thumbs up/down)</strong> &mdash; let users rate answers so you can identify weak spots and track improvement over time.</li>
+    <li><strong>Multi-query vector embedding</strong> &mdash; embed the user&rsquo;s query as multiple vectors (one per sub-question) instead of a single vector, improving recall for complex queries.</li>
+    <li><strong>Sibling chunk retrieval</strong> &mdash; when a chunk matches a query, also retrieve the chunks immediately before and after it in the original document. This provides more context to the synthesis step without increasing the initial chunk size.</li>
+    <li><strong>Additional embedding providers + migration tooling</strong> &mdash; the ability to swap in a better embedding model when one becomes available, plus describe-then-embed for charts (generate a text description of a chart, then embed that description).</li>
+    <li><strong>Two-pass extraction for multi-doc synthesis</strong> &mdash; first pass extracts key facts from each source document, second pass synthesizes across all extracted facts. Better for questions that span many documents.</li>
+    <li><strong>Deal summary active injection at query time</strong> &mdash; when a query mentions a specific deal, automatically include that deal&rsquo;s summary in the context even if it didn&rsquo;t rank highly in search results. Guarantees the synthesis has baseline deal context.</li>
+  </ul>
+
+  <hr>
+
+  <!-- EFFORT SUMMARY -->
+  <h2><span class="section-number">10.7</span> Estimated Effort Summary</h2>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Phase</th>
+        <th>Human Time</th>
+        <th>Claude Code Time</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1. Scaffold + Infra</td>
+        <td>~2 days</td>
+        <td>~20 min</td>
+      </tr>
+      <tr>
+        <td>2. Parsers + Chunking</td>
+        <td>~1 week</td>
+        <td>~30 min</td>
+      </tr>
+      <tr>
+        <td>3. Index + Ingestion</td>
+        <td>~1 week</td>
+        <td>~30 min</td>
+      </tr>
+      <tr>
+        <td>4. Query Pipeline</td>
+        <td>~1 week</td>
+        <td>~30 min</td>
+      </tr>
+      <tr>
+        <td>5. Web App</td>
+        <td>~1 week</td>
+        <td>~30 min</td>
+      </tr>
+      <tr>
+        <td>6. Integration + Acceptance</td>
+        <td>~3 days</td>
+        <td>~20 min</td>
+      </tr>
+      <tr>
+        <td><strong>Total</strong></td>
+        <td><strong>~5&ndash;6 weeks</strong></td>
+        <td><strong>~2.5 hours</strong></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <div class="callout-title">Why the Human Time Is So Much Longer</div>
+    <p>Claude Code generates code fast. But building a production system isn&rsquo;t just code generation. You need to review every file it produces, test against real documents, debug edge cases, make design decisions, configure Azure resources, and iterate on search quality. The human time is where judgment lives &mdash; the Claude Code time is where keystrokes live.</p>
+  </div>
+
+  <hr>
+
+  <!-- KEY TAKEAWAY -->
+  <div class="key-takeaway">
+    <div class="callout-title">Key Takeaway</div>
+    <p>BSearch is built in six phases over ~5&ndash;6 weeks, each producing a testable milestone. The phases are strictly sequential &mdash; each one depends on the previous one&rsquo;s output. Five acceptance test queries validate the complete system from file lookup to multi-document synthesis. The v1 scope is deliberately narrow: solve the core search problem for 18 internal users first, then layer on email ingestion, model routing, and advanced features in v2.</p>
+  </div>
+
+  <p>Next, we&rsquo;ll step back from the implementation sequence and examine the <em>reasoning</em> behind BSearch&rsquo;s most important design choices &mdash; the <a href="chapter-11.html">key design decisions</a>.</p>
+
+  <nav class="chapter-nav bottom">
+    <a href="chapter-09.html">&larr; Previous</a>
+    <span class="nav-spacer">|</span>
+    <a href="index.html">Contents</a>
+    <span class="nav-spacer">|</span>
+    <a href="chapter-11.html">Next &rarr;</a>
+  </nav>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad: true, theme: 'neutral'});</script>
+</body>
+</html>

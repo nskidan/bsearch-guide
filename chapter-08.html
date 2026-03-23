@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light only">
+  <title>Chapter 8: Authentication &amp; Permissions &mdash; BSearch Technical Guide</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="page-wrapper">
+  <nav class="chapter-nav">
+    <a href="chapter-07.html">&larr; Previous: Data Model</a>
+    <span class="nav-spacer">|</span>
+    <a href="index.html">Contents</a>
+    <span class="nav-spacer">|</span>
+    <a href="chapter-09.html">Next: Infrastructure &amp; Deployment &rarr;</a>
+  </nav>
+  <div class="chapter-header">
+    <div class="chapter-number">Chapter 8</div>
+    <h1>Authentication &amp; Permissions</h1>
+    <p class="chapter-subtitle">Who can log in, what they can see, and how the system enforces it.</p>
+  </div>
+
+  <p>BSearch holds deal documents across five SharePoint folders, some of which contain highly sensitive information. The system needs to answer two questions on every request: <em>who are you?</em> and <em>what are you allowed to see?</em> This chapter explains how both of those questions are answered &mdash; without requiring anyone at the firm to create a new username or remember another password.</p>
+
+  <!-- ================================================================ -->
+  <!-- 8.1 Azure AD / Entra ID -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">8.1</span> Azure AD / Entra ID</h2>
+
+  <div class="definition">
+    <p><span class="term">Azure Active Directory (Azure AD)</span>, recently rebranded to <span class="term">Microsoft Entra ID</span> &mdash; Microsoft&rsquo;s identity system. It is the service that manages everyone&rsquo;s Microsoft account at Berenson &mdash; the same account you use for Outlook, Teams, and SharePoint.</p>
+  </div>
+
+  <p>Everyone at the firm already has an Azure AD account. BSearch piggybacks on that existing identity instead of creating its own user database. This means:</p>
+
+  <ul>
+    <li><strong>No new passwords.</strong> You sign in with the same Microsoft credentials you already use every day.</li>
+    <li><strong>Single sign-on (SSO).</strong> If you are already logged into Outlook or Teams, BSearch recognizes you automatically &mdash; no second login prompt.</li>
+    <li><strong>Centralized management.</strong> When IT disables someone&rsquo;s Microsoft account (e.g., they leave the firm), they lose BSearch access instantly. No separate offboarding step.</li>
+  </ul>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>Think of Azure AD as the firm&rsquo;s building security badge. Your badge gets you into the lobby, your floor, and the conference rooms you are authorized for. BSearch is like a new room in the building &mdash; it does not issue its own badges; it reads the same badge you already carry.</p>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- 8.2 How Login Works -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">8.2</span> How Login Works</h2>
+
+  <div class="definition">
+    <p><span class="term">OpenID Connect (OIDC)</span> &mdash; An industry-standard protocol for authentication. It is the mechanism that lets one application (BSearch) delegate the &ldquo;who are you?&rdquo; question to another service (Microsoft). You have used OIDC every time you click &ldquo;Sign in with Google&rdquo; or &ldquo;Sign in with Microsoft&rdquo; on a website.</p>
+  </div>
+
+  <div class="definition">
+    <p><span class="term">JWT (JSON Web Token)</span> &mdash; A small, digitally signed data packet that proves who you are. After you log in, Microsoft hands BSearch a JWT &mdash; think of it as a tamper-proof digital ID card with your name, email, and group memberships stamped on it.</p>
+  </div>
+
+  <p>Here is the login flow, step by step:</p>
+
+  <ol>
+    <li>You open BSearch in your browser and click <strong>&ldquo;Sign in with Microsoft.&rdquo;</strong></li>
+    <li>Your browser redirects to Microsoft&rsquo;s login page (the same one you see for Outlook). Azure Static Web Apps handles this automatically via its built-in <code>.auth/login/aad</code> endpoint.</li>
+    <li>You enter your Microsoft credentials (or, if you are already signed in, this step is skipped entirely &mdash; that is SSO in action).</li>
+    <li>Microsoft verifies your identity and redirects you back to BSearch with a <strong>JWT token</strong> attached.</li>
+    <li>On every subsequent request (every search, every page load), the BSearch API receives that token and validates it &mdash; checking that it was genuinely issued by Microsoft, that it has not expired, and that it has not been tampered with.</li>
+  </ol>
+
+  <p>If the token is expired or invalid, the API returns a <strong>401 Unauthorized</strong> response, and BSearch redirects you back to the Microsoft login page to re-authenticate. In practice, tokens last long enough that you rarely see this &mdash; it happens silently in the background.</p>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>The JWT is like a signed engagement letter. It states who the parties are (you and BSearch), it has an expiration date, and it is signed by a trusted authority (Microsoft). If someone forges one or it expires, the deal (your session) does not proceed until a new one is executed.</p>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- 8.3 Folder Permission Model -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">8.3</span> Folder Permission Model</h2>
+
+  <p>BSearch indexes documents from five top-level SharePoint folders. Not everyone at the firm should see every folder. The permission model is simple and deliberate: <strong>access is all-or-nothing per folder.</strong> If you can see a folder, you can see every document in it. If you cannot, none of those documents will appear in your search results.</p>
+
+  <p>A configuration file maps each folder to one or more Azure AD security groups:</p>
+
+  <pre><code>{
+  "Active Deals": ["group-id-1", "group-id-2"],
+  "Closed Deals": ["group-id-1"],
+  "Pipeline": ["group-id-3"],
+  "Templates": ["all"],
+  "Admin": ["group-id-4"]
+}</code></pre>
+
+  <p>Reading this configuration: &ldquo;Active Deals&rdquo; is accessible to members of two AD groups. &ldquo;Templates&rdquo; is accessible to everyone (<code>"all"</code>). &ldquo;Admin&rdquo; is restricted to a single group.</p>
+
+  <p>There is no sub-file permissioning in v1. The system does not check whether you have access to a specific document within a folder &mdash; it checks whether you have access to the folder itself. With only 5 folders and 18 users, this level of granularity is sufficient.</p>
+
+  <div class="callout info">
+    <div class="callout-title">Why not file-level permissions?</div>
+    <p>SharePoint supports fine-grained, file-level permissions, but syncing those permissions into the search index adds significant complexity (see Section 8.6). For a team of 18 people with 5 clearly separated folders, folder-level access is the right trade-off: simple to implement, simple to audit, and simple to explain.</p>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- 8.4 Query-Time Enforcement -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">8.4</span> Query-Time Enforcement</h2>
+
+  <p>The permission model above would be meaningless if it were only enforced in the user interface. Someone could bypass the front-end and hit the API directly. That is why permissions are enforced <strong>at the database level</strong>, on every single search query.</p>
+
+  <p>Here is what happens every time you search:</p>
+
+  <ol>
+    <li><strong>Resolve the user.</strong> The API reads your JWT to determine who you are.</li>
+    <li><strong>Look up group memberships.</strong> The system checks which Azure AD security groups you belong to.</li>
+    <li><strong>Determine permitted folders.</strong> Using the configuration from Section 8.3, the system identifies which of the 5 folders your groups grant access to.</li>
+    <li><strong>Add a filter to the search query.</strong> Before the query is sent to Azure AI Search, a filter is appended: <code>source_folder IN ["Active Deals", "Templates", ...]</code>. This filter runs inside the search engine itself.</li>
+  </ol>
+
+  <p>The critical point: <strong>unauthorized documents never leave the search index.</strong> They are filtered out before the results are scored, before they reach the reranker, and before Claude ever sees them. There is no moment where a restricted document is &ldquo;fetched and then hidden&rdquo; &mdash; it is never fetched in the first place.</p>
+
+  <p>Group membership lookups are cached to avoid calling Microsoft&rsquo;s API on every search. The cache is invalidated when group memberships change (e.g., someone joins or leaves a deal team).</p>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>This is like an information wall (Chinese wall). When you are restricted from a deal, the compliance team does not just hide the folder from your desktop &mdash; the documents are walled off at the server level so you cannot access them through any channel. BSearch&rsquo;s query-time filtering works the same way: the wall is enforced at the data layer, not the UI layer.</p>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- 8.5 App Registration -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">8.5</span> App Registration</h2>
+
+  <div class="definition">
+    <p><span class="term">App Registration</span> &mdash; A configuration in Azure AD that defines what an application is allowed to do. It is how Microsoft knows that BSearch is a legitimate application and what data it can access.</p>
+  </div>
+
+  <p>BSearch needs to read files from SharePoint during the ingestion pipeline (when it pulls documents into the search index). To do this, it uses <strong>application-level permissions</strong> granted through the Graph API:</p>
+
+  <ul>
+    <li><strong>Files.Read.All</strong> &mdash; permission to read all files across SharePoint.</li>
+    <li><strong>Sites.Read.All</strong> &mdash; permission to read site metadata and structure.</li>
+  </ul>
+
+  <p>These are <em>read-only</em> permissions. BSearch cannot modify, delete, or create files on SharePoint. The permissions also require <strong>admin consent</strong> &mdash; a firm administrator must explicitly approve them before BSearch can access anything.</p>
+
+  <p>An important distinction: these application-level permissions are what BSearch uses to <em>ingest</em> documents (pull them into the search index). They are separate from the user-level permissions described in Section 8.3, which control what each person can <em>search</em>. The ingestion pipeline reads everything; the search query filters ensure each user only sees what they are authorized to see.</p>
+
+  <!-- ================================================================ -->
+  <!-- 8.6 What Would Change with Finer Permissions -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">8.6</span> What Would Change with Finer Permissions</h2>
+
+  <p>The current model (5 folders, group-based access) is deliberately simple. If the firm ever needed sub-folder or file-level permissions, here is what would change:</p>
+
+  <ol>
+    <li><strong>Sync SharePoint permissions to the search index.</strong> The ingestion pipeline would need to read the access control list (ACL) for each file in SharePoint and store it alongside the document in the index.</li>
+    <li><strong>Tag every chunk with an ACL field.</strong> Each chunk in the index would carry a list of users and groups permitted to see it.</li>
+    <li><strong>Query filter checks chunk-level ACLs.</strong> Instead of filtering by <code>source_folder</code>, the system would filter by <code>acl CONTAINS user_or_group</code> on every chunk.</li>
+    <li><strong>Permission sync becomes ongoing.</strong> SharePoint permissions can change at any time (someone is added to or removed from a file), so the system would need to detect and propagate those changes to the index.</li>
+  </ol>
+
+  <p>This is all achievable, but it adds real complexity to both the ingestion pipeline and the search query logic. For v1 &mdash; 5 folders, 18 users &mdash; it is not needed. It would be the right investment if the firm expanded BSearch to more teams with overlapping, fine-grained access requirements.</p>
+
+  <div class="key-takeaway">
+    <div class="callout-title">Key Takeaway</div>
+    <p>BSearch does not manage its own identities. It leverages the Microsoft accounts everyone already has, enforces folder-level access through Azure AD group memberships, and applies permission filters at the search-engine level so that unauthorized documents are never retrieved. The model is simple by design &mdash; 5 folders, group-based access, enforced at the data layer.</p>
+  </div>
+
+  <nav class="chapter-nav bottom">
+    <a href="chapter-07.html">&larr; Previous</a>
+    <span class="nav-spacer">|</span>
+    <a href="index.html">Contents</a>
+    <span class="nav-spacer">|</span>
+    <a href="chapter-09.html">Next &rarr;</a>
+  </nav>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad: true, theme: 'neutral'});</script>
+</body>
+</html>

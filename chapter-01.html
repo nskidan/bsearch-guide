@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light only">
+  <title>Chapter 1: Executive Summary — BSearch Technical Guide</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="page-wrapper">
+
+  <nav class="chapter-nav">
+    <a href="index.html">Contents</a>
+    <span class="nav-spacer">|</span>
+    <a href="chapter-02.html">Next: Architecture Overview &rarr;</a>
+  </nav>
+
+  <div class="chapter-header">
+    <div class="chapter-number">Chapter 1</div>
+    <h1>Executive Summary</h1>
+    <p class="chapter-subtitle">What BSearch is, the problem it solves, and why it matters for Berenson.</p>
+  </div>
+
+  <!-- 1.1 What Is BSearch? -->
+  <h2><span class="section-number">1.1</span> What Is BSearch?</h2>
+
+  <p>BSearch is an enterprise search and AI synthesis system built for Berenson &amp; Company. It connects to the firm's Microsoft 365 tenant &mdash; roughly 550,000 documents across SharePoint and OneDrive &mdash; and gives every user the ability to ask questions in plain English and get real answers, not just a list of file links.</p>
+
+  <div class="definition">
+    <p><span class="term">Enterprise search</span> &mdash; A system that lets people search across all of a company's internal documents, email, and files from one place, much like Google but for internal content only.</p>
+  </div>
+
+  <p>When someone types a query like <em>"What was the EV/EBITDA for the Acme deal?"</em>, BSearch does not just find the relevant CIM or model &mdash; it reads the documents, extracts the answer, and streams back a written response with source citations. You can also ask broader questions like <em>"What healthcare deals have we worked on in the last two years?"</em> and get a synthesized summary drawn from multiple files.</p>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>Think of BSearch as a junior analyst who has read every document in every deal folder, remembers all of it, and can answer any question about any deal in under five seconds &mdash; without ever pulling up the wrong version.</p>
+  </div>
+
+  <!-- 1.2 The Problem -->
+  <h2><span class="section-number">1.2</span> The Problem BSearch Solves</h2>
+
+  <p>Berenson has roughly 550,000 documents spread across SharePoint and OneDrive: Word documents, Excel models, PowerPoint decks, and PDFs. These files contain the collective knowledge of the firm &mdash; deal terms, financial metrics, client communications, precedent transactions, and model outputs. But today, finding the right information is painful:</p>
+
+  <ul>
+    <li><strong>Wrong versions waste real time.</strong> When someone grabs an outdated model or an old draft of a CIM, the rework can cost 10 or more hours. In a firm of 18 people, that is a significant hit.</li>
+    <li><strong>No precedent search.</strong> There is no practical way to ask <em>"What comparable deals have we done?"</em> and get a useful answer. Institutional knowledge lives in people's heads or is buried in folder structures that only make sense if you already know what you are looking for.</li>
+    <li><strong>Universal pain.</strong> This is not a problem limited to one team or one role. All 18 people at the firm &mdash; from analysts to managing directors &mdash; regularly need to find documents or extract information from them.</li>
+  </ul>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>Imagine you are staffed on a new healthcare deal and need to reference the fee structure from a comparable transaction Berenson advised on two years ago. Today, you would ask around, dig through folders, and hope you find the right version. With BSearch, you type your question, and the answer appears in seconds &mdash; with a link to the source document.</p>
+  </div>
+
+  <!-- 1.3 The Key Insight -->
+  <h2><span class="section-number">1.3</span> The Key Insight: AI Synthesis Is the Product</h2>
+
+  <p>BSearch is not just a better file search. The core insight behind the system is that <strong>AI synthesis is the product</strong>. Finding the right document is necessary but not sufficient &mdash; what users actually want is the <em>answer</em> that lives inside those documents.</p>
+
+  <div class="comparison">
+    <div class="comparison-col">
+      <h4>Traditional File Search</h4>
+      <p>You search, get a list of files, open each one, scan for the answer, and hope you picked the right version.</p>
+    </div>
+    <div class="comparison-col">
+      <h4>BSearch</h4>
+      <p>You ask a question, BSearch reads the relevant documents, and streams back a written answer with citations and source links.</p>
+    </div>
+  </div>
+
+  <p>This distinction matters because it shapes every design decision in the system. The ingestion pipeline does not just index file names and metadata &mdash; it parses document content, understands table structures, extracts deal-level entities, and creates the kind of rich, searchable representation that an AI model needs to produce accurate answers.</p>
+
+  <div class="definition">
+    <p><span class="term">AI synthesis</span> &mdash; The process of an AI model reading multiple pieces of retrieved content and composing a coherent, cited answer. In BSearch, this is handled by Anthropic's Claude model, which reads the top search results and writes the response that the user sees.</p>
+  </div>
+
+  <!-- 1.4 How It Works (User's Perspective) -->
+  <h2><span class="section-number">1.4</span> The User Experience, End to End</h2>
+
+  <p>From the user's perspective, BSearch is simple: you open the web app, type a question, and get an answer. But behind the scenes, two major pipelines make this possible.</p>
+
+  <h3>The Ingestion Pipeline (runs in the background)</h3>
+
+  <p>Before anyone can search, BSearch needs to read and index every document in the firm's SharePoint and OneDrive. This happens automatically:</p>
+
+  <ol>
+    <li>BSearch connects to Microsoft 365 via the <span class="jargon-box"><span class="jargon-term">Graph API</span></span> (Microsoft's official interface for accessing M365 data).</li>
+    <li>Each document is parsed by a format-aware parser &mdash; Word, Excel, PowerPoint, and PDF each get specialized treatment to preserve structure (tables stay as tables, slides stay as slides).</li>
+    <li>The content is split into searchable chunks, converted into mathematical representations called <span class="jargon-box"><span class="jargon-term">embeddings</span></span> (numbers that capture meaning), and stored in Azure AI Search.</li>
+    <li>Deal-level entities (company names, deal stages, financial metrics) are extracted and stored in a knowledge graph for richer query understanding.</li>
+    <li>When files change, BSearch detects the update via webhooks (real-time notifications from Microsoft) and re-indexes only what changed.</li>
+  </ol>
+
+  <h3>The Query Pipeline (runs when you search)</h3>
+
+  <ol>
+    <li>You type a question in the web app.</li>
+    <li>BSearch classifies your query: Are you looking for a specific file? Extracting a data point? Or asking a question that spans multiple documents?</li>
+    <li>It searches the index using a hybrid approach (both keyword matching and semantic meaning).</li>
+    <li>Results are re-ranked for relevance by a specialized model.</li>
+    <li>The top results are sent to Claude, which reads them and streams back a written answer with citations.</li>
+  </ol>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>The ingestion pipeline is like the first week on a new deal &mdash; you read every document in the data room and build a mental model of what is where. The query pipeline is like getting a question from an MD at 11pm: you already know the material, so you can pull the answer immediately and cite your sources.</p>
+  </div>
+
+  <!-- Mermaid: User Journey -->
+  <h3>User Journey</h3>
+
+  <pre class="mermaid">
+flowchart LR
+    A["User types a question"] --> B["Query classified"]
+    B --> C{"Query type?"}
+    C -->|File Lookup| D["Find the file,\nreturn link"]
+    C -->|Data Extraction| E["Search index,\nrerank results"]
+    C -->|Multi-Doc Synthesis| F["Search broadly,\nrerank top results"]
+    E --> G["Claude reads chunks,\nstreams answer"]
+    F --> G
+    D --> H["User sees result\nwith source links"]
+    G --> H
+  </pre>
+
+  <!-- 1.5 Key Constraints -->
+  <h2><span class="section-number">1.5</span> Key Constraints and Design Parameters</h2>
+
+  <p>Every system operates within constraints. These are the ones that shape BSearch's design:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Constraint</th>
+        <th>Value</th>
+        <th>Why It Matters</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Total users</td>
+        <td>~18</td>
+        <td>Small user base means we can optimize for quality over massive scale. Costs stay low.</td>
+      </tr>
+      <tr>
+        <td>Total documents</td>
+        <td>~550,000</td>
+        <td>Large enough to require proper indexing and chunking &mdash; you cannot brute-force search this.</td>
+      </tr>
+      <tr>
+        <td>Latency: file lookup / data extraction</td>
+        <td>&lt;3 seconds to first token</td>
+        <td>If the system feels slow, nobody will use it. Speed is an adoption requirement, not a nice-to-have.</td>
+      </tr>
+      <tr>
+        <td>Latency: multi-doc synthesis</td>
+        <td>&lt;5 seconds to first token</td>
+        <td>Cross-document reasoning takes longer, but users get a visual indicator that the system is working.</td>
+      </tr>
+      <tr>
+        <td>Content sources (v1)</td>
+        <td>SharePoint / OneDrive only</td>
+        <td>v1 focuses on files. Email (Outlook), Teams bot, and document vision are deferred to later versions.</td>
+      </tr>
+      <tr>
+        <td>File types</td>
+        <td>Word, Excel, PowerPoint, PDF</td>
+        <td>Each format gets a specialized parser to preserve structure (especially tables and slides).</td>
+      </tr>
+      <tr>
+        <td>Permissions model</td>
+        <td>5 top-level folders, no sub-file permissions</td>
+        <td>Simplifies access control &mdash; BSearch filters results by which folders a user can access.</td>
+      </tr>
+      <tr>
+        <td>LLM calls per query</td>
+        <td>1 (Claude only)</td>
+        <td>Single-call architecture keeps latency predictable and costs manageable.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="definition">
+    <p><span class="term">Time to first token (TTFT)</span> &mdash; How long the user waits before the first word of the AI response appears on screen. BSearch streams answers as they are generated, so even though the full response takes longer, the user sees progress almost immediately.</p>
+  </div>
+
+  <!-- 1.6 What's In and Out of Scope -->
+  <h2><span class="section-number">1.6</span> v1 Scope: What's In and What's Not</h2>
+
+  <p>BSearch is being built incrementally. The first version (v1) focuses on the highest-value, most-tractable features:</p>
+
+  <div class="comparison">
+    <div class="comparison-col">
+      <h4>In Scope (v1)</h4>
+      <ul>
+        <li>SharePoint and OneDrive file search</li>
+        <li>Format-aware parsing (Word, Excel, PPT, PDF)</li>
+        <li>Hybrid search (keyword + semantic)</li>
+        <li>AI-synthesized answers via Claude</li>
+        <li>Deal and entity extraction (knowledge graph)</li>
+        <li>Near-real-time sync via webhooks</li>
+        <li>Web app with Azure AD authentication</li>
+        <li>Near-duplicate file detection</li>
+      </ul>
+    </div>
+    <div class="comparison-col">
+      <h4>Deferred (v2+)</h4>
+      <ul>
+        <li>Outlook email search</li>
+        <li>Teams bot interface</li>
+        <li>Document vision (images, charts within docs)</li>
+        <li>Model summaries (auto-generated Excel model descriptions)</li>
+        <li>Two-pass extraction (Haiku then Sonnet)</li>
+        <li>Sibling chunk retrieval</li>
+        <li>Reconciliation jobs</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- 1.7 Key Takeaway -->
+  <h2><span class="section-number">1.7</span> Why This Matters</h2>
+
+  <p>BSearch exists because Berenson's collective knowledge &mdash; hundreds of thousands of documents spanning years of deals &mdash; is only valuable if people can actually access it. Today, finding the right document (or the right version of the right document) is unreliable and slow. BSearch changes that by making every document searchable and every answer extractable, in seconds.</p>
+
+  <div class="key-takeaway">
+    <div class="callout-title">Key Takeaway</div>
+    <p>BSearch is not just a search engine. It is an AI system that reads your firm's documents and gives you answers. The goal is not to return a list of files &mdash; it is to return the information you were actually looking for, cited back to its source, in under five seconds.</p>
+  </div>
+
+  <nav class="chapter-nav bottom">
+    <a href="index.html">Contents</a>
+    <span class="nav-spacer">|</span>
+    <a href="chapter-02.html">Next: Architecture Overview &rarr;</a>
+  </nav>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad: true, theme: 'neutral'});</script>
+</body>
+</html>

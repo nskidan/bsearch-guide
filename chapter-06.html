@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light only">
+  <title>Chapter 6: Relevance & Quality Controls — BSearch Technical Guide</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="page-wrapper">
+  <nav class="chapter-nav">
+    <a href="chapter-05.html">&larr; Previous: Query Pipeline</a>
+    <span class="nav-spacer">|</span>
+    <a href="index.html">Contents</a>
+    <span class="nav-spacer">|</span>
+    <a href="chapter-07.html">Next: The Data Model &rarr;</a>
+  </nav>
+  <div class="chapter-header">
+    <div class="chapter-number">Chapter 6</div>
+    <h1>Relevance &amp; Quality Controls</h1>
+    <p class="chapter-subtitle">How BSearch decides whether results are good enough to show &mdash; and what it does when something goes wrong.</p>
+  </div>
+
+  <p>Every search system faces the same question: &ldquo;How confident are we in these results?&rdquo; In investment banking, you would never hand a client a valuation without sanity-checking the comps. BSearch applies the same discipline to every query. This chapter covers the guardrails that separate high-confidence answers from marginal ones, how the system monitors its own health, and what users see at each quality level.</p>
+
+  <!-- ================================================================ -->
+  <!-- 6.1 Relevance Gating -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">6.1</span> Relevance Gating</h2>
+
+  <div class="definition">
+    <p><span class="term">Relevance Gating</span> &mdash; A system of confidence tiers that determines how BSearch presents results based on how well they actually match your query. Think of it as a quality filter that prevents bad results from reaching you.</p>
+  </div>
+
+  <p>After the reranker (Chapter 3, Section 3.5) scores each candidate chunk against your query, BSearch does not blindly pass everything to Claude for synthesis. Instead, it checks each chunk&rsquo;s <strong>rerank score</strong> &mdash; a number between 0 and 1 that represents how relevant Cohere&rsquo;s reranker thinks the chunk is to your query.</p>
+
+  <h3>The three confidence tiers</h3>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Tier</th>
+        <th>Rerank Score</th>
+        <th>What Happens</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>HIGH</strong></td>
+        <td>&ge;0.50</td>
+        <td>Strong match. Results go to Claude for normal synthesis. No banner shown to the user.</td>
+      </tr>
+      <tr>
+        <td><strong>LOW</strong></td>
+        <td>0.15 &ndash; 0.50</td>
+        <td>Marginal match. Claude still synthesizes, but adds hedging language. A <strong>yellow banner</strong> warns the user.</td>
+      </tr>
+      <tr>
+        <td><strong>NONE</strong></td>
+        <td>&lt;0.15</td>
+        <td>No meaningful match. BSearch skips the Claude call entirely and shows a no-results message with suggestions.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>In addition to the tier-level thresholds, there is a <strong>per-chunk floor of 0.10</strong>. Even within a HIGH-confidence result set, any individual chunk scoring below 0.10 gets dropped before synthesis. This prevents a single irrelevant chunk from polluting an otherwise strong answer.</p>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>Think of relevance gating like the quality controls on a comp set. If your comps are strong matches (same industry, similar size, recent transactions), you present them with confidence. If they are borderline (adjacent sector, different geography), you still show them but caveat heavily: &ldquo;these are directional only.&rdquo; And if the screen returned nothing relevant (wrong SIC code, no recent deals), you tell the MD there are no good comps rather than forcing a bad set into the book.</p>
+  </div>
+
+  <div class="callout info">
+    <div class="callout-title">Threshold Calibration</div>
+    <p>The thresholds (0.50, 0.15, 0.10) are not arbitrary guesses. During Phase 6 testing, we run 30+ representative queries across different deal types and document categories, analyze the score distributions, and adjust the thresholds before shipping. Scores cluster differently depending on the type of content being searched, so calibration against real data is essential.</p>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- 6.2 Reranker Health Monitoring -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">6.2</span> Reranker Health Monitoring</h2>
+
+  <div class="definition">
+    <p><span class="term">Health Check</span> &mdash; A lightweight background task that periodically pings an external service to verify it is still responding. If it fails repeatedly, the system switches to a fallback mode.</p>
+  </div>
+
+  <p>The Cohere reranker is a third-party AI service. Like any external dependency, it can go down. BSearch does not wait for a user query to fail before discovering a problem &mdash; it proactively monitors reranker health with a background task that pings Cohere every 60 seconds.</p>
+
+  <h3>Failure detection and degraded mode</h3>
+
+  <p>If <strong>three or more consecutive health checks fail</strong>, BSearch marks the reranker as <strong>degraded</strong> and fires an alert to Application Insights (our monitoring platform). Here is what changes:</p>
+
+  <ul>
+    <li><strong>Skip rerank step</strong> &mdash; results come directly from hybrid search without the reranker&rsquo;s second pass.</li>
+    <li><strong>Reduce candidate count</strong> &mdash; top-k drops from 20 to 12. Without the reranker to filter noise, fewer candidates means less risk of irrelevant results slipping through.</li>
+    <li><strong>Cap confidence at LOW</strong> &mdash; even if results look strong, the system never assigns HIGH confidence without the reranker&rsquo;s validation.</li>
+    <li><strong>Orange banner</strong> &mdash; the user sees a distinct orange banner: <em>&ldquo;Search quality may be reduced &mdash; results are ranked without AI reranking. Verify key details against source documents.&rdquo;</em></li>
+  </ul>
+
+  <div class="callout warning">
+    <div class="callout-title">Orange vs. Yellow Banners</div>
+    <p>Orange (degraded reranker) and yellow (LOW confidence) are <strong>distinct signals</strong> that can appear simultaneously. Orange means the system itself is impaired &mdash; a health issue. Yellow means the results for this particular query are marginal. A user could see both if the reranker is down <em>and</em> the query returns borderline matches.</p>
+  </div>
+
+  <p>When the health checks start succeeding again, BSearch marks the reranker as <strong>healthy</strong> and fires a recovery event. Normal operation resumes automatically &mdash; no manual intervention required.</p>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>This is like having a backup process when Bloomberg goes down. You can still price comps using yesterday&rsquo;s closing data and public filings, but you caveat everything: &ldquo;Bloomberg was unavailable &mdash; pricing is indicative only, verify before client delivery.&rdquo; The work continues, but with extra caution flags.</p>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- 6.3 Embedding Resilience -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">6.3</span> Embedding Resilience</h2>
+
+  <div class="definition">
+    <p><span class="term">LRU Cache</span> (Least Recently Used) &mdash; A memory store that keeps the most recently used items readily available. When it runs out of space, it discards the items that have not been accessed in the longest time.</p>
+  </div>
+
+  <p>The Voyage AI embedding service converts your query text into a 1,024-number vector (Chapter 3, Section 3.3). This is an external API call &mdash; and like any network call, it can be slow or fail. BSearch has two layers of protection:</p>
+
+  <h3>Layer 1: LRU cache (~1,000 entries)</h3>
+
+  <p>If you or a colleague searched for the same query recently, the embedding is already cached in memory. The cache lookup takes effectively 0ms, bypassing the Voyage API entirely. This helps with common queries (&ldquo;latest CIMs,&rdquo; &ldquo;engagement letters&rdquo;) and rapid-fire refinements of the same search.</p>
+
+  <h3>Layer 2: 500ms hard timeout with BM25 fallback</h3>
+
+  <p>If the Voyage API does not respond within 500 milliseconds, BSearch stops waiting and falls back to <strong>BM25-only search</strong> &mdash; keyword matching without the vector (semantic) component. This means the search loses its ability to match on meaning (e.g., &ldquo;trading multiple&rdquo; matching &ldquo;EV/EBITDA&rdquo;), but the synonym expansion and reranker steps still compensate for much of that loss.</p>
+
+  <div class="callout info">
+    <div class="callout-title">Not Surfaced to Users</div>
+    <p>Unlike the reranker degradation, embedding fallbacks are <strong>not shown to users</strong>. They are transient (per-query, not system-wide) and the quality impact is usually minor. However, they are logged, and if the fallback rate exceeds 10% of queries over a one-hour window, an Application Insights alert fires so we can investigate.</p>
+  </div>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>Think of it like preparing a comp set. Normally you use CapIQ for both screening (keyword filters) and reading equity research (conceptual analysis). If CapIQ is being slow, you can still run the screen based on hard filters (industry, size, geography) while CapIQ catches up. You lose the conceptual layer temporarily, but the core screen still works.</p>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- 6.4 Near-Duplicate Deduplication -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">6.4</span> Near-Duplicate Deduplication</h2>
+
+  <p>Every IB professional has experienced this: you search for a deal summary and the top five results are &ldquo;Deal Summary v2,&rdquo; &ldquo;Deal Summary v3,&rdquo; &ldquo;Deal Summary v3 FINAL,&rdquo; &ldquo;Deal Summary v3 FINAL (2),&rdquo; and &ldquo;Deal Summary v3 FINAL - Copy.&rdquo; Five slots consumed by the same document. BSearch&rsquo;s deduplication system prevents this.</p>
+
+  <h3>How it works</h3>
+
+  <p>Deduplication runs in two phases during ingestion, before documents ever appear in search results:</p>
+
+  <ol>
+    <li><strong>Phase 1 &mdash; Filename normalization.</strong> Strip version markers (&ldquo;v2,&rdquo; &ldquo;v3&rdquo;), finality markers (&ldquo;FINAL,&rdquo; &ldquo;DRAFT&rdquo;), and copy markers (&ldquo;(2),&rdquo; &ldquo;Copy of&rdquo;). If two files reduce to the same normalized name, they are flagged as potential duplicates.</li>
+    <li><strong>Phase 2 &mdash; Cosine similarity check.</strong> Compare the first-chunk embeddings of the two files. If the cosine similarity is &ge;0.95 (nearly identical content), they are confirmed as duplicates.</li>
+  </ol>
+
+  <p>A <strong>same-folder constraint</strong> prevents false matches. Two files named &ldquo;Financial Summary&rdquo; in different deal folders are not duplicates &mdash; they are summaries for different deals. The system only groups files within the same folder.</p>
+
+  <p>Among duplicates, the <strong>most recently modified file</strong> is marked as the canonical version. All chunks from canonical files carry an <code>is_canonical</code> flag set to <code>true</code>, and search results filter on this flag. The filter adds zero latency to queries because it is evaluated at the index level, not after retrieval.</p>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>This is exactly like the document management discipline a good deal team follows: when you save &ldquo;v4 FINAL,&rdquo; the earlier versions get moved to an archive subfolder so that anyone searching the active folder only finds the latest version. BSearch automates this curation at scale across 550,000 documents.</p>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- 6.5 Citation Format -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">6.5</span> Citation Format</h2>
+
+  <p>Every answer BSearch generates includes numbered citations so you can verify the source material. Each citation includes:</p>
+
+  <ul>
+    <li><strong>File name</strong> &mdash; the original document name.</li>
+    <li><strong>Folder path</strong> &mdash; which deal folder or shared drive location the document lives in.</li>
+    <li><strong>Document type</strong> (<code>doc_type</code>) &mdash; CIM, engagement letter, financial model, etc.</li>
+    <li><strong>&ldquo;Open in SharePoint &rarr;&rdquo;</strong> &mdash; a deep link via the <code>m365_url</code> field that opens the document directly in SharePoint. One click from answer to source.</li>
+  </ul>
+
+  <p>Citations appear in a <strong>Sources</strong> section at the end of each response, numbered to match inline references in the answer text. If Claude references a fact from source [2], you can scroll down and click through to verify it.</p>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>Think of it like footnotes in an investor presentation. Every data point cites its source &mdash; &ldquo;Source: Company management, FY2024 audited financials&rdquo; &mdash; so the reader can trace any number back to its origin. BSearch does the same thing, but with clickable links that take you directly to the document.</p>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- 6.6 Confidence Communication -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">6.6</span> Confidence Communication</h2>
+
+  <p>All the quality machinery described above ultimately translates into a simple, clear experience for the user. Here is what you see in each scenario:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Scenario</th>
+        <th>What You See</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>HIGH confidence</strong></td>
+        <td>Normal response, no banner. The system is confident in its answer.</td>
+      </tr>
+      <tr>
+        <td><strong>LOW confidence</strong></td>
+        <td>Yellow banner: <em>&ldquo;Results may not fully answer your query.&rdquo;</em> Response includes hedging language.</td>
+      </tr>
+      <tr>
+        <td><strong>NONE &mdash; no results</strong></td>
+        <td>No-results message with suggested alternative queries. Claude is not called at all.</td>
+      </tr>
+      <tr>
+        <td><strong>Degraded reranker</strong></td>
+        <td>Orange banner: <em>&ldquo;Search quality may be reduced.&rdquo;</em> A system health issue, independent of query quality.</td>
+      </tr>
+      <tr>
+        <td><strong>Multi-document synthesis</strong></td>
+        <td><em>&ldquo;Searching across multiple documents...&rdquo;</em> indicator while the system works.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>The design principle is simple: <strong>never let the user mistake a low-confidence answer for a definitive one.</strong> In IB, the cost of acting on a wrong answer &mdash; a misquoted EBITDA, a wrong deal status &mdash; can be significant. These banners are the system&rsquo;s way of saying &ldquo;double-check this one.&rdquo;</p>
+
+  <!-- Confidence tier decision tree -->
+  <h3>Confidence Tier Decision Flow</h3>
+
+  <pre class="mermaid">
+flowchart TD
+    Q["Query submitted"] --> RR{"Reranker\navailable?"}
+    RR -- "No (degraded)" --> DEG["Show orange banner\nCap confidence at LOW\nReduce top-k to 12"]
+    RR -- "Yes (healthy)" --> SCORE{"Best rerank\nscore?"}
+    SCORE -- "&ge;0.50" --> HIGH["HIGH confidence\nNormal synthesis\nNo banner"]
+    SCORE -- "0.15 &ndash; 0.50" --> LOW["LOW confidence\nHedged synthesis\nYellow banner"]
+    SCORE -- "&lt;0.15" --> NONE["NONE\nSkip Claude call\nNo-results message"]
+    DEG --> SCORE2{"Best rerank\nscore\n(from hybrid)?"}
+    SCORE2 -- "&ge;0.15" --> LOW2["LOW confidence\nHedged synthesis\nOrange + yellow banners"]
+    SCORE2 -- "&lt;0.15" --> NONE2["NONE\nNo-results message\nOrange banner"]
+
+    style Q fill:#fff3e0,stroke:#D4793A
+    style HIGH fill:#e8f5e9,stroke:#2E7D5B
+    style LOW fill:#fffde7,stroke:#F9A825
+    style LOW2 fill:#fffde7,stroke:#F9A825
+    style NONE fill:#ffebee,stroke:#C4612A
+    style NONE2 fill:#ffebee,stroke:#C4612A
+    style DEG fill:#fff3e0,stroke:#E65100
+  </pre>
+
+  <div class="key-takeaway">
+    <div class="callout-title">Key Takeaway</div>
+    <p>BSearch treats search quality as a first-class concern, not an afterthought. Every result is assigned a confidence tier, the reranker is continuously monitored, embedding failures have automatic fallbacks, and near-duplicates are suppressed before they clutter your results. The user always knows how much to trust a given answer &mdash; just as you would caveat a preliminary valuation differently than a final fairness opinion.</p>
+  </div>
+
+  <nav class="chapter-nav bottom">
+    <a href="chapter-05.html">&larr; Previous</a>
+    <span class="nav-spacer">|</span>
+    <a href="index.html">Contents</a>
+    <span class="nav-spacer">|</span>
+    <a href="chapter-07.html">Next &rarr;</a>
+  </nav>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad: true, theme: 'neutral'});</script>
+</body>
+</html>

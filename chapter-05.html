@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light only">
+  <title>Chapter 5: The Query Pipeline — BSearch Technical Guide</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="page-wrapper">
+  <nav class="chapter-nav">
+    <a href="chapter-04.html">&larr; Previous: The Ingestion Pipeline</a>
+    <span class="nav-spacer">|</span>
+    <a href="index.html">Contents</a>
+    <span class="nav-spacer">|</span>
+    <a href="chapter-06.html">Next: Relevance &amp; Quality Controls &rarr;</a>
+  </nav>
+  <div class="chapter-header">
+    <div class="chapter-number">Chapter 5</div>
+    <h1>The Query Pipeline</h1>
+    <p class="chapter-subtitle">What happens when you ask BSearch a question &mdash; from classification to streaming AI synthesis.</p>
+  </div>
+
+  <!-- Introduction -->
+  <p>When you type a question into BSearch and press Enter, seven discrete steps execute in roughly one second. Each step narrows the search space, filters out noise, and adds context &mdash; so that by the time Claude begins writing its answer, it has exactly the right material to work with, and nothing else.</p>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>Think of a well-run deal process. You start with a universe of hundreds of potential buyers, screen down to a long list, narrow to a short list, then focus your time on the two or three who will actually close. The query pipeline works the same way: start broad, filter aggressively, and spend the expensive resources (Claude) only on the highest-quality matches.</p>
+  </div>
+
+  <p>This chapter walks through all seven steps in detail, then follows a concrete example query through the entire pipeline so you can see exactly what happens at each stage.</p>
+
+  <!-- Mermaid: Full Query Flow -->
+  <h2><span class="section-number">5.1</span> The Full Pipeline at a Glance</h2>
+
+  <pre class="mermaid">
+flowchart TD
+    A["User submits query"] --> B["Step 1: Classification\n~0-250ms"]
+    A --> C["Step 3: Embedding\n~100-300ms"]
+    B --> D["Step 2: Query Expansion\n~5-10ms"]
+    B -.- C
+    D --> E["Step 4: Search\n~100-200ms"]
+    C --> E
+    E --> F["Step 5: Reranking\n~200-350ms"]
+    F --> G["Step 6: Relevance Gating\n<1ms"]
+    G -->|HIGH or LOW| H["Step 7: Synthesis\n~500-800ms TTFT"]
+    G -->|NONE| I["No-results message\n(skip Claude)"]
+    H --> J["Streaming answer\nwith citations"]
+
+    style B fill:#e8f5e9,stroke:#2E7D5B
+    style C fill:#e8f5e9,stroke:#2E7D5B
+    style D fill:#e8f5e9,stroke:#2E7D5B
+    style E fill:#fff3e0,stroke:#D4793A
+    style F fill:#fff3e0,stroke:#D4793A
+    style G fill:#fff3e0,stroke:#D4793A
+    style H fill:#fce4ec,stroke:#C4612A
+    style I fill:#f5f5f5,stroke:#999
+  </pre>
+
+  <p>Notice that Steps 1 and 3 run <strong>in parallel</strong> &mdash; the system does not wait for classification to finish before starting the embedding. This parallelization is what keeps total latency under two seconds even in the worst case.</p>
+
+  <!-- Step 1: Classification -->
+  <h2><span class="section-number">5.2</span> Step 1 &mdash; Classification</h2>
+
+  <p>The first thing BSearch does is figure out <em>what kind of question</em> you asked. This matters because a file lookup (<em>"find Report_v3.docx"</em>) requires a completely different workflow than a cross-document analysis (<em>"What healthcare deals have we worked on?"</em>).</p>
+
+  <div class="definition">
+    <p><span class="term">Query classification</span> &mdash; The process of categorizing a user's question into one of several predefined types, so the system can choose the right search and synthesis strategy for each type.</p>
+  </div>
+
+  <h3>Two classification paths</h3>
+
+  <p><strong>Regex fast path (&lt;5ms).</strong> A set of pattern-matching rules catches obvious file lookups before any AI model is involved. If your query contains a filename with an extension (<em>"find Report_v3.docx"</em>) or phrases like <em>"where's the GovTech deck"</em>, the regex catches it immediately and classifies it as a <code>FILE_LOOKUP</code>. This is the fastest possible path &mdash; no network call, no model inference.</p>
+
+  <div class="definition">
+    <p><span class="term">Regex</span> &mdash; Short for "regular expression." A pattern-matching technique that scans text for specific structures (like filenames ending in .docx or .xlsx). Extremely fast but rigid &mdash; it can only catch patterns you explicitly define.</p>
+  </div>
+
+  <p><strong>Haiku LLM fallback (~150&ndash;250ms).</strong> If the regex does not match, BSearch sends the query to Claude Haiku &mdash; a small, fast AI model &mdash; which classifies it into one of three categories:</p>
+
+  <ul>
+    <li><strong><code>FILE_LOOKUP</code></strong> &mdash; The user wants a specific file. Example: <em>"Where's the GovTech pitch deck?"</em></li>
+    <li><strong><code>DATA_EXTRACTION</code></strong> &mdash; The user wants a specific data point from one or a few documents. Example: <em>"What was the EBITDA margin for Catalyst?"</em></li>
+    <li><strong><code>MULTI_DOC_SYNTHESIS</code></strong> &mdash; The user wants an answer that requires reading across multiple documents. Example: <em>"Summarize all healthcare deals from the last two years."</em></li>
+  </ul>
+
+  <p>When the query is ambiguous, the system defaults to <code>DATA_EXTRACTION</code> &mdash; the middle ground that works well enough for most questions. If Haiku does not respond within 500ms, the system also defaults to <code>DATA_EXTRACTION</code> and moves on.</p>
+
+  <h3>Entity intent extraction</h3>
+
+  <p>In the same Haiku call, BSearch also extracts <strong>entity intent</strong> &mdash; structured information embedded in the query. From <em>"What multiple did we use for Catalyst?"</em>, Haiku identifies:</p>
+
+  <ul>
+    <li><strong>Company name:</strong> Catalyst</li>
+    <li><strong>Financial concept:</strong> valuation multiple</li>
+    <li><strong>Role filter:</strong> deals where Berenson was the advisor ("we")</li>
+  </ul>
+
+  <p>These extracted entities are used later (in Step 4) to filter search results precisely.</p>
+
+  <!-- Step 2: Query Expansion -->
+  <h2><span class="section-number">5.3</span> Step 2 &mdash; Query Expansion</h2>
+
+  <p>Investment banking terminology is wildly inconsistent. The same concept might be called "multiple," "EV/EBITDA," "trading comp multiple," or "valuation metric" depending on who wrote the document and when. If BSearch only searched for the exact words you typed, it would miss relevant results constantly.</p>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>This is like when you are searching for precedent transactions and you need to check for "acquisition," "merger," "buyout," "take-private," and "business combination" &mdash; all of which might describe the same deal in different documents. Query expansion automates that kind of synonym awareness.</p>
+  </div>
+
+  <p>Query expansion happens in three layers:</p>
+
+  <h3>Layer 1: Static IB synonym map (0ms)</h3>
+  <p>A JSON configuration file maps common IB shorthand to its formal equivalents. When BSearch sees "multiple" in your query, it automatically adds "EV/EBITDA" as a search term. "Comp" expands to "comparable companies." "LOI" expands to "letter of intent." This is instantaneous because it is a simple dictionary lookup &mdash; no network call required.</p>
+
+  <h3>Layer 2: Haiku contextual expansion (0ms added)</h3>
+  <p>This runs inside the same Haiku call as classification (Step 1), so it adds zero additional latency. Haiku understands the <em>intent</em> behind your query and generates contextual expansions. For example, <em>"what did we pay for Catalyst"</em> expands to include "purchase price," "enterprise value," and "transaction value" &mdash; terms that would not appear in a static synonym map but are clearly relevant.</p>
+
+  <h3>Layer 3: Entity alias expansion from Neo4j (~5&ndash;10ms)</h3>
+  <p>BSearch's knowledge graph stores aliases for companies and people. If you search for "GS," the system expands that to "Goldman Sachs" and "Goldman Sachs &amp; Co." so that documents using the full name are not missed. This requires a quick graph lookup, adding roughly 5&ndash;10ms.</p>
+
+  <div class="definition">
+    <p><span class="term">Neo4j</span> &mdash; A graph database that stores relationships between entities (companies, deals, people) as a web of connections. BSearch uses it to understand that "GS" and "Goldman Sachs" refer to the same entity, or that a company is connected to a specific deal.</p>
+  </div>
+
+  <h3>How expansion terms are weighted</h3>
+  <p>Expansion is applied to the keyword search (BM25) only &mdash; not to the vector search, which already understands semantic similarity on its own. To prevent expansion terms from overwhelming your original query, BSearch uses a weighting system: your <strong>original terms are boosted 3x</strong>, while <strong>expansion terms get a 1.5x boost</strong>. This ensures the original query always dominates.</p>
+
+  <!-- Step 3: Embedding -->
+  <h2><span class="section-number">5.4</span> Step 3 &mdash; Embedding</h2>
+
+  <p>While Steps 1 and 2 handle the keyword side, BSearch simultaneously converts your query into a <strong>vector embedding</strong> &mdash; a list of numbers that captures the <em>meaning</em> of what you asked, not just the words.</p>
+
+  <div class="definition">
+    <p><span class="term">Vector embedding</span> &mdash; A mathematical representation of text as a list of numbers (typically 1,024 of them). Texts with similar meanings end up with similar numbers, even if they use completely different words. This is what allows BSearch to find a document about "enterprise value" when you searched for "what did we pay."</p>
+  </div>
+
+  <p>Voyage AI's <code>voyage-context-3</code> model handles this conversion, typically in 100&ndash;300ms. Two optimizations keep this fast:</p>
+
+  <ul>
+    <li><strong>LRU cache (~1,000 entries).</strong> If you (or anyone) recently asked the same or a very similar question, BSearch reuses the cached embedding instantly (0ms). LRU stands for "least recently used" &mdash; the cache keeps the 1,000 most recent embeddings and evicts the oldest when full.</li>
+    <li><strong>500ms hard timeout.</strong> If Voyage AI is slow or unreachable, BSearch gives up on vector search entirely and falls back to keyword search (BM25) only. A slightly less precise search is better than a query that hangs.</li>
+    <li><strong>File lookup skip.</strong> Queries classified as <code>FILE_LOOKUP</code> skip the embedding step entirely &mdash; finding a file by name does not require semantic understanding.</li>
+  </ul>
+
+  <!-- Parallelization diagram -->
+  <h3>Parallelization: Steps 1&ndash;3</h3>
+
+  <pre class="mermaid">
+gantt
+    title Query Pipeline — Parallel Execution
+    dateFormat X
+    axisFormat %Lms
+
+    section Critical Path
+    Haiku classify + expand + entity extract : a1, 0, 250
+    Voyage AI query embedding               : a2, 0, 300
+    Entity alias expansion (Neo4j)           : a3, 250, 10
+
+    section Sequential
+    Azure AI Search                          : a4, 260, 200
+    Cohere rerank                            : a5, 460, 350
+    Claude synthesis (TTFT)                  : a6, 810, 800
+  </pre>
+
+  <p>The key insight: Haiku classification and Voyage AI embedding run concurrently using Python's <code>asyncio.gather</code>. The critical path through Steps 1&ndash;3 is determined by whichever finishes last, not the sum of both. Entity alias expansion from Neo4j is sequential &mdash; it must wait for Haiku to identify the entities before looking up their aliases. Separately, Neo4j entity <em>context</em> retrieval (deal status, financials) runs in parallel with Azure AI Search in Step 4.</p>
+
+  <!-- Step 4: Search -->
+  <h2><span class="section-number">5.5</span> Step 4 &mdash; Search</h2>
+
+  <p>With the expanded query terms and the vector embedding in hand, BSearch sends a hybrid query to Azure AI Search. "Hybrid" means it combines two fundamentally different search strategies:</p>
+
+  <div class="comparison">
+    <div class="comparison-col">
+      <h4>BM25 (Keyword Matching)</h4>
+      <p>Finds documents containing your exact terms and their expansions. Great for specific names, ticker symbols, and deal codes that vector search might miss.</p>
+    </div>
+    <div class="comparison-col">
+      <h4>Vector Similarity</h4>
+      <p>Finds documents with similar <em>meaning</em>, even if they use different words. Great for natural-language questions where you do not know the exact terminology used in the documents.</p>
+    </div>
+  </div>
+
+  <p>Azure AI Search merges the scores from both approaches, and also applies a <strong>recency scoring profile</strong> that gives a slight boost to more recently modified documents &mdash; because in IB, newer versions are almost always more relevant.</p>
+
+  <h3>Filters narrow the search space</h3>
+
+  <p>Before the search runs, BSearch applies several filters drawn from the entity extraction in Step 1:</p>
+
+  <ul>
+    <li><strong>Source folder (permissions).</strong> Users only see results from folders they have access to. This is enforced as a hard filter &mdash; no exceptions.</li>
+    <li><strong>Canonical flag (dedup).</strong> Only the canonical version of near-duplicate documents is returned, preventing the same CIM draft from appearing five times in results.</li>
+    <li><strong>Entity filters.</strong> If Haiku detected industry, company role, deal status, deal stage, or financial constraints in your query, those are applied as filters too. For example, <em>"active healthcare deals"</em> would filter for <code>industry=healthcare</code> and <code>deal_status=active</code>.</li>
+    <li><strong>Neo4j pre-query.</strong> For entity-rich queries, BSearch queries the knowledge graph first to resolve entity relationships, then passes those as filters to Azure AI Search. For example, if you search for a company name, Neo4j can identify which deal it belongs to, enabling a precise deal-level filter.</li>
+  </ul>
+
+  <p>The search returns the <strong>top 20 candidates</strong> (or top 12 if the reranker is degraded &mdash; more on that in Step 5).</p>
+
+  <!-- Step 5: Reranking -->
+  <h2><span class="section-number">5.6</span> Step 5 &mdash; Reranking</h2>
+
+  <p>Azure AI Search is fast, but its ranking is approximate. To get truly precise relevance ordering, BSearch sends the top 20 results to Cohere's reranking model, which re-scores each result against the <strong>original query</strong> &mdash; not the expanded version.</p>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>This is like the difference between an initial buyer screen (broad criteria, fast) and management's deep assessment of each potential acquirer (slower but much more precise). The search step casts a wide net; the reranker decides which catches are actually worth keeping.</p>
+  </div>
+
+  <p>Using the original query is deliberate. Query expansion (Step 2) may have added marginal terms like "comparable companies" that surface loosely related documents. The reranker evaluates each result against what you <em>actually</em> asked, so those marginal matches get dropped.</p>
+
+  <p>After reranking, BSearch keeps:</p>
+  <ul>
+    <li><strong>Top 5</strong> results for <code>FILE_LOOKUP</code> and <code>DATA_EXTRACTION</code> queries</li>
+    <li><strong>Top 10</strong> results for <code>MULTI_DOC_SYNTHESIS</code> queries (because cross-document answers need more source material)</li>
+  </ul>
+
+  <div class="callout warning">
+    <div class="callout-title">Fallback</div>
+    <p>If Cohere's reranking service is unavailable, BSearch skips reranking entirely and uses Azure AI Search's native ranking instead. When this happens, the system caps confidence at <code>LOW</code> (see Step 6) because the results have not been precision-verified. The search result count is also reduced to top 12 to compensate for lower ranking quality.</p>
+  </div>
+
+  <!-- Step 6: Relevance Gating -->
+  <h2><span class="section-number">5.7</span> Step 6 &mdash; Relevance Gating</h2>
+
+  <p>Before sending anything to Claude, BSearch checks whether the search results are actually relevant. This prevents the system from confidently synthesizing an answer from documents that have nothing to do with your question.</p>
+
+  <p>The system uses <strong>three confidence tiers</strong> based on the top reranker score:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Tier</th>
+        <th>Score Range</th>
+        <th>What Happens</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>HIGH</strong></td>
+        <td>&ge; 0.50</td>
+        <td>Strong match. Normal synthesis &mdash; Claude generates the answer with full confidence.</td>
+      </tr>
+      <tr>
+        <td><strong>LOW</strong></td>
+        <td>0.15 &ndash; 0.50</td>
+        <td>Marginal match. Claude still generates an answer, but adds hedging language: <em>"Results may not directly answer your query."</em></td>
+      </tr>
+      <tr>
+        <td><strong>NONE</strong></td>
+        <td>&lt; 0.15</td>
+        <td>No good match. BSearch skips the Claude call entirely and shows a no-results message. This saves cost and avoids hallucination.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>Additionally, there is a <strong>per-chunk floor of 0.10</strong>. Even within an otherwise high-confidence result set, individual chunks scoring below 0.10 are dropped before being sent to Claude. This prevents irrelevant noise from contaminating the synthesis.</p>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>This is like a deal screen with hard cutoffs. If a potential buyer does not meet your minimum revenue threshold, they do not make the list &mdash; no matter how interesting they are on other dimensions. Relevance gating prevents BSearch from wasting expensive AI resources (and your time) on low-quality matches.</p>
+  </div>
+
+  <!-- Step 7: Synthesis -->
+  <h2><span class="section-number">5.8</span> Step 7 &mdash; Synthesis</h2>
+
+  <p>This is where the search results become an actual answer. Claude Sonnet 4.6 receives the top-ranked document chunks, the original query, and entity context from Neo4j, then generates a written response that streams to the user in real time.</p>
+
+  <p>The synthesis strategy varies by query type:</p>
+
+  <h3>FILE_LOOKUP</h3>
+  <p>Terse response. Claude returns the file link and minimal context (e.g., <em>"Here's the GovTech pitch deck, last modified March 15."</em>). No extended thinking &mdash; speed is everything for file lookups.</p>
+
+  <h3>DATA_EXTRACTION</h3>
+  <p>Precise response. Claude extracts the specific data point requested and cites the source document. For example: <em>"The EV/EBITDA multiple used for Catalyst was 8.5x, per the valuation analysis in the CIM dated January 2025."</em> No extended thinking needed &mdash; the answer is typically in a single chunk.</p>
+
+  <h3>MULTI_DOC_SYNTHESIS</h3>
+  <p>Structured chain-of-thought. Claude uses <strong>extended thinking</strong> &mdash; a feature where the model explicitly reasons through its extraction and synthesis steps before writing the final answer. The thinking budget is roughly 2,000 tokens. This is the only query type where extended thinking is enabled, because cross-document analysis genuinely benefits from the model "showing its work" internally. While Claude thinks, the user sees a <em>"Searching across multiple documents..."</em> indicator.</p>
+
+  <div class="definition">
+    <p><span class="term">Extended thinking</span> &mdash; A mode where the AI model writes out its reasoning process (extraction, comparison, synthesis) before producing the final answer. The reasoning is internal &mdash; the user only sees the polished result, but the quality is significantly higher for complex, multi-source questions.</p>
+  </div>
+
+  <h3>Entity context injection</h3>
+  <p>Before Claude generates its response, BSearch injects <strong>entity context from Neo4j</strong> into the prompt. This includes structured information about the entities mentioned in the query: deal status, financial metrics, associated companies, key people, and stage progression. This context helps Claude produce more accurate and grounded answers without needing to infer facts from document fragments alone.</p>
+
+  <h3>Citations</h3>
+  <p>Every claim in Claude's response is linked to its source via <strong>clickable SharePoint deep links</strong>. Users can verify any statement by clicking the citation to open the original document in SharePoint. This is not just a nice feature &mdash; it is essential for trust. In investment banking, no one will rely on a system that does not show its sources.</p>
+
+  <!-- Latency Budget -->
+  <h2><span class="section-number">5.9</span> Latency Budget</h2>
+
+  <p>Every millisecond in the pipeline is accounted for. Here is where time is spent:</p>
+
+  <table class="latency-budget">
+    <thead>
+      <tr>
+        <th>Stage</th>
+        <th>Typical (p50)</th>
+        <th>Worst Case (p99)</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Regex check</td>
+        <td class="fast">&lt;5ms</td>
+        <td class="fast">&lt;5ms</td>
+      </tr>
+      <tr>
+        <td>Haiku classify + expand</td>
+        <td class="medium">~150ms</td>
+        <td class="medium">~250ms</td>
+      </tr>
+      <tr>
+        <td>Voyage AI query embedding</td>
+        <td class="medium">~150ms</td>
+        <td class="medium">~400ms</td>
+      </tr>
+      <tr>
+        <td>Critical path (parallel)</td>
+        <td class="medium">~150ms</td>
+        <td class="medium">~400ms</td>
+      </tr>
+      <tr>
+        <td>Azure AI Search</td>
+        <td class="medium">~100ms</td>
+        <td class="medium">~200ms</td>
+      </tr>
+      <tr>
+        <td>Cohere rerank</td>
+        <td class="medium">~200ms</td>
+        <td class="slow">~350ms</td>
+      </tr>
+      <tr>
+        <td>Claude TTFT</td>
+        <td class="slow">~500ms</td>
+        <td class="slow">~800ms</td>
+      </tr>
+      <tr class="total">
+        <td><strong>Total TTFT</strong></td>
+        <td><strong>~950ms</strong></td>
+        <td><strong>~1.75s</strong></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="definition">
+    <p><span class="term">p50 / p99</span> &mdash; Percentile measurements. p50 (the median) means half of all queries are faster than this. p99 means 99% of queries are faster &mdash; only 1 in 100 takes longer. The gap between p50 and p99 shows how much variance the system has.</p>
+  </div>
+
+  <p>The "Critical path (parallel)" row is the key to understanding the total. Because Haiku classification and Voyage embedding run simultaneously, the pipeline only waits for whichever is slower. In the typical case, both take ~150ms, so the parallel step adds only ~150ms &mdash; not 300ms.</p>
+
+  <div class="callout tip">
+    <div class="callout-title">Why This Matters</div>
+    <p>A total time-to-first-token under one second (typical) means BSearch starts streaming its answer almost immediately. The user never stares at a blank screen &mdash; words start appearing within a second of pressing Enter.</p>
+  </div>
+
+  <!-- Concrete Example Walkthrough -->
+  <h2><span class="section-number">5.10</span> Concrete Example: "What multiple did we use for Catalyst?"</h2>
+
+  <p>Let's walk through this exact query, step by step, and see what happens inside BSearch.</p>
+
+  <h3>Step 1 &mdash; Classification (0&ndash;150ms)</h3>
+  <p>The regex engine scans the query. No file extension, no "find" or "where's" pattern &mdash; regex does not match. The query goes to Haiku.</p>
+  <p>Haiku classifies this as <code>DATA_EXTRACTION</code> &mdash; you want a specific data point, not a file and not a cross-document summary. Haiku also extracts entity intent:</p>
+  <ul>
+    <li><strong>Company:</strong> "Catalyst"</li>
+    <li><strong>Financial concept:</strong> "multiple" (likely EV/EBITDA)</li>
+    <li><strong>Role:</strong> "we" implies Berenson was the advisor</li>
+  </ul>
+
+  <h3>Step 2 &mdash; Query Expansion (150&ndash;160ms)</h3>
+  <p>Three expansion layers fire:</p>
+  <ol>
+    <li><strong>Static synonym map:</strong> "multiple" &rarr; adds "EV/EBITDA" as an expansion term</li>
+    <li><strong>Haiku contextual expansion</strong> (already completed in the same call as classification): adds "purchase price," "enterprise value," "valuation multiple"</li>
+    <li><strong>Neo4j alias lookup:</strong> "Catalyst" is queried in the knowledge graph. It resolves to "Catalyst Technologies, Inc." and "Catalyst Tech" (both are aliases used in different documents)</li>
+  </ol>
+  <p>The expanded BM25 query looks like: <code>"multiple"(3x) "Catalyst"(3x) "EV/EBITDA"(1.5x) "purchase price"(1.5x) "enterprise value"(1.5x) "valuation multiple"(1.5x) "Catalyst Technologies"(1.5x) "Catalyst Tech"(1.5x)</code></p>
+
+  <h3>Step 3 &mdash; Embedding (0&ndash;150ms, parallel with Step 1)</h3>
+  <p>Simultaneously, Voyage AI converts the original query into a 1,024-dimensional vector. The LRU cache misses (nobody has asked this exact question recently), so a fresh embedding is generated in ~150ms. This vector captures the <em>meaning</em>: "what valuation multiple was applied in a deal involving a company called Catalyst."</p>
+
+  <h3>Step 4 &mdash; Search (160&ndash;280ms)</h3>
+  <p>Azure AI Search receives a hybrid query: the expanded BM25 terms plus the vector embedding. Filters are applied:</p>
+  <ul>
+    <li>Source folder filter (based on the user's permissions)</li>
+    <li>Canonical flag = true (exclude duplicate versions)</li>
+    <li>Entity filter: company matches "Catalyst Technologies, Inc."</li>
+  </ul>
+  <p>In parallel, Neo4j retrieves entity context about Catalyst: deal status (closed), deal stage (completed Q3 2024), Berenson's role (sell-side advisor), and basic financial metrics.</p>
+  <p>Azure returns 20 candidate chunks, including excerpts from the Catalyst CIM, the valuation analysis, the board presentation, and a few tangentially related documents.</p>
+
+  <h3>Step 5 &mdash; Reranking (280&ndash;480ms)</h3>
+  <p>Cohere rescores all 20 candidates against the original query: <em>"What multiple did we use for Catalyst?"</em> &mdash; not the expanded version. The valuation analysis chunk containing <em>"implied EV/EBITDA of 8.5x"</em> scores highest (0.82). The CIM overview chunk scores 0.61. A loosely related comp table from a different deal, surfaced by the "EV/EBITDA" expansion, scores only 0.12 and is dropped. The top 5 are kept.</p>
+
+  <h3>Step 6 &mdash; Relevance Gating (480ms)</h3>
+  <p>Top reranker score is 0.82, well above the 0.50 threshold. Confidence tier: <strong>HIGH</strong>. All five chunks score above the 0.10 per-chunk floor. No chunks are dropped. Proceed to synthesis with full confidence.</p>
+
+  <h3>Step 7 &mdash; Synthesis (480&ndash;980ms TTFT)</h3>
+  <p>Claude Sonnet 4.6 receives:</p>
+  <ul>
+    <li>The original query</li>
+    <li>Five ranked document chunks (valuation analysis, CIM, board presentation, etc.)</li>
+    <li>Neo4j entity context (Catalyst Technologies, closed deal, sell-side, Q3 2024)</li>
+    <li>Query type: <code>DATA_EXTRACTION</code> (so: be precise, cite sources, no extended thinking)</li>
+  </ul>
+  <p>Claude begins streaming its response at ~980ms:</p>
+
+  <div class="callout info">
+    <div class="callout-title">Example Response</div>
+    <p><em>"The EV/EBITDA multiple used in the Catalyst Technologies transaction was <strong>8.5x</strong>, based on LTM EBITDA of $47.2M, implying an enterprise value of approximately $401M. This is documented in the valuation analysis section of the CIM dated January 2025."</em></p>
+    <p style="font-size: 0.88rem; color: var(--text-secondary); margin-bottom: 0;">Source: Catalyst Technologies &mdash; Valuation Analysis.docx [clickable link]</p>
+  </div>
+
+  <p>Total time from pressing Enter to the first word appearing: under one second. The full response finishes streaming 2&ndash;3 seconds later.</p>
+
+  <!-- Key Takeaway -->
+  <div class="key-takeaway">
+    <div class="callout-title">Key Takeaway</div>
+    <p>The query pipeline is a seven-step funnel: classify the question, expand the terminology, embed the meaning, search the index, rerank for precision, gate on relevance, and synthesize the answer. Each step eliminates noise and adds precision, so Claude only works with the best material. Parallelization across steps keeps total latency under one second for the typical query.</p>
+  </div>
+
+  <nav class="chapter-nav bottom">
+    <a href="chapter-04.html">&larr; Previous</a>
+    <span class="nav-spacer">|</span>
+    <a href="index.html">Contents</a>
+    <span class="nav-spacer">|</span>
+    <a href="chapter-06.html">Next &rarr;</a>
+  </nav>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad: true, theme: 'neutral'});</script>
+</body>
+</html>

@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light only">
+  <title>Chapter 9: Infrastructure &amp; Deployment &mdash; BSearch Technical Guide</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="page-wrapper">
+  <nav class="chapter-nav">
+    <a href="chapter-08.html">&larr; Previous: Authentication &amp; Permissions</a>
+    <span class="nav-spacer">|</span>
+    <a href="index.html">Contents</a>
+    <span class="nav-spacer">|</span>
+    <a href="chapter-10.html">Next: Implementation Roadmap &rarr;</a>
+  </nav>
+  <div class="chapter-header">
+    <div class="chapter-number">Chapter 9</div>
+    <h1>Infrastructure &amp; Deployment</h1>
+    <p class="chapter-subtitle">What runs where, what it costs, and how changes get deployed without downtime.</p>
+  </div>
+
+  <p>This chapter maps BSearch&rsquo;s components to the actual Azure services that host them, explains what each service costs, and describes how code and infrastructure changes get deployed. If the previous chapters explained <em>what</em> BSearch does, this chapter explains <em>where</em> it physically runs and <em>how</em> it gets there.</p>
+
+  <!-- ================================================================ -->
+  <!-- 9.1 Azure Services Map -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">9.1</span> Azure Services Map</h2>
+
+  <p>BSearch is built on a set of managed Azure services. &ldquo;Managed&rdquo; means Microsoft operates the underlying servers, handles patching, and guarantees uptime &mdash; you just configure and use them. Here is every service and what it does:</p>
+
+  <h3>Azure Services</h3>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Service</th>
+        <th>Azure Tier</th>
+        <th>Monthly Cost</th>
+        <th>Purpose</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Azure AI Search</strong></td>
+        <td>S1 or S2</td>
+        <td>~$250&ndash;500</td>
+        <td>The search index &mdash; stores all document chunks with both keyword (BM25) and vector indexes for hybrid search.</td>
+      </tr>
+      <tr>
+        <td><strong>Azure App Service</strong></td>
+        <td>B1</td>
+        <td>~$13</td>
+        <td>Hosts the FastAPI search API. Always-on, meaning it is running 24/7 and responds instantly to requests (no cold start delay).</td>
+      </tr>
+      <tr>
+        <td><strong>Azure Durable Functions</strong></td>
+        <td>Consumption</td>
+        <td>Pay-per-use</td>
+        <td>Runs the ingestion pipeline &mdash; the multi-step process that pulls documents from SharePoint, parses them, chunks them, and loads them into the search index.</td>
+      </tr>
+      <tr>
+        <td><strong>Azure Static Web Apps</strong></td>
+        <td>Free</td>
+        <td>$0</td>
+        <td>Hosts the React web application (the BSearch user interface). Also handles the Microsoft login flow automatically.</td>
+      </tr>
+      <tr>
+        <td><strong>Cosmos DB</strong></td>
+        <td>Serverless</td>
+        <td>~$0</td>
+        <td>Stores application state: conversation histories, SharePoint sync tokens, user preferences. At 18 users, costs are negligible.</td>
+      </tr>
+      <tr>
+        <td><strong>Neo4j Aura</strong></td>
+        <td>Free / Pro</td>
+        <td>$0&ndash;65</td>
+        <td>Knowledge graph &mdash; stores relationships between entities (companies, people, deals, industries) for relationship-aware search.</td>
+      </tr>
+      <tr>
+        <td><strong>Azure Document Intelligence</strong></td>
+        <td>S0</td>
+        <td>Pay-per-page</td>
+        <td>Extracts text and tables from PDFs. Understands document layout (headers, columns, tables) rather than just raw text extraction.</td>
+      </tr>
+      <tr>
+        <td><strong>Key Vault</strong></td>
+        <td>Standard</td>
+        <td>Minimal</td>
+        <td>Stores API keys, connection strings, and other secrets securely. Services fetch their credentials from here instead of having them hard-coded.</td>
+      </tr>
+      <tr>
+        <td><strong>Application Insights</strong></td>
+        <td>Included</td>
+        <td>$0</td>
+        <td>Monitoring and alerting &mdash; tracks request latency, error rates, and custom events. Sends alerts when something goes wrong.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>External API Costs</h3>
+
+  <p>In addition to Azure services, BSearch calls several external AI APIs. These are usage-based &mdash; you pay for what you use:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>API</th>
+        <th>Monthly Cost</th>
+        <th>Usage</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Claude Sonnet 4.6</strong></td>
+        <td>~$11</td>
+        <td>Query synthesis &mdash; generates natural-language answers from search results. Estimated at 50&ndash;200 queries/day.</td>
+      </tr>
+      <tr>
+        <td><strong>Claude Haiku 4.5</strong></td>
+        <td>~$0.10&ndash;0.40/day</td>
+        <td>Lightweight tasks: document classification, metadata extraction, chunk summaries during ingestion.</td>
+      </tr>
+      <tr>
+        <td><strong>Voyage AI</strong></td>
+        <td>Pay-per-token</td>
+        <td>Generates vector embeddings for document chunks and search queries.</td>
+      </tr>
+      <tr>
+        <td><strong>Cohere Rerank</strong></td>
+        <td>Pay-per-query</td>
+        <td>Re-scores search results for precision (the &ldquo;senior associate review&rdquo; from Chapter 3).</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>Think of the Azure services as the firm&rsquo;s overhead &mdash; office lease, Bloomberg terminals, IT support. They are fixed or near-fixed monthly costs that keep the lights on. The external APIs are more like deal-related expenses &mdash; they scale with activity. More searches mean slightly higher API costs, just like more active deals mean more data room fees and printing costs. The total monthly run-rate is modest: roughly $300&ndash;600 all-in for 18 users.</p>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- 9.2 Bicep Templates -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">9.2</span> Bicep Templates &mdash; Infrastructure as Code</h2>
+
+  <div class="definition">
+    <p><span class="term">Infrastructure as Code (IaC)</span> &mdash; Defining your cloud infrastructure in text files rather than clicking through a web portal. The text files are version-controlled (tracked in Git), reviewable, and repeatable. If you need to rebuild everything from scratch, you run one command instead of clicking through 50 screens.</p>
+  </div>
+
+  <div class="definition">
+    <p><span class="term">Bicep</span> &mdash; Microsoft&rsquo;s declarative language for defining Azure resources. You describe <em>what</em> you want (a search service with these settings, a database with this configuration), and Azure figures out <em>how</em> to build it.</p>
+  </div>
+
+  <p>BSearch&rsquo;s infrastructure is defined in Bicep template files stored in the <code>infra/</code> directory:</p>
+
+  <ul>
+    <li><strong><code>infra/main.bicep</code></strong> &mdash; The orchestrator. References all the individual modules and wires them together.</li>
+    <li><strong><code>infra/search.bicep</code></strong> &mdash; Azure AI Search service configuration.</li>
+    <li><strong><code>infra/functions.bicep</code></strong> &mdash; Azure Durable Functions for the ingestion pipeline.</li>
+    <li><strong><code>infra/appservice.bicep</code></strong> &mdash; Azure App Service for the FastAPI backend.</li>
+    <li><strong><code>infra/cosmos.bicep</code></strong> &mdash; Cosmos DB for state storage.</li>
+    <li><strong><code>infra/staticwebapp.bicep</code></strong> &mdash; Azure Static Web Apps for the React front-end.</li>
+    <li><strong><code>infra/keyvault.bicep</code></strong> &mdash; Key Vault for secrets management.</li>
+  </ul>
+
+  <p>Separate parameter files define differences between environments (e.g., dev vs. prod). The dev environment might use cheaper service tiers, while prod uses the tiers listed in Section 9.1.</p>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>Bicep templates are like a detailed engagement letter that specifies exactly what infrastructure to set up. Instead of calling Azure support and saying &ldquo;we need a search service, a database, a web server&hellip;&rdquo; and hoping they configure everything correctly, you hand them a precise, written specification. If something goes wrong and you need to rebuild, you just re-execute the same engagement letter &mdash; every setting, every connection, every configuration is documented and repeatable.</p>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- 9.3 Deployment Process -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">9.3</span> Deployment Process</h2>
+
+  <div class="definition">
+    <p><span class="term">Deployment</span> &mdash; The process of taking code from your development environment and putting it into production where users can access it. In BSearch, there are three things that get deployed independently: infrastructure, the backend API, and the front-end web app.</p>
+  </div>
+
+  <p>BSearch has three deployment tracks:</p>
+
+  <ol>
+    <li><strong>Infrastructure</strong> &mdash; Run <code>az deployment group create</code> with the Bicep templates. This creates or updates all Azure services to match the template definitions. If a service already exists and is configured correctly, Azure skips it.</li>
+    <li><strong>Backend (FastAPI API)</strong> &mdash; The Python code is packaged and deployed to Azure App Service via zip deploy or Git deploy. Once deployed, the App Service restarts and begins serving the new code.</li>
+    <li><strong>Frontend (React web app)</strong> &mdash; The React application is built and deployed to Azure Static Web Apps. This happens automatically through GitHub integration &mdash; when code is merged to the main branch, Static Web Apps detects the change and deploys.</li>
+  </ol>
+
+  <p>The ingestion pipeline (Azure Functions) follows the same deployment mechanism as the backend &mdash; Python code packaged and deployed to the Functions service.</p>
+
+  <pre class="mermaid">
+flowchart LR
+    subgraph Code["Code Changes"]
+        BC["Bicep Templates"]
+        PY["Python (API + Ingestion)"]
+        RE["React (Frontend)"]
+    end
+
+    subgraph Deploy["Deployment"]
+        AZ["az deployment\ngroup create"]
+        ZIP["Zip / Git\nDeploy"]
+        GH["GitHub\nIntegration"]
+    end
+
+    subgraph Azure["Azure Services"]
+        INF["Infrastructure\n(Search, Cosmos, etc.)"]
+        APP["App Service\n(FastAPI)"]
+        FUN["Functions\n(Ingestion)"]
+        SWA["Static Web Apps\n(React UI)"]
+    end
+
+    BC --> AZ --> INF
+    PY --> ZIP --> APP
+    PY --> ZIP --> FUN
+    RE --> GH --> SWA
+
+    style Code fill:#e3f2fd,stroke:#4A7FB5
+    style Deploy fill:#fff3e0,stroke:#D4793A
+    style Azure fill:#e8f5e9,stroke:#2E7D5B
+  </pre>
+
+  <!-- ================================================================ -->
+  <!-- 9.4 Monitoring -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">9.4</span> Monitoring &mdash; Application Insights</h2>
+
+  <div class="definition">
+    <p><span class="term">Application Insights</span> &mdash; Azure&rsquo;s monitoring service. It collects data about every request the application handles &mdash; how long it took, whether it succeeded or failed, and any custom events the code reports. Think of it as a real-time dashboard for the application&rsquo;s health.</p>
+  </div>
+
+  <div class="definition">
+    <p><span class="term">p50 / p95 / p99 latency</span> &mdash; Percentile-based latency measurements. p50 means &ldquo;half of all requests finish faster than this.&rdquo; p95 means &ldquo;95% of requests finish faster than this&rdquo; &mdash; it captures the slow outliers. p99 captures the worst 1%. These tell you not just the average performance but how consistent it is.</p>
+  </div>
+
+  <p>BSearch tracks latency at every stage of the search pipeline: query parsing, embedding generation, index search, reranking, and answer synthesis. This makes it possible to pinpoint <em>which</em> stage is slow when a query takes longer than expected.</p>
+
+  <h3>Key Alerts</h3>
+
+  <p>The system sends alerts when something degrades or fails:</p>
+
+  <ul>
+    <li><strong>Reranker degraded</strong> &mdash; fires when Cohere&rsquo;s reranker fails 3 or more times in a window. BSearch falls back to its own scoring, but results may be less precise.</li>
+    <li><strong>Embedding fallback rate &gt;10%</strong> &mdash; fires when more than 10% of embedding requests are falling back to a secondary provider, indicating the primary (Voyage) may be experiencing issues.</li>
+    <li><strong>Search errors</strong> &mdash; fires when the search index returns errors, which would mean queries are failing entirely.</li>
+  </ul>
+
+  <h3>Custom Events</h3>
+
+  <p>Beyond standard request metrics, BSearch logs custom events for operational awareness:</p>
+
+  <ul>
+    <li><code>reranker_degraded</code> / <code>reranker_recovered</code> &mdash; tracks when the system enters and exits fallback mode for reranking.</li>
+    <li><code>neo4j_fallback</code> &mdash; the knowledge graph was unavailable, and the system fell back to search-only results.</li>
+    <li><code>embedding_fallback</code> &mdash; primary embedding provider was unavailable; a backup was used.</li>
+  </ul>
+
+  <h3>Dashboard</h3>
+
+  <p>A monitoring dashboard provides at-a-glance visibility into:</p>
+
+  <ul>
+    <li><strong>Query volume</strong> &mdash; how many searches per hour/day.</li>
+    <li><strong>Time-to-first-token (TTFT) by query type</strong> &mdash; how quickly users start seeing results, broken down by whether the query was a simple lookup, a synthesis question, etc.</li>
+    <li><strong>Cache hit rates</strong> &mdash; how often the system serves results from cache vs. running a fresh search.</li>
+  </ul>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>Application Insights is like the daily P&amp;L and risk report for a trading desk. You do not wait until quarter-end to discover a problem &mdash; you check the dashboard every morning. If latency spikes or errors increase, you see it immediately and can investigate before users start complaining. The alerts are like stop-loss triggers: automated notifications when a metric crosses a threshold.</p>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- 9.5 Blue-Green Re-Indexing -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">9.5</span> Blue-Green Re-Indexing</h2>
+
+  <div class="definition">
+    <p><span class="term">Blue-Green Deployment</span> &mdash; A deployment strategy where you run two identical environments (&ldquo;blue&rdquo; and &ldquo;green&rdquo;) side by side. You deploy changes to the inactive environment, verify everything works, then switch traffic to it. If something goes wrong, you switch back. Zero downtime, instant rollback.</p>
+  </div>
+
+  <p>There is a specific scenario where blue-green deployment is essential for BSearch: <strong>switching embedding providers</strong> (e.g., upgrading from one version of Voyage to a newer one, or switching to a different provider entirely).</p>
+
+  <h3>The Problem</h3>
+
+  <p>Every document chunk in the search index has a vector embedding &mdash; a list of 1,024 numbers generated by a specific AI model (currently Voyage <code>voyage-context-3</code>). When you search, your query is also embedded by the same model, and the system compares the two vectors using cosine similarity.</p>
+
+  <p>Here is the critical constraint: <strong>you cannot mix vectors from different embedding models in the same index.</strong> Cosine similarity between vectors from Model A and vectors from Model B is meaningless &mdash; the numbers represent completely different coordinate systems. It would be like comparing GPS coordinates to postal codes.</p>
+
+  <p>So if you want to switch embedding models, you have to re-embed all ~2.2 million chunks. That takes 1&ndash;2 hours. You cannot take the search index offline for 1&ndash;2 hours. Hence: blue-green re-indexing.</p>
+
+  <h3>The Solution</h3>
+
+  <pre class="mermaid">
+flowchart TB
+    subgraph Phase1["Phase 1: Build Green Index"]
+        A["Create new &lsquo;green&rsquo; index"] --> B["Re-embed all 2.2M chunks\nwith new model"]
+        B --> C["New files written to\nBOTH indexes"]
+    end
+
+    subgraph Phase2["Phase 2: Validate"]
+        D["Chunk counts match?"] --> E["Sample provenance check"]
+        E --> F["Run acceptance queries"]
+        F --> G["Calibrate dedup thresholds\n(similarity distributions differ\nacross models)"]
+    end
+
+    subgraph Phase3["Phase 3: Switch"]
+        H["Flip active index\nblue &rarr; green"] --> I["Users now searching\ngreen index"]
+        I --> J["Keep blue index 48h\nfor rollback"]
+    end
+
+    Phase1 --> Phase2 --> Phase3
+
+    style Phase1 fill:#e3f2fd,stroke:#4A7FB5
+    style Phase2 fill:#fff3e0,stroke:#D4793A
+    style Phase3 fill:#e8f5e9,stroke:#2E7D5B
+  </pre>
+
+  <ol>
+    <li><strong>Create a parallel &ldquo;green&rdquo; index.</strong> A brand-new search index is provisioned alongside the existing &ldquo;blue&rdquo; (live) index.</li>
+    <li><strong>Re-embed all chunks.</strong> Every chunk is processed through the new embedding model, and the resulting vectors are stored in the green index. This takes approximately 1&ndash;2 hours for 2.2 million chunks.</li>
+    <li><strong>During re-indexing, new files go to both indexes.</strong> Any documents that are added or updated while re-indexing is in progress are written to both the blue and green indexes, so neither falls behind.</li>
+    <li><strong>Validate the green index.</strong> Before switching:
+      <ul>
+        <li>Chunk counts must match between blue and green.</li>
+        <li>A sample of chunks is checked to confirm provenance (they trace back to the correct source documents).</li>
+        <li>A set of acceptance queries is run against the green index to verify result quality.</li>
+        <li>Deduplication thresholds are recalibrated &mdash; different embedding models produce different similarity score distributions, so the threshold for &ldquo;these two chunks are duplicates&rdquo; may need adjustment.</li>
+      </ul>
+    </li>
+    <li><strong>Flip the active index.</strong> Once validation passes, BSearch switches to serving queries from the green index. This is instantaneous from the user&rsquo;s perspective.</li>
+    <li><strong>Keep the old index for 48 hours.</strong> The blue index remains available as a rollback target. If the new model produces unexpectedly poor results in production, one configuration change switches back to blue. After 48 hours of stable operation, the old index is decommissioned.</li>
+  </ol>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>This is like migrating to a new data room provider mid-deal. You do not shut down the old data room, move all the files, and hope nothing breaks. Instead, you set up the new data room in parallel, copy everything over, verify the folder structure and permissions match, and only <em>then</em> send the new link to buyers. The old data room stays active for a few days in case you need to fall back. That is blue-green re-indexing.</p>
+  </div>
+
+  <div class="callout info">
+    <div class="callout-title">When does this happen?</div>
+    <p>Blue-green re-indexing is not a daily occurrence. It happens when BSearch upgrades its embedding model &mdash; perhaps once or twice a year, when a meaningfully better model becomes available. The process is fully automated; once triggered, it runs to completion without manual intervention.</p>
+  </div>
+
+  <div class="key-takeaway">
+    <div class="callout-title">Key Takeaway</div>
+    <p>BSearch runs on a set of managed Azure services with a total monthly cost of roughly $300&ndash;600 for 18 users. All infrastructure is defined in code (Bicep templates), making it repeatable and auditable. Deployments are split into three independent tracks (infrastructure, backend, frontend), and embedding model upgrades use a blue-green strategy to avoid any search downtime. Application Insights provides real-time monitoring with automated alerts when components degrade.</p>
+  </div>
+
+  <nav class="chapter-nav bottom">
+    <a href="chapter-08.html">&larr; Previous</a>
+    <span class="nav-spacer">|</span>
+    <a href="index.html">Contents</a>
+    <span class="nav-spacer">|</span>
+    <a href="chapter-10.html">Next &rarr;</a>
+  </nav>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad: true, theme: 'neutral'});</script>
+</body>
+</html>

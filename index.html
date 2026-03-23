@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light only">
+  <title>BSearch Technical Guide</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="page-wrapper">
+
+  <!-- Hero -->
+  <div class="hero">
+    <h1>BSearch Technical Guide</h1>
+    <p class="subtitle">Enterprise search for Berenson &amp; Company &mdash; every architectural decision, pipeline step, and technical concept explained for the builder.</p>
+  </div>
+
+  <hr>
+
+  <p>This guide is a comprehensive reference for understanding the BSearch system &mdash; an AI-powered enterprise search tool that finds documents across the firm's Microsoft 365 tenant and synthesizes answers from their content. Each chapter explains one aspect of the system, uses investment banking analogies where possible, and defines all technical jargon.</p>
+
+  <p><strong>How to use this guide:</strong> Read Chapters 1&ndash;3 first for context and core concepts. Then explore the remaining chapters in any order based on what you need to understand.</p>
+
+  <!-- Overview -->
+  <div class="toc-group">
+    <div class="group-label">Overview</div>
+    <ul class="toc-list">
+      <li>
+        <a href="chapter-01.html">
+          <span class="toc-chapter-num">01</span>
+          <span class="toc-chapter-title">Executive Summary</span>
+        </a>
+        <div class="toc-chapter-desc">What BSearch is, the problem it solves, key constraints, and the end-to-end user experience.</div>
+      </li>
+      <li>
+        <a href="chapter-02.html">
+          <span class="toc-chapter-num">02</span>
+          <span class="toc-chapter-title">Architecture Overview</span>
+        </a>
+        <div class="toc-chapter-desc">The big picture: every service, API, and database in the system and how they connect.</div>
+      </li>
+    </ul>
+  </div>
+
+  <!-- Core Concepts -->
+  <div class="toc-group">
+    <div class="group-label">Core Concepts</div>
+    <ul class="toc-list">
+      <li>
+        <a href="chapter-03.html">
+          <span class="toc-chapter-num">03</span>
+          <span class="toc-chapter-title">How Search Works</span>
+        </a>
+        <div class="toc-chapter-desc">Search indexes, keyword search, vector search, hybrid search, reranking, chunking, and embeddings &mdash; the concepts behind the engine.</div>
+      </li>
+    </ul>
+  </div>
+
+  <!-- The Pipelines -->
+  <div class="toc-group">
+    <div class="group-label">The Pipelines</div>
+    <ul class="toc-list">
+      <li>
+        <a href="chapter-04.html">
+          <span class="toc-chapter-num">04</span>
+          <span class="toc-chapter-title">The Ingestion Pipeline</span>
+        </a>
+        <div class="toc-chapter-desc">How documents go from SharePoint files to searchable, AI-ready index entries &mdash; the 9-step journey.</div>
+      </li>
+      <li>
+        <a href="chapter-05.html">
+          <span class="toc-chapter-num">05</span>
+          <span class="toc-chapter-title">The Query Pipeline</span>
+        </a>
+        <div class="toc-chapter-desc">What happens when you ask BSearch a question &mdash; from classification to streaming AI synthesis.</div>
+      </li>
+    </ul>
+  </div>
+
+  <!-- System Design -->
+  <div class="toc-group">
+    <div class="group-label">System Design</div>
+    <ul class="toc-list">
+      <li>
+        <a href="chapter-06.html">
+          <span class="toc-chapter-num">06</span>
+          <span class="toc-chapter-title">Relevance &amp; Quality Controls</span>
+        </a>
+        <div class="toc-chapter-desc">How the system ensures you get the right answers: confidence gating, reranker health, embedding resilience, and deduplication.</div>
+      </li>
+      <li>
+        <a href="chapter-07.html">
+          <span class="toc-chapter-num">07</span>
+          <span class="toc-chapter-title">The Data Model</span>
+        </a>
+        <div class="toc-chapter-desc">The search index schema, Cosmos DB collections, and Neo4j knowledge graph &mdash; where every piece of data lives.</div>
+      </li>
+      <li>
+        <a href="chapter-08.html">
+          <span class="toc-chapter-num">08</span>
+          <span class="toc-chapter-title">Authentication &amp; Permissions</span>
+        </a>
+        <div class="toc-chapter-desc">How users log in and how the system enforces folder-level access control.</div>
+      </li>
+    </ul>
+  </div>
+
+  <!-- Operations -->
+  <div class="toc-group">
+    <div class="group-label">Operations</div>
+    <ul class="toc-list">
+      <li>
+        <a href="chapter-09.html">
+          <span class="toc-chapter-num">09</span>
+          <span class="toc-chapter-title">Infrastructure &amp; Deployment</span>
+        </a>
+        <div class="toc-chapter-desc">Azure services, Bicep templates, deployment process, monitoring, and the blue-green re-indexing strategy.</div>
+      </li>
+      <li>
+        <a href="chapter-10.html">
+          <span class="toc-chapter-num">10</span>
+          <span class="toc-chapter-title">Implementation Roadmap</span>
+        </a>
+        <div class="toc-chapter-desc">The 6-phase build plan, acceptance tests, scope boundaries, and future roadmap.</div>
+      </li>
+    </ul>
+  </div>
+
+  <!-- Reference -->
+  <div class="toc-group">
+    <div class="group-label">Reference</div>
+    <ul class="toc-list">
+      <li>
+        <a href="chapter-11.html">
+          <span class="toc-chapter-num">11</span>
+          <span class="toc-chapter-title">Key Design Decisions</span>
+        </a>
+        <div class="toc-chapter-desc">All 18 architecture decisions: what was chosen, why, what was considered, and when to revisit.</div>
+      </li>
+      <li>
+        <a href="chapter-12.html">
+          <span class="toc-chapter-num">12</span>
+          <span class="toc-chapter-title">Failure Modes &amp; Resilience</span>
+        </a>
+        <div class="toc-chapter-desc">What can go wrong, how the system recovers, and what the user sees &mdash; organized by impact severity.</div>
+      </li>
+      <li>
+        <a href="chapter-13.html">
+          <span class="toc-chapter-num">13</span>
+          <span class="toc-chapter-title">Glossary</span>
+        </a>
+        <div class="toc-chapter-desc">Every technical term used in this guide, defined in plain English with BSearch context.</div>
+      </li>
+    </ul>
+  </div>
+
+  <hr>
+
+  <p class="text-center text-muted text-small">Built for Berenson &amp; Company. Powered by Claude, Azure, and too much coffee.</p>
+
+</div>
+
+</body>
+</html>

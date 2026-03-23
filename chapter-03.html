@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light only">
+  <title>Chapter 3: How Search Works — BSearch Technical Guide</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="page-wrapper">
+  <nav class="chapter-nav">
+    <a href="chapter-02.html">&larr; Previous: Architecture Overview</a>
+    <span class="nav-spacer">|</span>
+    <a href="index.html">Contents</a>
+    <span class="nav-spacer">|</span>
+    <a href="chapter-04.html">Next: The Ingestion Pipeline &rarr;</a>
+  </nav>
+  <div class="chapter-header">
+    <div class="chapter-number">Chapter 3</div>
+    <h1>How Search Works</h1>
+    <p class="chapter-subtitle">The concepts behind the engine &mdash; from keyword matching to AI-powered understanding.</p>
+  </div>
+
+  <p>Before diving into pipelines and code, you need a mental model for <em>how</em> BSearch finds the right document out of 550,000 candidates in under two seconds. This chapter explains each concept from scratch, using investment banking analogies wherever possible. If you understand this chapter, everything else in the guide will click into place.</p>
+
+  <!-- ================================================================ -->
+  <!-- 3.1 The Search Index -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">3.1</span> The Search Index</h2>
+
+  <div class="definition">
+    <p><span class="term">Search Index</span> &mdash; A pre-built data structure that maps words, phrases, and concepts to the documents that contain them. Think of it as a highly organized lookup table that lets the system skip reading every document for every query.</p>
+  </div>
+
+  <p>Open any textbook and flip to the back. The index tells you &ldquo;the word <em>amortization</em> appears on pages 14, 87, and 203.&rdquo; You don&rsquo;t need to read 300 pages to find what you need &mdash; you look it up in the index and jump straight to the right pages.</p>
+
+  <p>BSearch works the same way. Azure AI Search maintains an index of all ~550,000 documents across the firm. For every document, the index stores:</p>
+
+  <ul>
+    <li><strong>The text content</strong> &mdash; the actual words in the document, broken into searchable pieces.</li>
+    <li><strong>Metadata</strong> &mdash; filename, file type, SharePoint path, last-modified date, which deal folder it lives in.</li>
+    <li><strong>Vector representations</strong> &mdash; a list of 1,024 numbers that capture the <em>meaning</em> of the text (more on this in Section 3.3).</li>
+  </ul>
+
+  <p>When you search, the system queries this index instead of opening half a million files. That is why results come back in milliseconds, not minutes.</p>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>Imagine you had to find every deal with &ldquo;healthcare services&rdquo; exposure. You could open every folder on SharePoint and read every CIM, or you could check a master log that already catalogues what each deal covers. The search index is that master log.</p>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- 3.2 BM25 Keyword Search -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">3.2</span> BM25 Keyword Search</h2>
+
+  <div class="definition">
+    <p><span class="term">BM25</span> (Best Match 25) &mdash; A mathematical formula for scoring how well a document matches a set of search words. It is the industry-standard algorithm behind traditional keyword search &mdash; think Google circa 2005.</p>
+  </div>
+
+  <p>Keyword search is the simplest form of search: find documents that contain the exact words the user typed. BM25 improves on raw word-matching by considering two factors:</p>
+
+  <ol>
+    <li><strong>How often the search term appears in the document</strong> &mdash; more mentions = more relevant (up to a point).</li>
+    <li><strong>How rare the search term is across all documents</strong> &mdash; a match on a rare word like &ldquo;Catalyst&rdquo; is worth more than a match on a common word like &ldquo;the.&rdquo;</li>
+  </ol>
+
+  <p>If you search for <strong>&ldquo;Catalyst CIM&rdquo;</strong>, BM25 works beautifully. It finds every document containing those exact words and ranks them by relevance. Fast, precise, predictable.</p>
+
+  <p>But keyword search has a fundamental limitation: <strong>it only matches on exact words, not on meaning.</strong> If you search for <strong>&ldquo;trading multiple&rdquo;</strong> but the document says <strong>&ldquo;EV/EBITDA&rdquo;</strong>, keyword search will miss it entirely. Those are the same concept expressed in different words, and BM25 has no idea.</p>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>Keyword search is like searching a filing cabinet by the exact label on each folder. If you ask for &ldquo;Project Falcon materials,&rdquo; you will find the folder labeled &ldquo;Project Falcon.&rdquo; But if someone labeled it &ldquo;Falcon Deal Docs&rdquo; instead, you might walk right past it. The labels have to match your words exactly.</p>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- 3.3 Vector Search & Embeddings -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">3.3</span> Vector Search &amp; Embeddings</h2>
+
+  <div class="definition">
+    <p><span class="term">Embedding</span> &mdash; A list of numbers (in BSearch&rsquo;s case, 1,024 numbers) that represents the <em>meaning</em> of a piece of text. The AI model converts words into coordinates in a high-dimensional &ldquo;meaning space.&rdquo;</p>
+  </div>
+
+  <div class="definition">
+    <p><span class="term">Vector</span> &mdash; A list of numbers that represents a point in space. In everyday life, a GPS coordinate is a 2-number vector (latitude, longitude). BSearch&rsquo;s vectors use 1,024 numbers to pinpoint a text&rsquo;s position in &ldquo;meaning space.&rdquo;</p>
+  </div>
+
+  <p>This is the concept that makes modern search dramatically better than keyword matching. Here is the intuition:</p>
+
+  <p>An AI model (BSearch uses Voyage <code>voyage-context-3</code>) reads a piece of text and converts it into a list of 1,024 numbers. These numbers are not random &mdash; they represent coordinates in a vast &ldquo;meaning space&rdquo; where texts about similar topics end up near each other.</p>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy &mdash; GPS Coordinates</div>
+    <p>Think of GPS coordinates. Two restaurants in the same neighborhood have similar coordinates even though they have completely different names. &ldquo;Joe&rsquo;s Pizza&rdquo; at (40.748, -73.985) and &ldquo;Mario&rsquo;s Trattoria&rdquo; at (40.749, -73.984) are clearly near each other &mdash; you can tell just by comparing the numbers, no matter what they are called.</p>
+    <p>Embeddings work the same way for meaning. &ldquo;Trading multiple&rdquo; and &ldquo;EV/EBITDA&rdquo; end up at nearby coordinates in meaning-space, because the AI model understands they refer to the same concept. The words are different, but the meaning is close.</p>
+  </div>
+
+  <p>When you search, your query also gets converted into a 1,024-number vector. The system then finds documents whose vectors are closest to your query&rsquo;s vector &mdash; meaning the documents whose <em>meaning</em> is closest to what you asked for.</p>
+
+  <h3>How &ldquo;closeness&rdquo; is measured: Cosine Similarity</h3>
+
+  <div class="definition">
+    <p><span class="term">Cosine Similarity</span> &mdash; A mathematical way to measure how similar two vectors are by looking at the angle between them. If two vectors point in the same direction, the angle is zero and the similarity is 1.0 (perfect match). If they point in completely different directions, the similarity is 0 (no relationship).</p>
+  </div>
+
+  <p>You do not need to understand the math. The key insight is: <strong>smaller angle = more similar meaning.</strong> When BSearch compares your query vector to 550,000 document vectors, it is measuring the angle between each pair and returning the ones with the smallest angles &mdash; the closest meanings.</p>
+
+  <!-- Embedding diagram -->
+  <h3>How Embeddings Work</h3>
+
+  <pre class="mermaid">
+flowchart LR
+    A["&ldquo;trading multiple&rdquo;"] --> B["Voyage AI Model"]
+    C["&ldquo;EV/EBITDA ratio&rdquo;"] --> B
+    D["&ldquo;office lease agreement&rdquo;"] --> B
+    B --> E["[0.82, 0.15, -0.43, &hellip;]\n1,024 numbers"]
+    B --> F["[0.79, 0.18, -0.41, &hellip;]\n1,024 numbers"]
+    B --> G["[-0.12, 0.67, 0.33, &hellip;]\n1,024 numbers"]
+    E -. "close together\n(similar meaning)" .-> F
+    G -. "far apart\n(different meaning)" .-x E
+
+    style E fill:#e8f5e9,stroke:#2E7D5B
+    style F fill:#e8f5e9,stroke:#2E7D5B
+    style G fill:#fff3e0,stroke:#C4612A
+  </pre>
+
+  <p>In the diagram above, &ldquo;trading multiple&rdquo; and &ldquo;EV/EBITDA ratio&rdquo; produce similar vectors (their numbers are close), even though the words are completely different. &ldquo;Office lease agreement&rdquo; produces a very different vector because it is about a different topic entirely.</p>
+
+  <!-- ================================================================ -->
+  <!-- 3.4 Hybrid Search -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">3.4</span> Hybrid Search</h2>
+
+  <div class="definition">
+    <p><span class="term">Hybrid Search</span> &mdash; Running keyword search (BM25) and vector search simultaneously, then merging the results. Belt and suspenders &mdash; you get the precision of exact matching <em>and</em> the intelligence of semantic understanding.</p>
+  </div>
+
+  <p>BSearch does not choose between keyword search and vector search. It runs <strong>both at the same time</strong> and combines the results. This is called hybrid search, and here is why it matters:</p>
+
+  <div class="comparison">
+    <div class="comparison-col">
+      <h4>Keyword Search (BM25) is great at&hellip;</h4>
+      <ul>
+        <li>Finding exact names (&ldquo;Project Falcon&rdquo;)</li>
+        <li>Matching ticker symbols (&ldquo;AAPL&rdquo;)</li>
+        <li>Locating specific deal codes</li>
+        <li>Speed &mdash; very fast lookups</li>
+      </ul>
+    </div>
+    <div class="comparison-col">
+      <h4>Vector Search is great at&hellip;</h4>
+      <ul>
+        <li>Understanding synonyms and related concepts</li>
+        <li>Matching &ldquo;trading multiple&rdquo; to &ldquo;EV/EBITDA&rdquo;</li>
+        <li>Handling natural-language questions</li>
+        <li>Finding conceptually similar documents</li>
+      </ul>
+    </div>
+  </div>
+
+  <p>Neither one is perfect on its own. Keyword search misses conceptual matches; vector search can sometimes miss exact names because it focuses on meaning rather than specific words. By running both and merging the results, BSearch catches what either method alone would miss.</p>
+
+  <!-- Hybrid search flow diagram -->
+  <h3>The Hybrid Search Flow</h3>
+
+  <pre class="mermaid">
+flowchart TB
+    Q["User Query"] --> KW["BM25 Keyword Search\n&ldquo;Find exact word matches&rdquo;"]
+    Q --> VS["Vector Search\n&ldquo;Find similar meanings&rdquo;"]
+    KW --> M["Merge &amp; Deduplicate\nTop 20 candidates"]
+    VS --> M
+    M --> RR["Reranker (Cohere)\nRe-scores against query"]
+    RR --> R["Top 5 Results\nReturned to user"]
+
+    style Q fill:#fff3e0,stroke:#D4793A
+    style KW fill:#e3f2fd,stroke:#4A7FB5
+    style VS fill:#e8f5e9,stroke:#2E7D5B
+    style M fill:#f3ece2,stroke:#8B7B6F
+    style RR fill:#fce4ec,stroke:#C4612A
+    style R fill:#fff3e0,stroke:#D4793A
+  </pre>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>Think of it like sourcing a deal. You run two searches in parallel: one analyst checks your proprietary database for exact company name matches, while another scans industry reports for companies with similar business models. You then combine both lists, remove duplicates, and review the unified candidate set. Hybrid search is doing exactly this &mdash; two different approaches, merged into one result.</p>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- 3.5 Reranking -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">3.5</span> Reranking</h2>
+
+  <div class="definition">
+    <p><span class="term">Reranking</span> &mdash; A second-pass AI model that takes the initial search results and re-scores them against the original query to find the truly best matches. BSearch uses Cohere&rsquo;s reranker for this step.</p>
+  </div>
+
+  <p>The hybrid search step (Section 3.4) returns the top 20 candidate results. But &ldquo;top 20&rdquo; from a fast, broad search is not the same as &ldquo;the 5 best answers.&rdquo; The initial search optimizes for speed and recall (not missing anything relevant). Reranking optimizes for precision (finding the <em>most</em> relevant).</p>
+
+  <p>Here is how it works: a specialized AI model from Cohere reads each of the 20 candidates alongside the original query and assigns a new relevance score. This model is slower than the initial search (it reads every word, not just vectors), but it only has to evaluate 20 documents instead of 550,000, so it is still fast.</p>
+
+  <p>The reranker then returns the top 5, re-ordered by how well they actually answer the question.</p>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>A junior analyst does a first pass and pulls 20 comparable companies from CapIQ. They cast a wide net &mdash; any company in the right sector, right size range. Then a senior associate reviews the list and narrows it to the 5 that truly fit: right business model, right growth profile, right transaction type. The junior analyst is the hybrid search. The senior associate is the reranker.</p>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">Why not rerank all 550K?</div>
+    <p>The reranker is much more accurate than the initial search, but it is also much slower per-document. Reranking 20 documents takes about 200 milliseconds. Reranking 550,000 would take hours. The two-stage approach gives you the best of both worlds: broad coverage from the fast initial search, then surgical precision from the reranker on a small candidate set.</p>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- 3.6 Chunking -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">3.6</span> Chunking</h2>
+
+  <div class="definition">
+    <p><span class="term">Chunking</span> &mdash; Breaking a document into smaller, overlapping pieces (typically 800&ndash;1,000 tokens, roughly 600&ndash;750 words each) before storing them in the search index.</p>
+  </div>
+
+  <div class="definition">
+    <p><span class="term">Token</span> &mdash; The smallest unit of text that an AI model processes. Roughly, 1 token &asymp; 0.75 words. A 50-page CIM might be ~40,000 tokens.</p>
+  </div>
+
+  <p>You cannot feed a 50-page CIM to the search index as a single entry. There are two reasons:</p>
+
+  <ol>
+    <li><strong>Embedding models have size limits.</strong> The Voyage model can only process a limited amount of text at once. A full CIM would exceed that limit.</li>
+    <li><strong>Search needs precision.</strong> If a user asks about a specific company&rsquo;s revenue, the answer is on one page of a 50-page CIM. Returning &ldquo;the entire CIM&rdquo; as a search result is not useful. Returning the specific section about revenue is.</li>
+  </ol>
+
+  <p>So before indexing, BSearch breaks each document into chunks of roughly 800&ndash;1,000 tokens. Each chunk becomes its own entry in the search index, with its own vector embedding.</p>
+
+  <h3>Different strategies for different content</h3>
+
+  <p>Not all documents are alike. A 30-page narrative CIM, a financial model with dense tables, and a 10-slide management presentation all need different chunking strategies:</p>
+
+  <ul>
+    <li><strong>Narrative text</strong> (CIMs, memos, engagement letters) &mdash; split at natural paragraph boundaries, with some overlap between chunks so that context is not lost at the edges.</li>
+    <li><strong>Tables</strong> (financial data, comp tables) &mdash; kept together where possible. Splitting a table across two chunks would make both halves meaningless.</li>
+    <li><strong>Slides</strong> (pitch books, board presentations) &mdash; each slide or small group of slides becomes its own chunk, since slides are already self-contained units.</li>
+  </ul>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>Chunking is like the difference between filing an entire pitch book as one item versus filing each section separately (overview, situation analysis, valuation, transaction summary). When someone asks &ldquo;what was the valuation methodology?&rdquo; you can pull just the valuation section instead of handing them the whole deck and saying &ldquo;it&rsquo;s in here somewhere.&rdquo;</p>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- 3.7 Recency Boosting -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">3.7</span> Recency Boosting</h2>
+
+  <div class="definition">
+    <p><span class="term">Recency Boosting</span> &mdash; Giving newer documents a higher search score. In BSearch, documents modified within the last 30 days receive a 1.5&times; score multiplier.</p>
+  </div>
+
+  <p>In investment banking, the most recent version of a document is almost always the one you want. If there are five drafts of a purchase agreement, you want the latest one. If two CIMs exist for the same company, the newer one reflects current financials.</p>
+
+  <p>BSearch applies a 1.5&times; boost to the relevance score of any document modified in the last 30 days. This means that if a recent document and an older document are equally relevant based on content, the recent one will rank higher. The boost is a multiplier, not an override &mdash; a highly relevant old document will still beat a barely relevant new one.</p>
+
+  <div class="callout info">
+    <div class="callout-title">Why 1.5&times; and 30 days?</div>
+    <p>These numbers are tuned for IB workflows. Active deals have a ~2&ndash;4 week lifecycle for document updates, so 30 days captures the &ldquo;current deal&rdquo; window. The 1.5&times; multiplier is strong enough to push recent docs up the rankings without burying legitimately relevant older documents. Both values can be adjusted if usage patterns change.</p>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- 3.8 Contextual Embeddings -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">3.8</span> Contextual Embeddings</h2>
+
+  <div class="definition">
+    <p><span class="term">Contextual Embedding</span> &mdash; An embedding (Section 3.3) where each chunk is processed <em>with awareness of the full document it came from</em>, not in isolation. BSearch uses Voyage&rsquo;s <code>voyage-context-3</code> model, which is specifically designed for this.</p>
+  </div>
+
+  <p>Remember from Section 3.6 that documents get broken into chunks before indexing. This creates a problem: a chunk in isolation can be ambiguous or even meaningless.</p>
+
+  <p>Consider this chunk of text from a CIM:</p>
+
+  <pre><code>Revenue was $45M in FY2024, representing a 12% year-over-year increase
+driven primarily by new customer acquisition in the Southeast region.</code></pre>
+
+  <p>If you embed this chunk by itself, the AI model sees &ldquo;some company had $45M in revenue.&rdquo; But <em>which</em> company? What industry? Is this a healthcare services company or a SaaS platform? The chunk does not say.</p>
+
+  <p>Contextual embeddings solve this. The Voyage <code>voyage-context-3</code> model processes each chunk alongside a summary of the full document. So when it embeds the revenue chunk, it knows this is from &ldquo;Project Catalyst &mdash; a CIM for Acme Healthcare Services, a provider of home health and hospice services in the Southeastern United States.&rdquo; The resulting vector captures not just &ldquo;$45M revenue&rdquo; but &ldquo;$45M revenue <em>for a home health company</em>.&rdquo;</p>
+
+  <p>This dramatically improves search quality. When you search for &ldquo;home health revenue,&rdquo; that chunk will now rank highly because its embedding includes the full context of the document it belongs to.</p>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>Imagine an analyst hands you a single page with a financial summary. Without knowing what deal it is from, the numbers are just numbers. But if the analyst says &ldquo;this is page 14 from the Catalyst CIM &mdash; it&rsquo;s a home health company in the Southeast,&rdquo; those same numbers suddenly tell a story. Contextual embeddings give the AI that same &ldquo;which deal is this from?&rdquo; awareness for every chunk.</p>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- Putting It All Together -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">3.9</span> Putting It All Together</h2>
+
+  <p>Here is the full picture of how a search query flows through BSearch, using every concept from this chapter:</p>
+
+  <ol>
+    <li><strong>You type a query</strong> &mdash; &ldquo;Find healthcare services CIMs with revenue over $30M.&rdquo;</li>
+    <li><strong>Your query gets embedded</strong> &mdash; the Voyage model converts it into a 1,024-number vector (Section 3.3).</li>
+    <li><strong>Hybrid search runs</strong> &mdash; BM25 keyword search and vector search both query the index simultaneously (Section 3.4).</li>
+    <li><strong>Results are merged</strong> &mdash; the top results from both searches are combined and deduplicated into a candidate set of ~20 chunks.</li>
+    <li><strong>Recency boosting is applied</strong> &mdash; recent documents get a 1.5&times; score bump (Section 3.7).</li>
+    <li><strong>Reranking</strong> &mdash; Cohere&rsquo;s reranker reads each of the 20 candidates against your original query and picks the top 5 (Section 3.5).</li>
+    <li><strong>Results are returned</strong> &mdash; the top 5 chunks, with their source documents, are presented to you (or passed to the AI for answer synthesis).</li>
+  </ol>
+
+  <p>Every chunk in the index was created through chunking (Section 3.6) and embedded with contextual awareness (Section 3.8), so the vectors are as meaningful and precise as possible.</p>
+
+  <div class="key-takeaway">
+    <div class="callout-title">Key Takeaway</div>
+    <p>BSearch does not rely on any single search technique. It layers multiple approaches &mdash; keyword matching, semantic vectors, recency boosting, and AI reranking &mdash; so that each method covers the others&rsquo; blind spots. The result: whether you search by exact deal name, by concept, or by natural-language question, the right documents surface.</p>
+  </div>
+
+  <nav class="chapter-nav bottom">
+    <a href="chapter-02.html">&larr; Previous</a>
+    <span class="nav-spacer">|</span>
+    <a href="index.html">Contents</a>
+    <span class="nav-spacer">|</span>
+    <a href="chapter-04.html">Next &rarr;</a>
+  </nav>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad: true, theme: 'neutral'});</script>
+</body>
+</html>

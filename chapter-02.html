@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light only">
+  <title>Chapter 2: Architecture Overview — BSearch Technical Guide</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="page-wrapper">
+  <nav class="chapter-nav">
+    <a href="chapter-01.html">&larr; Previous: Executive Summary</a>
+    <span class="nav-spacer">|</span>
+    <a href="index.html">Contents</a>
+    <span class="nav-spacer">|</span>
+    <a href="chapter-03.html">Next: How Search Works &rarr;</a>
+  </nav>
+  <div class="chapter-header">
+    <div class="chapter-number">Chapter 2</div>
+    <h1>Architecture Overview</h1>
+    <p class="chapter-subtitle">The big picture &mdash; every service, API, and database in the system and how they connect.</p>
+  </div>
+
+  <!-- ============================================================ -->
+  <!-- 2.1 Big Picture -->
+  <!-- ============================================================ -->
+  <h2><span class="section-number">2.1</span> The Big Picture</h2>
+
+  <p>At its core, BSearch has two jobs:</p>
+
+  <ol>
+    <li><strong>Get documents ready to search</strong> &mdash; take every file in Berenson's SharePoint and OneDrive, break it into searchable pieces, and store those pieces in an index.</li>
+    <li><strong>Answer questions</strong> &mdash; take a user's question, find the most relevant pieces, and use AI to synthesize an answer with citations back to the original files.</li>
+  </ol>
+
+  <p>These two jobs are handled by two separate <strong>pipelines</strong> (a pipeline is just a sequence of steps that data flows through, one after another, like an assembly line). The two pipelines are connected by a shared <strong>search index</strong> &mdash; a specialized database optimized for finding things fast.</p>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>Think of it like the sell-side process. The <strong>ingestion pipeline</strong> is the preparation phase &mdash; gathering materials, organizing the data room, tagging documents by deal and type. The <strong>query pipeline</strong> is the buyer Q&amp;A phase &mdash; someone asks a question, the team finds the relevant documents, and drafts a precise answer with source references. The <strong>search index</strong> is the data room itself &mdash; organized, indexed, and searchable.</p>
+  </div>
+
+  <pre class="mermaid">
+flowchart LR
+    subgraph Sources["Document Sources"]
+        SP["SharePoint &amp;\nOneDrive\n~550K docs"]
+    end
+
+    subgraph Ingestion["Ingestion Pipeline"]
+        direction TB
+        PARSE["Parse &amp; Extract"]
+        CHUNK["Chunk &amp; Embed"]
+        PARSE --> CHUNK
+    end
+
+    subgraph Index["Search Index"]
+        AI_SEARCH["Azure AI Search\nvectors + keywords\n+ metadata"]
+    end
+
+    subgraph Query["Query Pipeline"]
+        direction TB
+        CLASSIFY["Classify Question"]
+        SEARCH["Search &amp; Rerank"]
+        SYNTH["AI Synthesis"]
+        CLASSIFY --> SEARCH --> SYNTH
+    end
+
+    subgraph Users["Users"]
+        WEB["Web App"]
+    end
+
+    SP -->|"Microsoft\nGraph API"| Ingestion
+    Ingestion --> Index
+    Index --> Query
+    Query --> Users
+  </pre>
+  <p class="text-muted text-small text-center">Figure 2.1 &mdash; The two pipelines connected by the search index.</p>
+
+  <!-- ============================================================ -->
+  <!-- 2.2 Cast of Characters -->
+  <!-- ============================================================ -->
+  <h2><span class="section-number">2.2</span> Cast of Characters</h2>
+
+  <p>BSearch is built from about a dozen external services and APIs, each doing one job. Here is every piece of the system, what it does, what it costs, and why it was chosen over alternatives.</p>
+
+  <h3>Infrastructure &amp; Storage</h3>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Service</th>
+        <th>Role</th>
+        <th>Approx. Cost</th>
+        <th>Why This One</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Azure AI Search</strong> (S1/S2)</td>
+        <td>The search index &mdash; stores document chunks with both vector embeddings and keywords, enabling hybrid search</td>
+        <td>~$250&ndash;500/mo</td>
+        <td>Supports hybrid search (vector + BM25), built-in scoring profiles for recency boosting, and native Azure integration</td>
+      </tr>
+      <tr>
+        <td><strong>Azure App Service</strong> (B1)</td>
+        <td>Hosts the search API (the FastAPI backend that handles queries)</td>
+        <td>~$13/mo</td>
+        <td>Always-on &mdash; no cold starts, which matters for the &lt;3s latency target. Built-in Python support</td>
+      </tr>
+      <tr>
+        <td><strong>Azure Durable Functions</strong></td>
+        <td>Runs the ingestion pipeline &mdash; both bulk imports and webhook-triggered updates</td>
+        <td>Pay-per-use</td>
+        <td>Fan-out/fan-in pattern for parallel document processing, built-in checkpointing and automatic retries</td>
+      </tr>
+      <tr>
+        <td><strong>Azure Static Web Apps</strong></td>
+        <td>Hosts the React web app (the UI users interact with)</td>
+        <td>Free tier</td>
+        <td>Built-in Azure AD authentication, served from a CDN (content delivery network &mdash; servers close to the user for fast load times)</td>
+      </tr>
+      <tr>
+        <td><strong>Cosmos DB</strong> (serverless)</td>
+        <td>Stores conversations, sync tokens, webhook subscriptions, and the retry queue</td>
+        <td>~$0 at 18 users</td>
+        <td>Scales to zero &mdash; you only pay for actual usage, which is near-zero at our scale</td>
+      </tr>
+      <tr>
+        <td><strong>Neo4j Aura</strong></td>
+        <td>Knowledge graph &mdash; stores relationships between deals, companies, people, and financial data</td>
+        <td>Free (dev) / ~$65/mo (prod)</td>
+        <td>Purpose-built graph database for traversing entity relationships (e.g., &ldquo;which deals involved Company X as a target?&rdquo;)</td>
+      </tr>
+      <tr>
+        <td><strong>Azure Document Intelligence</strong></td>
+        <td>Parses PDFs &mdash; especially scanned documents and complex layouts like CIMs with tables and watermarks</td>
+        <td>Pay-per-page</td>
+        <td>Handles the hard cases that simple text extraction misses: scanned pages, multi-column layouts, embedded tables</td>
+      </tr>
+      <tr>
+        <td><strong>Azure Key Vault</strong></td>
+        <td>Stores API keys and secrets securely</td>
+        <td>Minimal</td>
+        <td>Azure-native secrets management &mdash; no API keys stored in code</td>
+      </tr>
+      <tr>
+        <td><strong>Application Insights</strong></td>
+        <td>Monitoring and alerting &mdash; tracks latency, errors, and usage</td>
+        <td>Included</td>
+        <td>Latency tracking per pipeline stage (p50/p95), error alerts, usage dashboards</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>AI &amp; ML Services</h3>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Service</th>
+        <th>Role</th>
+        <th>Approx. Cost</th>
+        <th>Why This One</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Claude Sonnet 4.6</strong> (Anthropic)</td>
+        <td>AI synthesis &mdash; reads the retrieved document chunks and generates a natural-language answer with inline citations</td>
+        <td>~$11/mo at 50&ndash;200 queries/day</td>
+        <td>Best reasoning quality for synthesis tasks. Streaming support for fast time-to-first-token</td>
+      </tr>
+      <tr>
+        <td><strong>Claude Haiku 4.5</strong> (Anthropic)</td>
+        <td>Lightweight AI tasks &mdash; query classification, metadata extraction from documents, document summaries</td>
+        <td>~$0.10&ndash;0.40/day</td>
+        <td>Fast and cheap. Good enough for classification and extraction where top-tier reasoning is not needed</td>
+      </tr>
+      <tr>
+        <td><strong>Voyage AI</strong> (voyage-context-3)</td>
+        <td>Converts text into vector embeddings &mdash; numerical representations that capture meaning (1024 dimensions)</td>
+        <td>Pay-per-token</td>
+        <td>Contextual embeddings that outperform OpenAI by ~14% on retrieval benchmarks. 32K token context window</td>
+      </tr>
+      <tr>
+        <td><strong>Cohere Rerank</strong></td>
+        <td>Re-scores search results by comparing each one against the original question for relevance</td>
+        <td>Pay-per-query</td>
+        <td>Cross-encoder scoring &mdash; reads the query and each chunk together rather than comparing pre-computed scores, which is more accurate</td>
+      </tr>
+      <tr>
+        <td><strong>Microsoft Graph API</strong></td>
+        <td>Accesses SharePoint and OneDrive files, manages webhooks for real-time change notifications</td>
+        <td>Free (with M365 license)</td>
+        <td>The official and only API for reading M365 content. Already included in Berenson's M365 subscription</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="definition">
+    <p><span class="term">Vector embedding:</span> A list of numbers (in this case, 1024 numbers) that represents the <em>meaning</em> of a piece of text. Two pieces of text with similar meanings will have similar numbers, even if they use completely different words. This is how BSearch can find documents about &ldquo;enterprise value&rdquo; when you search for &ldquo;valuation.&rdquo;</p>
+  </div>
+
+  <div class="definition">
+    <p><span class="term">BM25:</span> A traditional keyword-matching algorithm &mdash; the same type of search that powers Google&rsquo;s basic text matching. It finds documents that contain the exact words you typed. BSearch uses BM25 <em>alongside</em> vector search so that exact matches (like file names or deal names) are not missed.</p>
+  </div>
+
+  <div class="callout info">
+    <div class="callout-title">Cost Note</div>
+    <p>The total monthly cost for BSearch is roughly <strong>$300&ndash;600</strong>, dominated by the Azure AI Search index tier. At 18 users and 50&ndash;200 queries per day, the AI API costs (Claude, Voyage, Cohere) are modest &mdash; the per-query costs are fractions of a cent. The most expensive single item is the search index, which is a fixed monthly fee regardless of usage.</p>
+  </div>
+
+  <!-- ============================================================ -->
+  <!-- 2.3 Two Pipelines -->
+  <!-- ============================================================ -->
+  <h2><span class="section-number">2.3</span> The Two Pipelines</h2>
+
+  <h3>The Ingestion Pipeline: Documents &rarr; Index</h3>
+
+  <p>The ingestion pipeline is a background process that continuously keeps the search index up to date with the firm's documents. It runs in two modes:</p>
+
+  <ul>
+    <li><strong>Bulk import:</strong> The initial run that processes all ~550K documents. This runs once (and again whenever a full re-index is needed).</li>
+    <li><strong>Incremental updates:</strong> Triggered by webhooks (real-time notifications from Microsoft Graph) whenever a file is created, modified, or deleted. These keep the index current without re-processing everything.</li>
+  </ul>
+
+  <p>The pipeline follows these steps for each document:</p>
+
+  <pre class="mermaid">
+flowchart TB
+    A["Detect new/changed file\n(Graph API webhook or delta query)"] --> B["Download file\nfrom SharePoint/OneDrive"]
+    B --> C["Parse content\n(format-aware: Word, Excel,\nPowerPoint, PDF)"]
+    C --> D["Extract metadata\n(doc type, deal name,\ncompany, industry)"]
+    D --> E["Chunk the content\n(split into searchable pieces\nby format type)"]
+    E --> F["Generate embeddings\n(Voyage AI converts each\nchunk to a vector)"]
+    F --> G["Write to search index\n(Azure AI Search)"]
+    D --> H["Update knowledge graph\n(Neo4j: entities &amp;\nrelationships)"]
+  </pre>
+  <p class="text-muted text-small text-center">Figure 2.2 &mdash; The ingestion pipeline: from SharePoint file to searchable index entry.</p>
+
+  <div class="definition">
+    <p><span class="term">Chunking:</span> Splitting a document into smaller pieces (called &ldquo;chunks&rdquo;) that are the right size for search and AI processing. A 50-page CIM might become 80&ndash;120 chunks. Different document formats are chunked differently &mdash; narrative text is split by paragraphs, tables are kept intact, and slides are one-per-chunk.</p>
+  </div>
+
+  <h3>The Query Pipeline: Question &rarr; Answer</h3>
+
+  <p>When a user types a question into BSearch, the query pipeline processes it through five stages to produce an answer:</p>
+
+  <pre class="mermaid">
+flowchart TB
+    Q["User asks a question"] --> C1["1. Classify the query\n(file lookup? data extraction?\nmulti-doc synthesis?)"]
+    C1 --> C2["2. Search the index\n(hybrid: vector + keyword\nwith permission filters)"]
+    C2 --> C3["3. Rerank results\n(Cohere scores each chunk\nagainst the original question)"]
+    C3 --> C4["4. Enrich with entity context\n(Neo4j provides deal/company\nrelationship data)"]
+    C4 --> C5["5. AI synthesis\n(Claude reads top chunks and\nstreams an answer with citations)"]
+    C5 --> A["Answer with source links\nstreamed to the user"]
+  </pre>
+  <p class="text-muted text-small text-center">Figure 2.3 &mdash; The query pipeline: from question to streamed answer.</p>
+
+  <p>The entire query pipeline targets <strong>under 3 seconds</strong> to the first token of the AI response. Several stages run in parallel to hit this target &mdash; for example, query classification and embedding generation happen simultaneously.</p>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>The query pipeline works like a well-run analyst research request. <strong>Classification</strong> is the associate deciding whether it&rsquo;s a &ldquo;find me a file&rdquo; request or an &ldquo;answer a question&rdquo; request. <strong>Search</strong> is pulling relevant materials from the data room. <strong>Reranking</strong> is the associate reviewing the stack and pulling the five most relevant pages to the top. <strong>Entity context</strong> is checking the deal tracker for background. <strong>Synthesis</strong> is drafting a concise response with proper citations.</p>
+  </div>
+
+  <!-- ============================================================ -->
+  <!-- 2.4 How Everything Connects -->
+  <!-- ============================================================ -->
+  <h2><span class="section-number">2.4</span> How Everything Connects</h2>
+
+  <p>The diagram below shows the full data flow across all services. Arrows indicate which direction data moves.</p>
+
+  <pre class="mermaid">
+flowchart TB
+    subgraph M365["Microsoft 365"]
+        SP["SharePoint &amp;\nOneDrive"]
+    end
+
+    subgraph Ingest["Ingestion Pipeline"]
+        AF["Azure Durable\nFunctions"]
+        ADI["Azure Document\nIntelligence"]
+        HAIKU_I["Claude Haiku\n(metadata extraction)"]
+        VOY_I["Voyage AI\n(embeddings)"]
+    end
+
+    subgraph Storage["Data Stores"]
+        AIS["Azure AI Search\n(search index)"]
+        NEO["Neo4j Aura\n(knowledge graph)"]
+        COSMOS["Cosmos DB\n(conversations,\nsync state)"]
+    end
+
+    subgraph QuerySvc["Query Service"]
+        API["FastAPI on\nApp Service"]
+        HAIKU_Q["Claude Haiku\n(query classification)"]
+        VOY_Q["Voyage AI\n(query embedding)"]
+        COHERE["Cohere Rerank"]
+        SONNET["Claude Sonnet\n(AI synthesis)"]
+    end
+
+    subgraph Frontend["Frontend"]
+        WEB["React Web App\n(Static Web Apps)"]
+    end
+
+    subgraph Support["Supporting Services"]
+        KV["Key Vault\n(secrets)"]
+        APPINS["Application\nInsights"]
+    end
+
+    SP -->|"Graph API\nwebhooks + delta"| AF
+    AF -->|"PDFs"| ADI
+    ADI -->|"parsed text"| AF
+    AF -->|"ambiguous docs"| HAIKU_I
+    HAIKU_I -->|"metadata"| AF
+    AF -->|"chunks"| VOY_I
+    VOY_I -->|"vectors"| AF
+    AF -->|"chunks + vectors\n+ metadata"| AIS
+    AF -->|"entities &amp;\nrelationships"| NEO
+
+    WEB -->|"queries"| API
+    API --> HAIKU_Q
+    API --> VOY_Q
+    API -->|"hybrid search"| AIS
+    API -->|"entity context"| NEO
+    API -->|"top-20 chunks"| COHERE
+    COHERE -->|"top-5 ranked"| API
+    API -->|"top chunks\n+ context"| SONNET
+    SONNET -->|"streamed answer"| API
+    API -->|"streamed answer\n+ citations"| WEB
+    API -->|"save conversation"| COSMOS
+
+    KV -.->|"secrets"| AF
+    KV -.->|"secrets"| API
+    APPINS -.->|"telemetry"| AF
+    APPINS -.->|"telemetry"| API
+  </pre>
+  <p class="text-muted text-small text-center">Figure 2.4 &mdash; Full architecture: every service and how data flows between them.</p>
+
+  <!-- ============================================================ -->
+  <!-- 2.5 Monorepo Structure -->
+  <!-- ============================================================ -->
+  <h2><span class="section-number">2.5</span> Repository Structure</h2>
+
+  <p>All of BSearch&rsquo;s code lives in a single repository (a &ldquo;monorepo&rdquo;). This keeps everything in one place rather than splitting the backend, frontend, and infrastructure across separate repositories.</p>
+
+  <div class="definition">
+    <p><span class="term">Monorepo:</span> A single code repository that contains multiple projects or components. The alternative is having separate repositories for the backend, frontend, infrastructure templates, etc. A monorepo is simpler to manage for a solo builder because everything is in one place and changes that span multiple components can be made in a single commit.</p>
+  </div>
+
+  <pre><code>bsearch/
+  src/          &larr; Python backend (FastAPI search API + ingestion pipeline)
+  web/          &larr; React frontend (the web app users see)
+  infra/        &larr; Bicep templates (Azure infrastructure-as-code)
+  tests/        &larr; Automated tests
+  docs/         &larr; This technical guide</code></pre>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Directory</th>
+        <th>What Lives Here</th>
+        <th>Language</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>src/</code></td>
+        <td>The FastAPI search API, the ingestion pipeline (Azure Durable Functions), parsers, chunking logic, embedding calls, Claude synthesis, and all backend business logic</td>
+        <td>Python</td>
+      </tr>
+      <tr>
+        <td><code>web/</code></td>
+        <td>The React web application &mdash; the search interface, streaming answer display, source cards, conversation history</td>
+        <td>TypeScript / React</td>
+      </tr>
+      <tr>
+        <td><code>infra/</code></td>
+        <td>Bicep templates that define every Azure resource (search index, app service, functions, Cosmos DB, etc.) as code. Running these templates creates or updates the infrastructure</td>
+        <td>Bicep (Azure IaC)</td>
+      </tr>
+      <tr>
+        <td><code>tests/</code></td>
+        <td>Automated tests for the backend &mdash; unit tests for parsers and chunking, integration tests for the search pipeline</td>
+        <td>Python (pytest)</td>
+      </tr>
+      <tr>
+        <td><code>docs/</code></td>
+        <td>This technical guide and design documentation</td>
+        <td>HTML / Markdown</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="definition">
+    <p><span class="term">Bicep:</span> Azure&rsquo;s language for defining cloud infrastructure as code. Instead of clicking through the Azure portal to create a database or a web server, you write a template file that describes what you want. Running the template creates or updates the resources automatically and reproducibly &mdash; like a recipe rather than cooking from memory.</p>
+  </div>
+
+  <!-- ============================================================ -->
+  <!-- 2.6 Why Each External API -->
+  <!-- ============================================================ -->
+  <h2><span class="section-number">2.6</span> Why Each External API Was Chosen</h2>
+
+  <p>BSearch uses several third-party AI services rather than building everything in-house. Each choice was driven by the same three criteria: <strong>quality</strong> (does it produce the best results?), <strong>operational simplicity</strong> (can one person manage it?), and <strong>cost at our scale</strong> (reasonable for 18 users?).</p>
+
+  <details class="decision-card">
+    <summary>Claude Sonnet 4.6 for AI synthesis</summary>
+    <p>The synthesis model is the most visible part of the system &mdash; its output is literally what users read. Claude Sonnet was chosen for its reasoning quality on synthesis tasks: it follows citation instructions reliably, handles multi-document reasoning well, and produces clear, concise answers. Streaming support means the first words appear quickly even before the full answer is generated.</p>
+    <div class="decision-meta">Alternatives considered: GPT-4o (comparable quality but higher cost and no streaming via Azure OpenAI at the time), Claude Haiku (too terse for synthesis, better suited to classification).</div>
+  </details>
+
+  <details class="decision-card">
+    <summary>Claude Haiku 4.5 for classification and metadata extraction</summary>
+    <p>Some tasks do not need the most powerful AI model. Classifying a query as &ldquo;file lookup&rdquo; vs. &ldquo;data extraction&rdquo; or extracting a deal name from a document path are simpler tasks where a fast, cheap model performs well. Haiku runs these tasks at a fraction of a cent per call, and its responses arrive in under 200ms.</p>
+    <div class="decision-meta">Alternatives considered: Rules-only approach (too brittle for edge cases), Sonnet for everything (unnecessary cost and latency for simple tasks).</div>
+  </details>
+
+  <details class="decision-card">
+    <summary>Voyage AI (voyage-context-3) for embeddings</summary>
+    <p>Embeddings are the foundation of semantic search &mdash; if the embeddings are poor, the system retrieves the wrong documents. Voyage AI&rsquo;s contextual embedding model outperforms OpenAI&rsquo;s text-embedding-3-large by roughly 14% on retrieval benchmarks. Its 32K token context window means it can consider surrounding context when generating each chunk&rsquo;s embedding, leading to better representations of document meaning.</p>
+    <div class="decision-meta">Alternatives considered: OpenAI text-embedding-3-large (solid baseline but lower retrieval accuracy), Azure OpenAI embeddings (same model, adds Azure dependency without benefit).</div>
+  </details>
+
+  <details class="decision-card">
+    <summary>Cohere Rerank for result re-scoring</summary>
+    <p>Initial search returns the top 20 candidates, but not all of them are equally relevant. The reranker reads each candidate chunk alongside the original question and assigns a relevance score. This &ldquo;cross-encoder&rdquo; approach is more accurate than the initial search because it sees the query and the document together rather than comparing pre-computed vectors. After reranking, only the top 5 most relevant chunks are passed to Claude for synthesis.</p>
+    <div class="decision-meta">Alternatives considered: No reranking (lower answer quality &mdash; Claude would get more noise), Voyage reranker (newer, less battle-tested at the time of selection).</div>
+  </details>
+
+  <details class="decision-card">
+    <summary>Neo4j Aura for the knowledge graph</summary>
+    <p>Many real questions at an IB firm involve relationships: &ldquo;What deals has Company X been involved in?&rdquo; &ldquo;Who are the contacts on deals above $50M EBITDA?&rdquo; A traditional search index is not good at traversing relationships &mdash; it finds documents, not connections. Neo4j stores entities (deals, companies, people) and the relationships between them as a graph, making these traversal queries fast and natural.</p>
+    <div class="decision-meta">Alternatives considered: Storing relationships in Cosmos DB (possible but requires manual join logic), no knowledge graph (would limit entity-aware search capabilities).</div>
+  </details>
+
+  <!-- ============================================================ -->
+  <!-- Key Takeaway -->
+  <!-- ============================================================ -->
+  <div class="key-takeaway">
+    <div class="callout-title">Key Takeaway</div>
+    <p>BSearch&rsquo;s architecture is two pipelines connected by a search index. The <strong>ingestion pipeline</strong> continuously processes documents from SharePoint into searchable, AI-ready chunks. The <strong>query pipeline</strong> classifies questions, searches the index, reranks results, enriches them with entity context from a knowledge graph, and streams AI-synthesized answers. About a dozen external services each handle one job &mdash; the total cost is $300&ndash;600/month for 18 users, with the search index being the largest fixed expense.</p>
+  </div>
+
+  <nav class="chapter-nav bottom">
+    <a href="chapter-01.html">&larr; Previous</a>
+    <span class="nav-spacer">|</span>
+    <a href="index.html">Contents</a>
+    <span class="nav-spacer">|</span>
+    <a href="chapter-03.html">Next &rarr;</a>
+  </nav>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad: true, theme: 'neutral'});</script>
+</body>
+</html>

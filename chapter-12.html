@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light only">
+  <title>Chapter 12: Failure Modes &amp; Resilience &mdash; BSearch Technical Guide</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="page-wrapper">
+  <nav class="chapter-nav">
+    <a href="chapter-11.html">&larr; Previous: Key Design Decisions</a>
+    <span class="nav-spacer">|</span>
+    <a href="index.html">Contents</a>
+    <span class="nav-spacer">|</span>
+    <a href="chapter-13.html">Next: Glossary &rarr;</a>
+  </nav>
+  <div class="chapter-header">
+    <div class="chapter-number">Chapter 12</div>
+    <h1>Failure Modes &amp; Resilience</h1>
+    <p class="chapter-subtitle">What can go wrong, how the system recovers, and what you&rsquo;ll see as a user.</p>
+  </div>
+
+  <p>No system runs perfectly all of the time. External APIs time out, files arrive corrupted, networks hiccup. The measure of a well-built system is not whether failures happen &mdash; it is how the system <em>responds</em> when they do. BSearch is designed around five resilience principles:</p>
+
+  <ol>
+    <li><strong>Every failure has a handler.</strong> Retry, fallback, or explicit error &mdash; nothing is silently swallowed.</li>
+    <li><strong>Fail fast on configuration errors.</strong> If the embedding provider is misconfigured, the app refuses to start rather than producing garbage results.</li>
+    <li><strong>User transparency.</strong> When quality is degraded, BSearch tells you with colored banners &mdash; it never pretends everything is fine when it is not.</li>
+    <li><strong>Self-healing.</strong> Most transient failures resolve automatically through retries, delta sync, or periodic maintenance jobs.</li>
+    <li><strong>Bounded degradation.</strong> Even in the worst non-catastrophic failure, BSearch still returns results &mdash; they are just less refined.</li>
+  </ol>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>Think of BSearch&rsquo;s resilience like a deal team&rsquo;s backup plan. If the MD is stuck in another meeting, the VP runs the call. If the model is not ready, the team presents from the memo. The deal does not stop &mdash; it continues with a slightly leaner team. Similarly, BSearch always tries to give you an answer, even if some of its best tools are temporarily unavailable.</p>
+  </div>
+
+  <p>This chapter walks through every failure mode, organized by how much you &mdash; the user &mdash; would actually notice. Most failures are invisible. A few trigger a gentle banner. Only a handful result in an actual error screen.</p>
+
+  <!-- ================================================================ -->
+  <!-- 12.1 Silent Failures -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">12.1</span> Silent Failures &mdash; You Never Notice</h2>
+
+  <p>These are failures the system handles entirely on its own. You will never see an error message, and in most cases the issue resolves before it could ever affect a search result.</p>
+
+  <h3>Ingestion-Side Failures</h3>
+
+  <p>These happen in the background when BSearch is pulling files from SharePoint and processing them into the search index.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>What Fails</th>
+        <th>What Happens</th>
+        <th>User Experience</th>
+        <th>Self-Healing?</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr class="failure-silent">
+        <td><strong>Graph API download</strong> (404, auth error, timeout)</td>
+        <td>Durable Functions retry the download automatically, then log and skip if retries are exhausted</td>
+        <td>One file is not indexed</td>
+        <td>Yes &mdash; next delta sync retries</td>
+      </tr>
+      <tr class="failure-silent">
+        <td><strong>Parser fails</strong> (corrupt or unsupported file)</td>
+        <td>try/except catches the error, logs it, skips the file</td>
+        <td>One file is not indexed</td>
+        <td>No &mdash; file must be fixed at the source</td>
+      </tr>
+      <tr class="failure-silent">
+        <td><strong>Voyage AI embedding</strong> (during ingestion)</td>
+        <td>Durable Functions retry with exponential backoff</td>
+        <td>Ingestion slows down temporarily</td>
+        <td>Yes &mdash; retries succeed once the service recovers</td>
+      </tr>
+      <tr class="failure-silent">
+        <td><strong>Neo4j deal record lookup</strong> (during ingestion)</td>
+        <td>Chunk gets per-file deal_name as fallback, queued for retry</td>
+        <td>Temporarily inconsistent deal name</td>
+        <td>Yes &mdash; self-heals on next successful ingestion</td>
+      </tr>
+      <tr class="failure-silent">
+        <td><strong>Neo4j write failure</strong> (during ingestion)</td>
+        <td>Chunks are written without entity fields, queued for retry</td>
+        <td>Entity filtering unavailable for this file</td>
+        <td>Yes &mdash; retry restores entity fields</td>
+      </tr>
+      <tr class="failure-silent">
+        <td><strong>Dedup Cosmos lookup timeout</strong></td>
+        <td>Skip dedup check, file indexed as canonical</td>
+        <td>Temporary duplicate results possible</td>
+        <td>Yes &mdash; periodic re-evaluation cleans up</td>
+      </tr>
+      <tr class="failure-silent">
+        <td><strong>Doc summary generation</strong> (Haiku 5s timeout)</td>
+        <td>Skip summary, doc indexed normally</td>
+        <td>Cross-section bridging unavailable for this doc</td>
+        <td>Yes &mdash; regenerated on file update</td>
+      </tr>
+      <tr class="failure-silent">
+        <td><strong>Deal summary generation</strong> (Haiku 8s timeout)</td>
+        <td>Skip summary, deal docs still individually searchable</td>
+        <td>Cross-deal aggregation slightly degraded</td>
+        <td>Yes &mdash; retried on next 6-hour cycle</td>
+      </tr>
+      <tr class="failure-silent">
+        <td><strong>Canonical name re-tagging</strong></td>
+        <td>Old deal_name persists on existing chunks</td>
+        <td>Older chunks show previous name</td>
+        <td>Yes &mdash; next ingestion triggers retag</td>
+      </tr>
+      <tr class="failure-silent">
+        <td><strong>Table splitter</strong> (no hierarchy detected)</td>
+        <td>Falls back to fixed-size row splits (~25 rows)</td>
+        <td>Slightly less precise table chunking</td>
+        <td>N/A &mdash; fallback is adequate</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Query-Side Failures</h3>
+
+  <p>These happen in the few seconds between you pressing &ldquo;Search&rdquo; and seeing results.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>What Fails</th>
+        <th>What Happens</th>
+        <th>User Experience</th>
+        <th>Self-Healing?</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr class="failure-silent">
+        <td><strong>Haiku classifier timeout</strong> (&gt;500ms)</td>
+        <td>Defaults to <code>data_extraction</code> intent</td>
+        <td>Slightly less optimal retrieval strategy</td>
+        <td>Yes &mdash; per-query, next query may succeed</td>
+      </tr>
+      <tr class="failure-silent">
+        <td><strong>Voyage AI query embedding timeout</strong> (&gt;500ms)</td>
+        <td>Falls back to BM25-only search (skip vector)</td>
+        <td>Slightly lower recall</td>
+        <td>Yes &mdash; per-query, cached next time</td>
+      </tr>
+      <tr class="failure-silent">
+        <td><strong>Cosmos DB write timeout</strong> (conversation log)</td>
+        <td>Fire-and-forget with logging</td>
+        <td>One conversation entry lost</td>
+        <td>Yes &mdash; next write succeeds</td>
+      </tr>
+      <tr class="failure-silent">
+        <td><strong>Webhook missed</strong></td>
+        <td>Delta sync catches up within 12&ndash;24 hours</td>
+        <td>Brief stale window</td>
+        <td>Yes &mdash; delta sync is the safety net</td>
+      </tr>
+      <tr class="failure-silent">
+        <td><strong>Neo4j query failure</strong> (at query time)</td>
+        <td>Skip alias expansion and entity context</td>
+        <td>Search works without entity enrichment</td>
+        <td>Yes &mdash; per-query transient</td>
+      </tr>
+      <tr class="failure-silent">
+        <td><strong>Extended thinking budget exhausted</strong></td>
+        <td>Claude truncates its reasoning, still generates answer</td>
+        <td>May miss some cross-chunk connections</td>
+        <td>N/A &mdash; inherent model limit</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout tip">
+    <div class="callout-title">Why so many &ldquo;silent&rdquo; failures?</div>
+    <p>This is by design. The majority of things that can go wrong are transient (a brief API timeout, a momentary network blip). Showing an error message for something that fixes itself in seconds would just be noise. BSearch logs every failure internally for monitoring, but only surfaces issues to you when they actually affect your experience.</p>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- 12.2 Graceful Visible Failures -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">12.2</span> Graceful Visible Failures &mdash; You See a Banner</h2>
+
+  <p>These failures are significant enough that you should know about them, but not severe enough to stop you from working. BSearch uses colored banners to communicate what is happening.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>What Fails</th>
+        <th>What Happens</th>
+        <th>What You See</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr class="failure-graceful">
+        <td><strong>Cohere rerank API</strong> (error or timeout)</td>
+        <td>Skip reranking, use Azure Search&rsquo;s built-in ranking on the top 12 results, cap confidence at LOW</td>
+        <td>Orange banner: <em>&ldquo;Search quality may be reduced&rdquo;</em></td>
+      </tr>
+      <tr class="failure-graceful">
+        <td><strong>LOW confidence</strong> (rerank scores 0.15&ndash;0.50)</td>
+        <td>Claude adds hedging language to its synthesis</td>
+        <td>Yellow banner: <em>&ldquo;Results may not fully answer your query&rdquo;</em></td>
+      </tr>
+      <tr class="failure-graceful">
+        <td><strong>Multi-doc synthesis</strong> (5s+ time-to-first-token)</td>
+        <td>Streaming starts late but still completes</td>
+        <td><em>&ldquo;Searching across multiple documents...&rdquo;</em> visible for 2&ndash;3 seconds before text appears</td>
+      </tr>
+      <tr class="failure-graceful">
+        <td><strong>Relevance gate miscalibrated</strong></td>
+        <td>Valid queries incorrectly get &ldquo;not found&rdquo;</td>
+        <td>User sees no results (fixable by adjusting thresholds)</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <div class="callout-title">Orange vs. Yellow Banners</div>
+    <p><strong>Orange</strong> means a system component failed and BSearch is running in a degraded mode &mdash; results are still useful but may not be as well-ranked. <strong>Yellow</strong> means the system is working normally but is not confident it found great results for your particular query. Both are informational &mdash; you can still trust and use the results.</p>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- 12.3 Visible Errors -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">12.3</span> Visible Errors &mdash; Something Is Clearly Wrong</h2>
+
+  <p>These are the rare failures where you see an actual error message or are interrupted. They typically mean a core service is down and BSearch cannot work around it.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>What Fails</th>
+        <th>What Happens</th>
+        <th>What You See</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr class="failure-visible">
+        <td><strong>Azure AI Search down</strong></td>
+        <td>503 error from the search service</td>
+        <td><em>&ldquo;Search unavailable&rdquo;</em> error message</td>
+      </tr>
+      <tr class="failure-visible">
+        <td><strong>Claude synthesis failure</strong></td>
+        <td>Return raw search results as source cards</td>
+        <td>Degraded but functional &mdash; you see sources without AI synthesis</td>
+      </tr>
+      <tr class="failure-visible">
+        <td><strong>Azure AD token expired/invalid</strong></td>
+        <td>401 Unauthorized</td>
+        <td>Brief redirect to Microsoft login page</td>
+      </tr>
+      <tr class="failure-visible">
+        <td><strong>Embedding provider misconfigured</strong></td>
+        <td>App refuses to start, health check fails</td>
+        <td>App down until configuration is fixed (fail-fast)</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>Notice that even within visible errors, BSearch tries to degrade gracefully. If Claude fails, you still get the source documents as clickable cards. The system only shows a full error screen when the search index itself is unreachable &mdash; because at that point, there is genuinely nothing to show.</p>
+
+  <!-- ================================================================ -->
+  <!-- 12.4 Infrastructure Concerns -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">12.4</span> Infrastructure-Level Concerns</h2>
+
+  <p>These are behind-the-scenes issues that affect the system&rsquo;s ability to maintain and update the search index. They are invisible to users in the short term but could affect data freshness if left unresolved.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Issue</th>
+        <th>How BSearch Handles It</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr class="failure-silent">
+        <td><strong>Index quota exceeded</strong></td>
+        <td>Alert fires via Application Insights. New files are not indexed until storage is freed, but existing searches continue normally.</td>
+      </tr>
+      <tr class="failure-silent">
+        <td><strong>Re-index orchestrator crash</strong></td>
+        <td>Durable Functions checkpointing resumes from the last completed batch. The old index continues serving searches in the meantime.</td>
+      </tr>
+      <tr class="failure-silent">
+        <td><strong>Re-index validation failure</strong></td>
+        <td>Blocks the flip to the new index. The old index keeps serving &mdash; users never see incomplete data.</td>
+      </tr>
+      <tr class="failure-silent">
+        <td><strong>Concurrent ingestion during re-index</strong> (target write fails)</td>
+        <td>The old index already has the file. The gap is caught by post-flip validation.</td>
+      </tr>
+      <tr class="failure-silent">
+        <td><strong>Dedup false positive</strong> (different files grouped together)</td>
+        <td>Cosine similarity threshold of 0.95 plus same-folder constraint minimizes this risk. Non-canonical chunks remain indexed for periodic re-evaluation.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>The re-index process works like a CIM revision. The team prepares the updated version in a separate workspace. The old version stays live and available to buyers. Only when the new version passes QC does it replace the old one. If the new version has issues, the old version stays in circulation &mdash; nobody ever sees a half-finished document.</p>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- 12.5 Failure Cascade Diagram -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">12.5</span> How Failures Cascade into Fallbacks</h2>
+
+  <p>The diagram below shows the key decision points during a search query. At each stage, if the primary path fails, BSearch falls back to the next-best option rather than giving up.</p>
+
+  <pre class="mermaid">
+flowchart TD
+    A["User submits query"] --> B{"Voyage AI\nembedding"}
+    B -->|Success| C["Hybrid search\n(vector + BM25)"]
+    B -->|Timeout| D["BM25-only search\n(keyword matching)"]
+
+    C --> E{"Cohere\nrerank"}
+    D --> E
+
+    E -->|Success| F["Top results by\nrelevance score"]
+    E -->|Failure| G["Azure Search ranking\n(confidence capped LOW)"]
+
+    F --> H{"Neo4j\nentity lookup"}
+    G --> I["Orange banner:\nquality may be reduced"]
+    I --> H
+
+    H -->|Success| J["Alias expansion +\nentity context"]
+    H -->|Failure| K["Skip enrichment,\nuse results as-is"]
+
+    J --> L{"Claude\nsynthesis"}
+    K --> L
+
+    L -->|Success| M["AI-generated answer\nwith source cards"]
+    L -->|Failure| N["Raw source cards\n(no AI summary)"]
+
+    style B fill:#f9f4ee,stroke:#D4793A
+    style E fill:#f9f4ee,stroke:#D4793A
+    style H fill:#f9f4ee,stroke:#D4793A
+    style L fill:#f9f4ee,stroke:#D4793A
+    style D fill:#fdf6f0,stroke:#C4612A,stroke-dasharray: 5 5
+    style G fill:#fdf6f0,stroke:#C4612A,stroke-dasharray: 5 5
+    style K fill:#fdf6f0,stroke:#C4612A,stroke-dasharray: 5 5
+    style N fill:#fdf6f0,stroke:#C4612A,stroke-dasharray: 5 5
+    style M fill:#eef5eb,stroke:#2E7D5B
+    style I fill:#fef3e8,stroke:#D4793A
+  </pre>
+
+  <p>Notice the pattern: each diamond is a decision point where a service might fail. Each dashed box is a fallback. The system always reaches one of the two green/orange endpoints at the bottom &mdash; either a full AI answer or raw source cards. It never dead-ends.</p>
+
+  <!-- ================================================================ -->
+  <!-- 12.6 Design Principles -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">12.6</span> The Five Resilience Principles</h2>
+
+  <h3>1. No Silent Data Loss</h3>
+  <p>Every failure is either retried, handled by a fallback, or explicitly logged with an error. Nothing disappears into a void. If a file fails to index, that fact is recorded in Application Insights and the next delta sync will try again.</p>
+
+  <h3>2. Fail Fast on Configuration Errors</h3>
+  <p>If the embedding provider, API keys, or index connection strings are wrong, BSearch refuses to start. This is intentional. A misconfigured system that <em>appears</em> to work is far more dangerous than one that clearly says &ldquo;I cannot start &mdash; fix this first.&rdquo; The health check endpoint catches these issues before any user traffic arrives.</p>
+
+  <h3>3. Transparent Degradation</h3>
+  <p>When BSearch is running in a reduced mode &mdash; no reranker, BM25-only, no entity enrichment &mdash; it tells you. The orange and yellow banners exist specifically so you can calibrate your trust in the results. Hiding degradation would be worse than showing it.</p>
+
+  <h3>4. Self-Healing by Default</h3>
+  <p>Look at the &ldquo;Self-Healing?&rdquo; column in the tables above: the vast majority say <strong>Yes</strong>. Durable Functions retry failed downloads. Delta sync catches missed webhooks. The 6-hour summary cycle regenerates failed deal summaries. Most problems fix themselves within minutes to hours without any intervention.</p>
+
+  <h3>5. Bounded Degradation</h3>
+  <p>Even in the worst realistic scenario &mdash; Voyage AI is down, Cohere is down, Neo4j is unreachable &mdash; BSearch still returns results. They come from BM25 keyword matching with Azure Search&rsquo;s default ranking and no entity enrichment. That is a meaningfully worse experience than the full pipeline, but it still works. You still get relevant documents. The floor is never zero.</p>
+
+  <div class="key-takeaway">
+    <div class="callout-title">Key Takeaway</div>
+    <p>BSearch is designed to bend, not break. The majority of failures are invisible and self-healing. The few that are visible are clearly communicated. And even in the worst case, the system returns results &mdash; just less refined ones. Every component has a fallback, and the fallback always produces something useful.</p>
+  </div>
+
+  <nav class="chapter-nav bottom">
+    <a href="chapter-11.html">&larr; Previous</a>
+    <span class="nav-spacer">|</span>
+    <a href="index.html">Contents</a>
+    <span class="nav-spacer">|</span>
+    <a href="chapter-13.html">Next &rarr;</a>
+  </nav>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad: true, theme: 'neutral'});</script>
+</body>
+</html>
