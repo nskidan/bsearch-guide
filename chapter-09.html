@@ -4,358 +4,670 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="light only">
-  <title>Chapter 9: Infrastructure &amp; Deployment &mdash; BSearch Technical Guide</title>
+  <title>Chapter 9: Phase 2 &mdash; Document Parsers &amp; Chunking &mdash; BSearch Technical Guide</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
 <div class="page-wrapper">
+
   <nav class="chapter-nav">
-    <a href="chapter-08.html">&larr; Previous: Authentication &amp; Permissions</a>
+    <a href="chapter-08.html">&larr; Previous: Phase 1 &mdash; Project Setup &amp; Infrastructure</a>
     <span class="nav-spacer">|</span>
     <a href="index.html">Contents</a>
     <span class="nav-spacer">|</span>
-    <a href="chapter-10.html">Next: Implementation Roadmap &rarr;</a>
+    <a href="chapter-10.html">Next: Phase 3 &mdash; Search Index &amp; Ingestion Pipeline &rarr;</a>
   </nav>
+
   <div class="chapter-header">
     <div class="chapter-number">Chapter 9</div>
-    <h1>Infrastructure &amp; Deployment</h1>
-    <p class="chapter-subtitle">What runs where, what it costs, and how changes get deployed without downtime.</p>
+    <h1>Phase 2 &mdash; Document Parsers &amp; Chunking</h1>
+    <p class="chapter-subtitle">Build the document processing engine &mdash; the part of BSearch that reads every file format, breaks content into searchable chunks, and extracts the metadata that makes search work.</p>
   </div>
 
-  <p>This chapter maps BSearch&rsquo;s components to the actual Azure services that host them, explains what each service costs, and describes how code and infrastructure changes get deployed. If the previous chapters explained <em>what</em> BSearch does, this chapter explains <em>where</em> it physically runs and <em>how</em> it gets there.</p>
+  <!-- ================================================================ -->
+  <!-- 9.1 What You're Building -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">9.1</span> What You&rsquo;re Building</h2>
+
+  <p>This phase builds BSearch&rsquo;s document processing engine &mdash; the code that takes a raw file from SharePoint, reads its contents, and produces the structured, searchable chunks that feed the search index. Every search result BSearch returns traces back to a chunk created by this pipeline. If the parsers miss content or the chunker splits in the wrong places, search quality degrades no matter how good the embedding model or the reranker is.</p>
+
+  <p>The work falls into five areas: <strong>format-aware parsers</strong> that extract content from Word, Excel, PowerPoint, and PDF files while preserving document structure; a <strong>chunking engine</strong> that splits content into 800&ndash;1000 token pieces at logical boundaries; a <strong>hierarchical table splitter</strong> for large financial tables; <strong>summary generation</strong> at both the document and deal level; and <strong>metadata and entity extraction</strong> that classifies documents, identifies companies and people, and populates the knowledge graph.</p>
+
+  <p>This is the most technically dense phase. It touches four file format libraries, an Azure AI service, an LLM (Haiku), a graph database (Neo4j), and a set of regex-based NER heuristics. But the output is straightforward: for every file BSearch processes, this code produces a list of chunks ready to be embedded and indexed.</p>
 
   <!-- ================================================================ -->
-  <!-- 9.1 Azure Services Map -->
+  <!-- 9.2 Before You Start -->
   <!-- ================================================================ -->
-  <h2><span class="section-number">9.1</span> Azure Services Map</h2>
+  <h2><span class="section-number">9.2</span> Before You Start</h2>
 
-  <p>BSearch is built on a set of managed Azure services. &ldquo;Managed&rdquo; means Microsoft operates the underlying servers, handles patching, and guarantees uptime &mdash; you just configure and use them. Here is every service and what it does:</p>
+  <div class="before-you-start">
+    <div class="section-label">Prerequisites</div>
+    <ul>
+      <li><strong>Phase 1 complete.</strong> Monorepo structure in place, Pydantic config working, Bicep templates deployed. You need the <code>src/ingestion/</code> directory and the shared config module.</li>
+      <li><strong>Sample documents for each format.</strong> Get at least one Word document, one Excel model, one PowerPoint deck, and one PDF from a real deal folder. These should contain tables, headings, and multi-section content &mdash; not empty templates. Put them in <code>tests/fixtures/</code>.</li>
+      <li><strong>Azure Document Intelligence resource provisioned.</strong> This is Azure&rsquo;s PDF parsing service (formerly called Form Recognizer). It uses AI to understand document layout &mdash; headers, paragraphs, tables, reading order &mdash; rather than just extracting raw text. Provision an S0 tier instance in the Azure portal and store the endpoint and key in your <code>.env</code> file. The free tier works for development but has a 2-page-per-minute rate limit.</li>
+      <li><strong>Neo4j Aura instance running.</strong> The Free tier is sufficient for development. You need the connection URI, username, and password in your <code>.env</code>. The knowledge graph stores deal entities, company relationships, and financial metrics extracted during ingestion.</li>
+      <li><strong>Anthropic API key configured.</strong> Haiku is used for document summaries, entity extraction, and doc_type classification fallback. Add <code>ANTHROPIC_API_KEY</code> to your <code>.env</code>.</li>
+      <li><strong>Python dependencies installed.</strong> This phase requires <code>python-docx</code>, <code>openpyxl</code>, <code>python-pptx</code>, <code>azure-ai-formrecognizer</code>, <code>neo4j</code>, and <code>anthropic</code>. These should already be in your <code>pyproject.toml</code> from Phase 1.</li>
+    </ul>
+  </div>
 
-  <h3>Azure Services</h3>
+  <!-- ================================================================ -->
+  <!-- 9.3 The Spec — Parsers -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">9.3</span> The Spec &mdash; Format-Aware Parsers</h2>
+
+  <p>Every parser follows the same contract: take in raw file bytes and metadata, return a list of <code>ContentBlock</code> objects that preserve the document&rsquo;s structure. The abstract base class lives in <code>src/ingestion/parsers/base.py</code>.</p>
+
+  <div class="definition">
+    <p><span class="term">ContentBlock</span> &mdash; A dataclass representing a unit of parsed content. Each block has a <code>content</code> string, a <code>block_type</code> (paragraph, table, slide, formula), an optional <code>section_heading</code> from the nearest parent heading, and metadata like slide number or sheet name. Parsers produce ContentBlocks; the chunking engine consumes them.</p>
+  </div>
+
+  <h3>Parser Interface</h3>
+
+  <pre><code># src/ingestion/parsers/base.py
+class BaseParser(ABC):
+    @abstractmethod
+    def parse(self, file_bytes: bytes, metadata: FileMetadata) -> list[ContentBlock]:
+        """Extract structured content from a file."""
+        ...
+
+    def chunk(self, blocks: list[ContentBlock]) -> list[Chunk]:
+        """Split content blocks into index-ready chunks.
+        Default implementation handles narrative chunking;
+        subclasses override for format-specific behavior."""
+        ...</code></pre>
+
+  <h3>Four Parser Implementations</h3>
 
   <table>
     <thead>
       <tr>
-        <th>Service</th>
-        <th>Azure Tier</th>
-        <th>Monthly Cost</th>
-        <th>Purpose</th>
+        <th>Parser</th>
+        <th>Library</th>
+        <th>What It Extracts</th>
+        <th>Key Details</th>
       </tr>
     </thead>
     <tbody>
       <tr>
-        <td><strong>Azure AI Search</strong></td>
-        <td>S1 or S2</td>
-        <td>~$250&ndash;500</td>
-        <td>The search index &mdash; stores all document chunks with both keyword (BM25) and vector indexes for hybrid search.</td>
+        <td><strong>Word</strong></td>
+        <td><code>python-docx</code></td>
+        <td>Paragraphs, tables, headers, styles</td>
+        <td>Tracks heading hierarchy (H1 &rarr; H2 &rarr; H3) so each paragraph knows its section context. Tables extracted with row/column structure preserved. Styles indicate bold, italic, etc.</td>
       </tr>
       <tr>
-        <td><strong>Azure App Service</strong></td>
-        <td>B1</td>
-        <td>~$13</td>
-        <td>Hosts the FastAPI search API. Always-on, meaning it is running 24/7 and responds instantly to requests (no cold start delay).</td>
+        <td><strong>Excel</strong></td>
+        <td><code>openpyxl</code></td>
+        <td>Sheets, cells, formulas, named ranges</td>
+        <td>Processes sheet-by-sheet. Detects header rows automatically. <strong>Captures formula text</strong> on key model sheets (not just resolved values) &mdash; formulas are indexed as a separate chunk per sheet. Resolves formulas to values where possible.</td>
       </tr>
       <tr>
-        <td><strong>Azure Durable Functions</strong></td>
-        <td>Consumption</td>
-        <td>Pay-per-use</td>
-        <td>Runs the ingestion pipeline &mdash; the multi-step process that pulls documents from SharePoint, parses them, chunks them, and loads them into the search index.</td>
+        <td><strong>PowerPoint</strong></td>
+        <td><code>python-pptx</code></td>
+        <td>Per-slide content, speaker notes, text frames, tables</td>
+        <td>Each slide becomes its own ContentBlock with a <code>[Slide N: Title]</code> prefix. Speaker notes are appended to slide content. Tables within slides are preserved as structured data.</td>
       </tr>
       <tr>
-        <td><strong>Azure Static Web Apps</strong></td>
-        <td>Free</td>
-        <td>$0</td>
-        <td>Hosts the React web application (the BSearch user interface). Also handles the Microsoft login flow automatically.</td>
-      </tr>
-      <tr>
-        <td><strong>Cosmos DB</strong></td>
-        <td>Serverless</td>
-        <td>~$0</td>
-        <td>Stores application state: conversation histories, SharePoint sync tokens, user preferences. At 18 users, costs are negligible.</td>
-      </tr>
-      <tr>
-        <td><strong>Neo4j Aura</strong></td>
-        <td>Free / Pro</td>
-        <td>$0&ndash;65</td>
-        <td>Knowledge graph &mdash; stores relationships between entities (companies, people, deals, industries) for relationship-aware search.</td>
-      </tr>
-      <tr>
-        <td><strong>Azure Document Intelligence</strong></td>
-        <td>S0</td>
-        <td>Pay-per-page</td>
-        <td>Extracts text and tables from PDFs. Understands document layout (headers, columns, tables) rather than just raw text extraction.</td>
-      </tr>
-      <tr>
-        <td><strong>Key Vault</strong></td>
-        <td>Standard</td>
-        <td>Minimal</td>
-        <td>Stores API keys, connection strings, and other secrets securely. Services fetch their credentials from here instead of having them hard-coded.</td>
-      </tr>
-      <tr>
-        <td><strong>Application Insights</strong></td>
-        <td>Included</td>
-        <td>$0</td>
-        <td>Monitoring and alerting &mdash; tracks request latency, error rates, and custom events. Sends alerts when something goes wrong.</td>
+        <td><strong>PDF</strong></td>
+        <td>Azure Document Intelligence</td>
+        <td>Tables, paragraphs, reading order</td>
+        <td>Handles scanned documents, complex CIM layouts, watermarked teasers, and embedded tables. Understands document layout (columns, headers, reading order) rather than just extracting raw text line by line.</td>
       </tr>
     </tbody>
   </table>
-
-  <h3>External API Costs</h3>
-
-  <p>In addition to Azure services, BSearch calls several external AI APIs. These are usage-based &mdash; you pay for what you use:</p>
-
-  <table>
-    <thead>
-      <tr>
-        <th>API</th>
-        <th>Monthly Cost</th>
-        <th>Usage</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr>
-        <td><strong>Claude Sonnet 4.6</strong></td>
-        <td>~$11</td>
-        <td>Query synthesis &mdash; generates natural-language answers from search results. Estimated at 50&ndash;200 queries/day.</td>
-      </tr>
-      <tr>
-        <td><strong>Claude Haiku 4.5</strong></td>
-        <td>~$0.10&ndash;0.40/day</td>
-        <td>Lightweight tasks: document classification, metadata extraction, chunk summaries during ingestion.</td>
-      </tr>
-      <tr>
-        <td><strong>Voyage AI</strong></td>
-        <td>Pay-per-token</td>
-        <td>Generates vector embeddings for document chunks and search queries.</td>
-      </tr>
-      <tr>
-        <td><strong>Cohere Rerank</strong></td>
-        <td>Pay-per-query</td>
-        <td>Re-scores search results for precision (the &ldquo;senior associate review&rdquo; from Chapter 3).</td>
-      </tr>
-    </tbody>
-  </table>
-
-  <div class="callout ib-analogy">
-    <div class="callout-title">IB Analogy</div>
-    <p>Think of the Azure services as the firm&rsquo;s overhead &mdash; office lease, Bloomberg terminals, IT support. They are fixed or near-fixed monthly costs that keep the lights on. The external APIs are more like deal-related expenses &mdash; they scale with activity. More searches mean slightly higher API costs, just like more active deals mean more data room fees and printing costs. The total monthly run-rate is modest: roughly $300&ndash;600 all-in for 18 users.</p>
-  </div>
-
-  <!-- ================================================================ -->
-  <!-- 9.2 Bicep Templates -->
-  <!-- ================================================================ -->
-  <h2><span class="section-number">9.2</span> Bicep Templates &mdash; Infrastructure as Code</h2>
-
-  <div class="definition">
-    <p><span class="term">Infrastructure as Code (IaC)</span> &mdash; Defining your cloud infrastructure in text files rather than clicking through a web portal. The text files are version-controlled (tracked in Git), reviewable, and repeatable. If you need to rebuild everything from scratch, you run one command instead of clicking through 50 screens.</p>
-  </div>
-
-  <div class="definition">
-    <p><span class="term">Bicep</span> &mdash; Microsoft&rsquo;s declarative language for defining Azure resources. You describe <em>what</em> you want (a search service with these settings, a database with this configuration), and Azure figures out <em>how</em> to build it.</p>
-  </div>
-
-  <p>BSearch&rsquo;s infrastructure is defined in Bicep template files stored in the <code>infra/</code> directory:</p>
-
-  <ul>
-    <li><strong><code>infra/main.bicep</code></strong> &mdash; The orchestrator. References all the individual modules and wires them together.</li>
-    <li><strong><code>infra/search.bicep</code></strong> &mdash; Azure AI Search service configuration.</li>
-    <li><strong><code>infra/functions.bicep</code></strong> &mdash; Azure Durable Functions for the ingestion pipeline.</li>
-    <li><strong><code>infra/appservice.bicep</code></strong> &mdash; Azure App Service for the FastAPI backend.</li>
-    <li><strong><code>infra/cosmos.bicep</code></strong> &mdash; Cosmos DB for state storage.</li>
-    <li><strong><code>infra/staticwebapp.bicep</code></strong> &mdash; Azure Static Web Apps for the React front-end.</li>
-    <li><strong><code>infra/keyvault.bicep</code></strong> &mdash; Key Vault for secrets management.</li>
-  </ul>
-
-  <p>Separate parameter files define differences between environments (e.g., dev vs. prod). The dev environment might use cheaper service tiers, while prod uses the tiers listed in Section 9.1.</p>
-
-  <div class="callout ib-analogy">
-    <div class="callout-title">IB Analogy</div>
-    <p>Bicep templates are like a detailed engagement letter that specifies exactly what infrastructure to set up. Instead of calling Azure support and saying &ldquo;we need a search service, a database, a web server&hellip;&rdquo; and hoping they configure everything correctly, you hand them a precise, written specification. If something goes wrong and you need to rebuild, you just re-execute the same engagement letter &mdash; every setting, every connection, every configuration is documented and repeatable.</p>
-  </div>
-
-  <!-- ================================================================ -->
-  <!-- 9.3 Deployment Process -->
-  <!-- ================================================================ -->
-  <h2><span class="section-number">9.3</span> Deployment Process</h2>
-
-  <div class="definition">
-    <p><span class="term">Deployment</span> &mdash; The process of taking code from your development environment and putting it into production where users can access it. In BSearch, there are three things that get deployed independently: infrastructure, the backend API, and the front-end web app.</p>
-  </div>
-
-  <p>BSearch has three deployment tracks:</p>
-
-  <ol>
-    <li><strong>Infrastructure</strong> &mdash; Run <code>az deployment group create</code> with the Bicep templates. This creates or updates all Azure services to match the template definitions. If a service already exists and is configured correctly, Azure skips it.</li>
-    <li><strong>Backend (FastAPI API)</strong> &mdash; The Python code is packaged and deployed to Azure App Service via zip deploy or Git deploy. Once deployed, the App Service restarts and begins serving the new code.</li>
-    <li><strong>Frontend (React web app)</strong> &mdash; The React application is built and deployed to Azure Static Web Apps. This happens automatically through GitHub integration &mdash; when code is merged to the main branch, Static Web Apps detects the change and deploys.</li>
-  </ol>
-
-  <p>The ingestion pipeline (Azure Functions) follows the same deployment mechanism as the backend &mdash; Python code packaged and deployed to the Functions service.</p>
-
-  <pre class="mermaid">
-flowchart LR
-    subgraph Code["Code Changes"]
-        BC["Bicep Templates"]
-        PY["Python (API + Ingestion)"]
-        RE["React (Frontend)"]
-    end
-
-    subgraph Deploy["Deployment"]
-        AZ["az deployment\ngroup create"]
-        ZIP["Zip / Git\nDeploy"]
-        GH["GitHub\nIntegration"]
-    end
-
-    subgraph Azure["Azure Services"]
-        INF["Infrastructure\n(Search, Cosmos, etc.)"]
-        APP["App Service\n(FastAPI)"]
-        FUN["Functions\n(Ingestion)"]
-        SWA["Static Web Apps\n(React UI)"]
-    end
-
-    BC --> AZ --> INF
-    PY --> ZIP --> APP
-    PY --> ZIP --> FUN
-    RE --> GH --> SWA
-
-    style Code fill:#e3f2fd,stroke:#4A7FB5
-    style Deploy fill:#fff3e0,stroke:#D4793A
-    style Azure fill:#e8f5e9,stroke:#2E7D5B
-  </pre>
-
-  <!-- ================================================================ -->
-  <!-- 9.4 Monitoring -->
-  <!-- ================================================================ -->
-  <h2><span class="section-number">9.4</span> Monitoring &mdash; Application Insights</h2>
-
-  <div class="definition">
-    <p><span class="term">Application Insights</span> &mdash; Azure&rsquo;s monitoring service. It collects data about every request the application handles &mdash; how long it took, whether it succeeded or failed, and any custom events the code reports. Think of it as a real-time dashboard for the application&rsquo;s health.</p>
-  </div>
-
-  <div class="definition">
-    <p><span class="term">p50 / p95 / p99 latency</span> &mdash; Percentile-based latency measurements. p50 means &ldquo;half of all requests finish faster than this.&rdquo; p95 means &ldquo;95% of requests finish faster than this&rdquo; &mdash; it captures the slow outliers. p99 captures the worst 1%. These tell you not just the average performance but how consistent it is.</p>
-  </div>
-
-  <p>BSearch tracks latency at every stage of the search pipeline: query parsing, embedding generation, index search, reranking, and answer synthesis. This makes it possible to pinpoint <em>which</em> stage is slow when a query takes longer than expected.</p>
-
-  <h3>Key Alerts</h3>
-
-  <p>The system sends alerts when something degrades or fails:</p>
-
-  <ul>
-    <li><strong>Reranker degraded</strong> &mdash; fires when Cohere&rsquo;s reranker fails 3 or more times in a window. BSearch falls back to its own scoring, but results may be less precise.</li>
-    <li><strong>Embedding fallback rate &gt;10%</strong> &mdash; fires when more than 10% of embedding requests are falling back to a secondary provider, indicating the primary (Voyage) may be experiencing issues.</li>
-    <li><strong>Search errors</strong> &mdash; fires when the search index returns errors, which would mean queries are failing entirely.</li>
-  </ul>
-
-  <h3>Custom Events</h3>
-
-  <p>Beyond standard request metrics, BSearch logs custom events for operational awareness:</p>
-
-  <ul>
-    <li><code>reranker_degraded</code> / <code>reranker_recovered</code> &mdash; tracks when the system enters and exits fallback mode for reranking.</li>
-    <li><code>neo4j_fallback</code> &mdash; the knowledge graph was unavailable, and the system fell back to search-only results.</li>
-    <li><code>embedding_fallback</code> &mdash; primary embedding provider was unavailable; a backup was used.</li>
-  </ul>
-
-  <h3>Dashboard</h3>
-
-  <p>A monitoring dashboard provides at-a-glance visibility into:</p>
-
-  <ul>
-    <li><strong>Query volume</strong> &mdash; how many searches per hour/day.</li>
-    <li><strong>Time-to-first-token (TTFT) by query type</strong> &mdash; how quickly users start seeing results, broken down by whether the query was a simple lookup, a synthesis question, etc.</li>
-    <li><strong>Cache hit rates</strong> &mdash; how often the system serves results from cache vs. running a fresh search.</li>
-  </ul>
-
-  <div class="callout ib-analogy">
-    <div class="callout-title">IB Analogy</div>
-    <p>Application Insights is like the daily P&amp;L and risk report for a trading desk. You do not wait until quarter-end to discover a problem &mdash; you check the dashboard every morning. If latency spikes or errors increase, you see it immediately and can investigate before users start complaining. The alerts are like stop-loss triggers: automated notifications when a metric crosses a threshold.</p>
-  </div>
-
-  <!-- ================================================================ -->
-  <!-- 9.5 Blue-Green Re-Indexing -->
-  <!-- ================================================================ -->
-  <h2><span class="section-number">9.5</span> Blue-Green Re-Indexing</h2>
-
-  <div class="definition">
-    <p><span class="term">Blue-Green Deployment</span> &mdash; A deployment strategy where you run two identical environments (&ldquo;blue&rdquo; and &ldquo;green&rdquo;) side by side. You deploy changes to the inactive environment, verify everything works, then switch traffic to it. If something goes wrong, you switch back. Zero downtime, instant rollback.</p>
-  </div>
-
-  <p>There is a specific scenario where blue-green deployment is essential for BSearch: <strong>switching embedding providers</strong> (e.g., upgrading from one version of Voyage to a newer one, or switching to a different provider entirely).</p>
-
-  <h3>The Problem</h3>
-
-  <p>Every document chunk in the search index has a vector embedding &mdash; a list of 1,024 numbers generated by a specific AI model (currently Voyage <code>voyage-context-3</code>). When you search, your query is also embedded by the same model, and the system compares the two vectors using cosine similarity.</p>
-
-  <p>Here is the critical constraint: <strong>you cannot mix vectors from different embedding models in the same index.</strong> Cosine similarity between vectors from Model A and vectors from Model B is meaningless &mdash; the numbers represent completely different coordinate systems. It would be like comparing GPS coordinates to postal codes.</p>
-
-  <p>So if you want to switch embedding models, you have to re-embed all ~2.2 million chunks. That takes 1&ndash;2 hours. You cannot take the search index offline for 1&ndash;2 hours. Hence: blue-green re-indexing.</p>
-
-  <h3>The Solution</h3>
-
-  <pre class="mermaid">
-flowchart TB
-    subgraph Phase1["Phase 1: Build Green Index"]
-        A["Create new &lsquo;green&rsquo; index"] --> B["Re-embed all 2.2M chunks\nwith new model"]
-        B --> C["New files written to\nBOTH indexes"]
-    end
-
-    subgraph Phase2["Phase 2: Validate"]
-        D["Chunk counts match?"] --> E["Sample provenance check"]
-        E --> F["Run acceptance queries"]
-        F --> G["Calibrate dedup thresholds\n(similarity distributions differ\nacross models)"]
-    end
-
-    subgraph Phase3["Phase 3: Switch"]
-        H["Flip active index\nblue &rarr; green"] --> I["Users now searching\ngreen index"]
-        I --> J["Keep blue index 48h\nfor rollback"]
-    end
-
-    Phase1 --> Phase2 --> Phase3
-
-    style Phase1 fill:#e3f2fd,stroke:#4A7FB5
-    style Phase2 fill:#fff3e0,stroke:#D4793A
-    style Phase3 fill:#e8f5e9,stroke:#2E7D5B
-  </pre>
-
-  <ol>
-    <li><strong>Create a parallel &ldquo;green&rdquo; index.</strong> A brand-new search index is provisioned alongside the existing &ldquo;blue&rdquo; (live) index.</li>
-    <li><strong>Re-embed all chunks.</strong> Every chunk is processed through the new embedding model, and the resulting vectors are stored in the green index. This takes approximately 1&ndash;2 hours for 2.2 million chunks.</li>
-    <li><strong>During re-indexing, new files go to both indexes.</strong> Any documents that are added or updated while re-indexing is in progress are written to both the blue and green indexes, so neither falls behind.</li>
-    <li><strong>Validate the green index.</strong> Before switching:
-      <ul>
-        <li>Chunk counts must match between blue and green.</li>
-        <li>A sample of chunks is checked to confirm provenance (they trace back to the correct source documents).</li>
-        <li>A set of acceptance queries is run against the green index to verify result quality.</li>
-        <li>Deduplication thresholds are recalibrated &mdash; different embedding models produce different similarity score distributions, so the threshold for &ldquo;these two chunks are duplicates&rdquo; may need adjustment.</li>
-      </ul>
-    </li>
-    <li><strong>Flip the active index.</strong> Once validation passes, BSearch switches to serving queries from the green index. This is instantaneous from the user&rsquo;s perspective.</li>
-    <li><strong>Keep the old index for 48 hours.</strong> The blue index remains available as a rollback target. If the new model produces unexpectedly poor results in production, one configuration change switches back to blue. After 48 hours of stable operation, the old index is decommissioned.</li>
-  </ol>
-
-  <div class="callout ib-analogy">
-    <div class="callout-title">IB Analogy</div>
-    <p>This is like migrating to a new data room provider mid-deal. You do not shut down the old data room, move all the files, and hope nothing breaks. Instead, you set up the new data room in parallel, copy everything over, verify the folder structure and permissions match, and only <em>then</em> send the new link to buyers. The old data room stays active for a few days in case you need to fall back. That is blue-green re-indexing.</p>
-  </div>
 
   <div class="callout info">
-    <div class="callout-title">When does this happen?</div>
-    <p>Blue-green re-indexing is not a daily occurrence. It happens when BSearch upgrades its embedding model &mdash; perhaps once or twice a year, when a meaningfully better model becomes available. The process is fully automated; once triggered, it runs to completion without manual intervention.</p>
+    <div class="callout-title">Why Azure Document Intelligence for PDFs?</div>
+    <p>Standard PDF text extraction (e.g., PyPDF2) treats a PDF as a flat stream of characters. It does not understand that a two-column layout should be read left-column-then-right-column, that a table has rows and columns, or that a header belongs to the following section. Azure Document Intelligence uses AI to reconstruct the document&rsquo;s logical structure &mdash; critical for CIMs and financial presentations where layout carries meaning. The trade-off is cost: ~$0.13 per page during bulk ingestion.</p>
+  </div>
+
+  <h3>PDF Pre-Deduplication</h3>
+
+  <p>Before parsing any PDF, the pipeline checks whether a Word, Excel, or PowerPoint file with the same base name exists in the same SharePoint folder. If a match is found, the PDF is skipped entirely &mdash; no download, no parse, no embedding.</p>
+
+  <div class="callout">
+    <div class="callout-title">Why This Matters</div>
+    <p>Berenson&rsquo;s SharePoint folders frequently contain PDF exports alongside their Office source files (e.g., <code>Project Atlas - Teaser - 2024.01.15 v.003.pptx</code> alongside <code>Project Atlas - Teaser - 2024.01.15.pdf</code>). Office files have richer structure &mdash; styles, heading hierarchy, cell formulas &mdash; so they produce better chunks. Roughly 75% of the ~225,000 PDFs are companion copies. Skipping them saves approximately $22,000 in Azure Document Intelligence costs during bulk ingestion.</p>
+  </div>
+
+  <p>The matching logic normalizes filenames: strip the extension, strip trailing version suffixes (the Office file has <code>v.003</code>, the PDF does not), and compare. The check runs against the Graph API folder listing, so it happens before any file download. On API error, the pipeline fails open and parses the PDF normally.</p>
+
+  <!-- ================================================================ -->
+  <!-- 9.4 The Spec — Chunking Engine -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">9.4</span> The Spec &mdash; Chunking Engine</h2>
+
+  <p>The chunking engine takes ContentBlocks from the parsers and produces index-ready chunks. The goal: chunks that are large enough to contain meaningful context but small enough to fit efficiently in Claude&rsquo;s prompt alongside other retrieval results.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Content Type</th>
+        <th>Chunk Size</th>
+        <th>Strategy</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Narrative</strong> (Word, PDF)</td>
+        <td>800&ndash;1000 tokens, ~100-token overlap</td>
+        <td>Split at paragraph or section boundaries. Never split mid-paragraph. Prepend document title + section heading to each chunk.</td>
+      </tr>
+      <tr>
+        <td><strong>Tables</strong> (Excel, tables in Word/PPT)</td>
+        <td>Intact as one chunk (&le;1500 tokens)</td>
+        <td>Prepend text description: <code>[Sheet: Revenue Model] Table with columns: Year, Revenue, EBITDA &mdash; 15 rows</code>. If &gt;1500 tokens, use hierarchical row-group splitting (see below).</td>
+      </tr>
+      <tr>
+        <td><strong>Slides</strong></td>
+        <td>One chunk per slide</td>
+        <td>Each slide is its own chunk: <code>[Slide 3: Management Team] {content}</code></td>
+      </tr>
+      <tr>
+        <td><strong>Excel formulas</strong></td>
+        <td>Separate chunk per key sheet</td>
+        <td><code>[Sheet: LBO Model &mdash; Formulas] {formula text}</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Section Context Preservation</h3>
+
+  <p>Every narrative chunk gets its section heading prepended. If a Word document has an H1 &ldquo;Financial Analysis&rdquo; with an H2 &ldquo;Revenue Breakdown,&rdquo; every chunk from that section starts with that context. This is critical for retrieval: without it, a chunk containing &ldquo;grew 12% year-over-year&rdquo; has no context for <em>what</em> grew 12%.</p>
+
+  <h3>Hierarchical Table Splitting</h3>
+
+  <p>Tables over 1500 tokens need to be split, but you cannot split a financial table at an arbitrary row. An income statement split between &ldquo;Revenue&rdquo; and &ldquo;COGS&rdquo; loses its structure. The table splitter detects logical boundaries in the data.</p>
+
+  <div class="definition">
+    <p><span class="term">Row-group detection</span> &mdash; The algorithm that finds logical split points in large tables. Investment banking tables encode hierarchy through structural signals: indent levels, bold headers, &ldquo;Total&rdquo; rows, and blank separators. The splitter reads these signals to find category boundaries without needing to understand what the numbers mean.</p>
+  </div>
+
+  <p>The splitting works in four steps:</p>
+
+  <ol>
+    <li><strong>Detect column headers.</strong> Identify the first 1&ndash;2 rows as headers using a heuristic: rows where all non-empty cells are bold, or all cells are strings with no numeric values. These headers are stored and prepended to every split chunk.</li>
+    <li><strong>Detect category boundaries.</strong> Scan data rows top-to-bottom. A row is a boundary if any of these signals fire:</li>
+  </ol>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Signal</th>
+        <th>Detection</th>
+        <th>Example</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Indent decrease</strong></td>
+        <td><code>cell.alignment.indent == 0</code> after rows with <code>indent &gt; 0</code></td>
+        <td>&ldquo;Operating Expenses&rdquo; at indent 0 after sub-items at indent 2</td>
+      </tr>
+      <tr>
+        <td><strong>Bold first cell</strong></td>
+        <td>First non-empty cell is bold and at indent 0</td>
+        <td><strong>Revenue by Segment</strong> (bold, unindented)</td>
+      </tr>
+      <tr>
+        <td><strong>Total/Subtotal row</strong></td>
+        <td>First cell matches <code>^(Total|Subtotal|Net|Grand Total)\b</code></td>
+        <td>&ldquo;Total Operating Expenses&rdquo;</td>
+      </tr>
+      <tr>
+        <td><strong>Blank separator</strong></td>
+        <td>All cells in row are empty or whitespace</td>
+        <td>Blank row between &ldquo;Sources&rdquo; and &ldquo;Uses&rdquo; sections</td>
+      </tr>
+      <tr>
+        <td><strong>PDF/Word tables</strong></td>
+        <td>Bold first cell or blank preceding row (no indent data)</td>
+        <td>Same logic, minus indent signals</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <ol start="3">
+    <li><strong>Build row groups.</strong> Segment rows at boundaries. Each row group is a dataclass with an optional category label, the rows, and a token count.</li>
+    <li><strong>Greedy chunk assembly.</strong> Merge adjacent groups until adding the next would exceed 1500 tokens. Each chunk gets column headers prepended, a category breadcrumb (e.g., <code>[Operating Expenses &gt; SG&amp;A]</code>), and a descriptive prefix with row range and column names.</li>
+  </ol>
+
+  <h3>How This Handles Real IB Tables</h3>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Table Type</th>
+        <th>Hierarchy Signal</th>
+        <th>Grouping</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Income statement</td>
+        <td>Bold category headers (Revenue, COGS, OpEx) + &ldquo;Total&rdquo; rows</td>
+        <td>One group per category + its line items</td>
+      </tr>
+      <tr>
+        <td>Revenue by customer</td>
+        <td>Bold customer names at indent 0, products indented</td>
+        <td>One group per customer + sub-rows</td>
+      </tr>
+      <tr>
+        <td>Sources &amp; Uses</td>
+        <td>&ldquo;Sources&rdquo; / &ldquo;Uses&rdquo; bold headers or blank separator</td>
+        <td>Two groups (one per section)</td>
+      </tr>
+      <tr>
+        <td>Quarterly bridge</td>
+        <td>Typically flat with no hierarchy</td>
+        <td>Fixed-size fallback (~25&ndash;30 rows)</td>
+      </tr>
+      <tr>
+        <td>Cap table</td>
+        <td>Investor names at indent 0, share classes indented</td>
+        <td>One group per investor</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <div class="callout-title">Edge Cases</div>
+    <p><strong>Deeply nested tables</strong> (3+ indent levels): group at top-level (indent 0) boundaries only. Sub-hierarchy stays intact within the chunk. <strong>Merged cells</strong>: resolve <code>openpyxl.MergedCell</code> objects to the parent cell&rsquo;s value. <strong>Every row is bold</strong> (common in summary tables): no boundaries detected, so the flat-table fallback kicks in at ~25&ndash;30 rows per chunk.</p>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- 9.5 The Spec — Summary Generation -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">9.5</span> The Spec &mdash; Summary Generation</h2>
+
+  <h3>Document Summaries</h3>
+
+  <p>For any document that produces four or more chunks, Haiku generates a ~200-token summary. This summary serves as a semantic bridge between distant sections of the same document &mdash; when a CIM has a company description on page 5 and financial metrics on page 30, the summary chunk mentions both, so a query about the company&rsquo;s financials can surface the right document even if neither individual chunk alone is a strong match.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Parameter</th>
+        <th>Value</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Trigger</td>
+        <td>Document produces &ge;4 chunks</td>
+      </tr>
+      <tr>
+        <td>Input</td>
+        <td>First ~2000 tokens of document content</td>
+      </tr>
+      <tr>
+        <td>Output</td>
+        <td>~200-token summary</td>
+      </tr>
+      <tr>
+        <td>Model</td>
+        <td>Claude Haiku 4.5</td>
+      </tr>
+      <tr>
+        <td>Indexed as</td>
+        <td><code>chunk_type: "doc_summary"</code>, <code>chunk_index: -1</code></td>
+      </tr>
+      <tr>
+        <td>Timeout</td>
+        <td>5 seconds</td>
+      </tr>
+      <tr>
+        <td>On failure</td>
+        <td>Log warning, skip summary. Document still indexed normally.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>The summary captures the document type, deal name, key topics covered, entities and metrics mentioned, and a brief section map. The prompt is loaded from <code>src/shared/prompts/doc_summary.txt</code> &mdash; not hardcoded in the Python file.</p>
+
+  <h3>Deal-Level Summaries</h3>
+
+  <p>For deals with three or more documents and a non-null canonical name, Haiku generates a ~400-token deal-level summary. These are what make cross-deal queries possible &mdash; without them, answering &ldquo;where do we stand on active deals?&rdquo; would require Claude to reason across hundreds of raw chunks from dozens of deals in a single call.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Parameter</th>
+        <th>Value</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Trigger</td>
+        <td>Deal has &ge;3 documents AND non-null <code>canonical_name</code></td>
+      </tr>
+      <tr>
+        <td>Input</td>
+        <td>All <code>doc_summary</code> chunks for the deal + entity context from Neo4j</td>
+      </tr>
+      <tr>
+        <td>Output</td>
+        <td>~400-token deal overview</td>
+      </tr>
+      <tr>
+        <td>Model</td>
+        <td>Claude Haiku 4.5</td>
+      </tr>
+      <tr>
+        <td>Indexed as</td>
+        <td><code>chunk_type: "deal_summary"</code>, synthetic <code>file_id</code></td>
+      </tr>
+      <tr>
+        <td>Timeout</td>
+        <td>8 seconds (more input context than doc summary)</td>
+      </tr>
+      <tr>
+        <td>On failure</td>
+        <td>Log warning, skip. No retry.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Deal Summary Refresh Schedule</h3>
+
+  <p>Deal summaries are refreshed through two mechanisms:</p>
+
+  <ul>
+    <li><strong>Event-triggered (webhook).</strong> After a file is ingested via webhook, the pipeline queues a deal summary update. A debouncing mechanism consolidates changes: the pipeline writes a <code>{deal_id, last_file_change_ts}</code> record to a Cosmos DB <code>deal_summary_pending</code> container. A timer trigger checks every minute for deals where the last file change was more than 5 minutes ago, and processes them. This prevents regenerating the summary 10 times when 10 files change in rapid succession.</li>
+    <li><strong>Periodic (timer).</strong> Every 6 hours, a scheduled job checks all qualifying deals for stale summaries &mdash; any deal where a document&rsquo;s <code>last_modified</code> is newer than the deal summary&rsquo;s <code>last_modified</code>.</li>
+  </ul>
+
+  <!-- ================================================================ -->
+  <!-- 9.6 The Spec — Metadata & Entity Extraction -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">9.6</span> The Spec &mdash; Metadata &amp; Entity Extraction</h2>
+
+  <h3>Document Type Classification</h3>
+
+  <p>Every document gets a <code>doc_type</code> classification. This drives deal stage inference, entity extraction targeting, and search filtering. The classifier uses filename and path patterns first (fast, free), with a Haiku fallback for ambiguous cases.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th><code>doc_type</code></th>
+        <th>Description</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td><code>cim</code></td><td>Confidential Information Memorandum</td></tr>
+      <tr><td><code>teaser</code></td><td>Confidential teaser / one-pager</td></tr>
+      <tr><td><code>model</code></td><td>Financial model (Excel)</td></tr>
+      <tr><td><code>engagement_letter</code></td><td>Engagement letter / advisory agreement</td></tr>
+      <tr><td><code>nda</code></td><td>Non-disclosure / confidentiality agreement</td></tr>
+      <tr><td><code>management_presentation</code></td><td>Management presentation deck</td></tr>
+      <tr><td><code>diligence_tracker</code></td><td>Due diligence tracker / VDR index</td></tr>
+      <tr><td><code>board_deck</code></td><td>Board of directors presentation</td></tr>
+      <tr><td><code>process_letter</code></td><td>Process letter to potential acquirers</td></tr>
+      <tr><td><code>ioi</code></td><td>Indication of Interest</td></tr>
+      <tr><td><code>loi</code></td><td>Letter of Intent</td></tr>
+      <tr><td><code>purchase_agreement</code></td><td>Purchase / merger agreement</td></tr>
+      <tr><td><code>memo</code></td><td>Internal memo / research note</td></tr>
+      <tr><td><code>other</code></td><td>Anything that doesn&rsquo;t match the above</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Deal Identity</h3>
+
+  <p>The <code>deal_id</code> is a deterministic identifier derived from the deal&rsquo;s subfolder path: a SHA-256 hash of the first-level subfolder name under one of the two deal root folders (<code>Banking - General</code> or <code>Private Equity - General</code>), truncated to 16 characters. All files anywhere under <code>Banking - General/Project Atlas/**</code> produce the same <code>deal_id</code>, regardless of nesting depth.</p>
+
+  <div class="definition">
+    <p><span class="term">Deal root folders</span> &mdash; The two top-level SharePoint folders that contain deal subfolders: <code>Banking - General</code> and <code>Private Equity - General</code>. These are defined as a code-level constant (<code>DEAL_ROOT_FOLDERS</code>) in the metadata module &mdash; not in config, because they are structural facts about the firm&rsquo;s organization that change at the same frequency as the code itself.</p>
+  </div>
+
+  <h3>Three-Tier Entity Extraction</h3>
+
+  <p>Entity extraction runs at three tiers, each with a different cost/accuracy trade-off:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Tier</th>
+        <th>Method</th>
+        <th>Scope</th>
+        <th>What It Extracts</th>
+        <th>Where It Writes</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Tier 1</strong></td>
+        <td>Haiku (1 call/doc)</td>
+        <td>Document-level</td>
+        <td>Companies with roles and confidence, primary industry, deal name, doc_type</td>
+        <td>Neo4j (Deal, Company nodes, relationships)</td>
+      </tr>
+      <tr>
+        <td><strong>Tier 2</strong></td>
+        <td>Haiku (selective)</td>
+        <td>High-value chunks</td>
+        <td>Financial metrics (revenue, EBITDA, EV, multiples), people with titles, additional company relationships</td>
+        <td>Neo4j (financial metrics on Deal, Person nodes, additional edges)</td>
+      </tr>
+      <tr>
+        <td><strong>Tier 3</strong></td>
+        <td>Regex / heuristics</td>
+        <td>Every chunk</td>
+        <td>Company name mentions, person name mentions, dollar amounts, percentages, dates</td>
+        <td>Azure AI Search chunk fields only (NOT Neo4j)</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h4>Tier 1 &mdash; Document-Level Haiku Extraction</h4>
+
+  <p>One Haiku call per document, using the first ~1000 tokens. Extracts the document type, deal name, primary companies with roles (<code>target</code>, <code>acquirer</code>, <code>advisor</code>, <code>lender</code>, <code>other</code>) and confidence levels (<code>high</code>, <code>medium</code>, <code>low</code>), and industry classification. Only high and medium confidence entities are written to Neo4j; low confidence entities populate chunk-level fields only.</p>
+
+  <h4>Tier 2 &mdash; High-Value Chunk Extraction</h4>
+
+  <p>After chunking, certain chunks are flagged for additional Haiku extraction based on their content:</p>
+
+  <ul>
+    <li><strong>Financial tables</strong> &mdash; chunks with headers containing &ldquo;Revenue,&rdquo; &ldquo;EBITDA,&rdquo; &ldquo;Enterprise Value,&rdquo; or &ldquo;Purchase Price&rdquo;</li>
+    <li><strong>People sections</strong> &mdash; chunks from management team sections, signature blocks, or engagement letter parties (detected via heading hierarchy from the parser)</li>
+    <li><strong>IOI/LOI body chunks</strong> &mdash; chunks from documents with <code>doc_type</code> of <code>ioi</code> or <code>loi</code></li>
+    <li><strong>Process letter chunks</strong> &mdash; chunks from <code>process_letter</code> documents</li>
+  </ul>
+
+  <p>Typically ~1&ndash;3 additional Haiku calls per document. Many documents (memos, board decks, general files) get zero additional calls.</p>
+
+  <h4>Tier 3 &mdash; Local NER (No API Calls)</h4>
+
+  <p>Every chunk gets lightweight named entity recognition via regex and heuristics. Company names are detected by matching capitalized multi-word phrases followed by entity suffixes (Inc, Corp, LLC, Ltd, Partners, Capital, Group, Holdings). Person names are detected in structured contexts (after Mr./Ms./Dr., in &ldquo;Name, Title&rdquo; patterns). A cached set of known entity names from Neo4j improves recall &mdash; the cache is refreshed at the start of each ingestion batch.</p>
+
+  <div class="callout info">
+    <div class="callout-title">Why Three Tiers?</div>
+    <p>Tier 1 gives you deal-level intelligence cheaply (one Haiku call per document, ~$550 for all 550K documents). Tier 2 adds precision where it matters most &mdash; financial tables and structured sections &mdash; for an additional ~$200&ndash;400. Tier 3 adds per-chunk mentions for free. The tiers are additive: Tier 1 finds &ldquo;Goldman Sachs is the advisor on this deal,&rdquo; Tier 2 extracts the specific fee terms from the engagement letter, and Tier 3 tags every chunk that mentions Goldman Sachs for BM25 search.</p>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- 9.7 The Spec — Deal Registry & Knowledge Graph -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">9.7</span> The Spec &mdash; Deal Registry &amp; Knowledge Graph</h2>
+
+  <h3>Deal Alias Accumulation</h3>
+
+  <p>Investment banking deals always have multiple names: a code name (&ldquo;Project Atlas&rdquo;) in early documents and the real company name (&ldquo;Acme Corp&rdquo;) in later ones. BSearch handles this through alias accumulation in Neo4j. The Neo4j Deal node stores an <code>aliases</code> array and a <code>canonical_name</code>. Every time a file is ingested:</p>
+
+  <ol>
+    <li>Haiku extracts a per-file deal name from the filename and content.</li>
+    <li>If the name is new (not already in <code>aliases</code>), it is appended via Cypher <code>MERGE</code>.</li>
+    <li>If this file has the most recent <code>last_modified</code> timestamp, the <code>canonical_name</code> is updated. This naturally converges to the &ldquo;real&rdquo; company name as deals progress from code-name documents to formal ones.</li>
+  </ol>
+
+  <p>When a deal&rsquo;s canonical name changes, all existing chunks with that <code>deal_id</code> in Azure AI Search are batch-updated &mdash; a targeted field update, not a full re-ingestion.</p>
+
+  <h3>Company Name Normalization</h3>
+
+  <p>Company nodes use a <code>normalized_name</code> as the <code>MERGE</code> key: lowercase, with suffixes stripped (Inc., Corp., LLC, Ltd., &amp; Co., Group, Holdings, International, Advisors, Partners, Capital). This prevents &ldquo;Goldman Sachs,&rdquo; &ldquo;Goldman Sachs &amp; Co.,&rdquo; and &ldquo;Goldman Sachs Group, Inc.&rdquo; from becoming separate nodes.</p>
+
+  <h3>Deal Stage Inference</h3>
+
+  <p>Deal stages are inferred deterministically from <code>doc_type</code> &mdash; no LLM required:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th><code>doc_type</code></th>
+        <th>Inferred <code>deal_stage</code></th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td><code>nda</code>, <code>engagement_letter</code></td><td><code>origination</code></td></tr>
+      <tr><td><code>teaser</code>, <code>cim</code>, <code>management_presentation</code>, <code>process_letter</code></td><td><code>marketing</code></td></tr>
+      <tr><td><code>ioi</code></td><td><code>bidding</code></td></tr>
+      <tr><td><code>loi</code></td><td><code>negotiation</code></td></tr>
+      <tr><td><code>diligence_tracker</code></td><td><code>diligence</code></td></tr>
+      <tr><td><code>purchase_agreement</code></td><td><code>closing</code></td></tr>
+      <tr><td><code>model</code>, <code>board_deck</code>, <code>memo</code>, <code>other</code></td><td><code>null</code> (no stage entry)</td></tr>
+    </tbody>
+  </table>
+
+  <p>The deal&rsquo;s <code>current_stage</code> is always the <em>highest</em> stage reached. Stage history is tracked as <code>StageEntry</code> nodes connected to the Deal node in Neo4j.</p>
+
+  <h3>Deal Status Inference</h3>
+
+  <p>Deal status is also deterministic, based on document history and activity recency:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Condition</th>
+        <th><code>deal_status</code></th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td><code>purchase_agreement</code> doc_type exists</td><td><code>closed</code></td></tr>
+      <tr><td>Last activity &gt;9 months ago, no purchase_agreement</td><td><code>dead</code></td></tr>
+      <tr><td>Last activity 3&ndash;9 months ago, no purchase_agreement</td><td><code>on_hold</code></td></tr>
+      <tr><td>Last activity within 3 months</td><td><code>active</code></td></tr>
+    </tbody>
+  </table>
+
+  <p>Status is recomputed on every file ingestion for the affected deal.</p>
+
+  <!-- ================================================================ -->
+  <!-- 9.8 File Structure -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">9.8</span> Files to Create</h2>
+
+  <pre><code>src/ingestion/
+├── parsers/
+│   ├── __init__.py
+│   ├── base.py           # ABC: parse(bytes, metadata) → list[ContentBlock]
+│   ├── word.py           # WordParser (python-docx)
+│   ├── excel.py          # ExcelParser (openpyxl)
+│   ├── ppt.py            # PPTParser (python-pptx)
+│   └── pdf.py            # PDFParser (Azure Document Intelligence)
+├── table_splitter.py     # Hierarchical row-group detection + large table chunking
+├── doc_summary.py        # Haiku document summary generation
+├── deal_summary.py       # Deal-level summary generation (periodic + event-triggered)
+├── metadata.py           # doc_type classification + deal_id + entity extraction
+├── deal_registry.py      # Neo4j deal alias accumulation + canonical name resolution
+├── entity_registry.py    # Company + person entity writes to Neo4j
+├── graph_cleanup.py      # File deletion/update: remove provenance, delete orphans
+├── pdf_dedup.py          # Skip PDFs with matching Office files
+├── embeddings.py         # Voyage AI embedding provider abstraction
+└── __init__.py
+
+src/shared/
+├── neo4j_client.py       # Neo4j driver wrapper: Deal/Company/Person CRUD
+├── ner.py                # Lightweight chunk-level NER (Tier 3, regex only)
+└── prompts/
+    ├── doc_summary.txt   # Document summary prompt template
+    └── deal_summary.txt  # Deal summary prompt template
+
+tests/
+├── test_word_parser.py
+├── test_excel_parser.py
+├── test_ppt_parser.py
+├── test_pdf_parser.py
+├── test_table_splitter.py
+├── test_doc_summary.py
+├── test_deal_summary.py
+├── test_deal_registry.py
+├── test_pdf_dedup.py
+├── test_metadata.py
+├── test_chunking.py
+├── test_neo4j_client.py
+├── test_ner.py
+├── test_entity_registry.py
+├── test_graph_cleanup.py
+└── fixtures/
+    ├── sample.docx               # With headings, tables, paragraphs
+    ├── sample.xlsx               # Multiple sheets, formulas, headers
+    ├── sample_hierarchical.xlsx  # Indented rows, bold categories, Total rows
+    ├── sample_flat_table.xlsx    # Large flat table with no hierarchy signals
+    ├── sample.pptx               # Slides, speaker notes, tables
+    └── sample.pdf                # Multi-page with tables</code></pre>
+
+  <!-- ================================================================ -->
+  <!-- 9.9 What to Tell Claude Code -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">9.9</span> What to Tell Claude Code</h2>
+
+  <div class="claude-prompt">
+    <div class="prompt-label">Prompt 1 &mdash; Document Parsers</div>
+    <div class="prompt-text">Build document parsers for BSearch. Create an abstract <code>BaseParser</code> class in <code>src/ingestion/parsers/base.py</code> with a <code>parse(file_bytes, metadata) -> list[ContentBlock]</code> method, where <code>ContentBlock</code> is a dataclass with content, block_type (paragraph/table/slide/formula), section_heading, and format-specific metadata. Implement four parsers:<br><br>
+    <strong>WordParser</strong> (python-docx): extract paragraphs with heading hierarchy tracking (H1/H2/H3), tables with row/column structure, styles.<br>
+    <strong>ExcelParser</strong> (openpyxl): sheet-by-sheet extraction, automatic header row detection, formula text capture as separate content blocks, resolve formulas to values where possible.<br>
+    <strong>PPTParser</strong> (python-pptx): per-slide content blocks with [Slide N: Title] prefix, speaker notes appended, tables within slides preserved.<br>
+    <strong>PDFParser</strong> (Azure Document Intelligence): tables as structured data, paragraphs with reading order, section headers.<br><br>
+    Also create <code>src/ingestion/pdf_dedup.py</code> with a <code>has_matching_office_file()</code> function that checks if a Word/Excel/PPT file with the same base name exists in the same folder before parsing a PDF. Normalize filenames by stripping extensions and trailing version suffixes.</div>
+  </div>
+
+  <div class="claude-prompt">
+    <div class="prompt-label">Prompt 2 &mdash; Chunking Engine &amp; Table Splitter</div>
+    <div class="prompt-text">Build the chunking engine for BSearch. Add a <code>chunk()</code> method to <code>BaseParser</code> that takes <code>list[ContentBlock]</code> and returns <code>list[Chunk]</code>. Target 800&ndash;1000 tokens per chunk with ~100-token overlap. Split at paragraph boundaries &mdash; never mid-paragraph. Prepend the document title + nearest section heading to each chunk as context.<br><br>
+    For tables: keep tables intact as one chunk up to 1500 tokens. For larger tables, create <code>src/ingestion/table_splitter.py</code> with hierarchical row-group splitting. Detect column headers (bold-all or all-string rows). Detect category boundaries via indent level changes (indent 0 after indent &gt;0), bold first cells at indent 0, Total/Subtotal regex, and blank separator rows. Build row groups at boundaries, then greedy-merge groups up to 1500 tokens. Prepend column headers to every split chunk. Add category breadcrumb and descriptive prefix with row range and column names. Flat table fallback: if no boundaries detected, split at fixed intervals of 25 rows.<br><br>
+    Handle edge cases: merged cells (resolve to parent value), deeply nested tables (group at indent 0 only), all-bold tables (flat fallback).</div>
+  </div>
+
+  <div class="claude-prompt">
+    <div class="prompt-label">Prompt 3 &mdash; Summaries, Metadata &amp; Entity Extraction</div>
+    <div class="prompt-text">Add document and deal summary generation, metadata extraction, and entity extraction to BSearch.<br><br>
+    <strong>Doc summaries</strong> (<code>src/ingestion/doc_summary.py</code>): for documents producing &ge;4 chunks, call Haiku with the first 2000 tokens to generate a ~200-token summary. Index as <code>chunk_type: "doc_summary"</code>, <code>chunk_index: -1</code>. Load prompt from <code>src/shared/prompts/doc_summary.txt</code>. 5s timeout, log and skip on failure.<br><br>
+    <strong>Deal summaries</strong> (<code>src/ingestion/deal_summary.py</code>): for deals with &ge;3 docs and non-null canonical_name, generate ~400-token deal overview using all doc_summary chunks + Neo4j entity context. Index as <code>chunk_type: "deal_summary"</code>. Debounce webhook-triggered regeneration with a 5-minute consolidation window via Cosmos DB. Periodic refresh every 6 hours. 8s timeout.<br><br>
+    <strong>Metadata</strong> (<code>src/ingestion/metadata.py</code>): classify doc_type via filename regex patterns with Haiku fallback. Compute deal_id as SHA-256 hash of first-level subfolder under deal root folders. Extract deal_name per-file via regex + Haiku.<br><br>
+    <strong>Entity extraction</strong>: Tier 1 doc-level Haiku (companies with roles/confidence, industry). Tier 2 selective Haiku on financial table chunks, people sections, IOI/LOI chunks. Tier 3 regex NER in <code>src/shared/ner.py</code> (company suffixes, person patterns, cached known entities from Neo4j). Write entities to Neo4j via <code>src/ingestion/entity_registry.py</code> and <code>src/ingestion/deal_registry.py</code> using MERGE for alias accumulation. Build <code>src/shared/neo4j_client.py</code> as the Neo4j driver wrapper with Deal/Company/Person CRUD.</div>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- 9.10 How to Verify -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">9.10</span> How to Verify</h2>
+
+  <div class="verify-checklist">
+    <div class="section-label">Verification Checklist</div>
+    <ol>
+      <li><strong>Parse one sample of each format.</strong> Run each parser (Word, Excel, PPT, PDF) against a real deal document. Verify content is extracted completely &mdash; no missing paragraphs, no garbled tables, no lost speaker notes. Check that heading hierarchy is tracked for Word, formula text is captured for Excel, and slide numbers are correct for PowerPoint.</li>
+      <li><strong>PDF pre-dedup.</strong> Place a <code>.pptx</code> and its companion <code>.pdf</code> in the same test folder. Verify <code>has_matching_office_file()</code> returns True for the PDF. Rename the PDF to break the match and verify it returns False.</li>
+      <li><strong>Chunk a multi-section document.</strong> Parse and chunk a Word document with 5+ sections. Verify chunks are 800&ndash;1000 tokens. Verify each chunk has its section heading prepended. Verify no chunk splits mid-paragraph. Spot-check that the first and last sentences of each chunk form complete thoughts.</li>
+      <li><strong>Chunk a large financial table.</strong> Parse <code>sample_hierarchical.xlsx</code> (a table with indented rows, bold category headers, and Total rows exceeding 1500 tokens). Verify: chunks split at category boundaries, each chunk has column headers repeated at the top, descriptive prefix includes row range and category name. Then test <code>sample_flat_table.xlsx</code> &mdash; verify the flat fallback produces ~25-row chunks.</li>
+      <li><strong>Generate a document summary.</strong> Parse a 10+ chunk document (e.g., a multi-section CIM). Verify Haiku generates a summary. Verify the summary chunk has <code>chunk_type: "doc_summary"</code> and <code>chunk_index: -1</code>. Read the summary &mdash; it should mention key topics from different sections of the document. Verify a 3-chunk document does NOT generate a summary.</li>
+      <li><strong>Run entity extraction on a sample CIM.</strong> Verify Tier 1 extracts the target company name, advisor, and industry with high or medium confidence. Verify doc_type is classified correctly. Verify Tier 2 runs on any financial table chunks and extracts metrics (revenue, EBITDA, etc.). Verify Tier 3 NER tags company mentions in individual chunks.</li>
+      <li><strong>Check Neo4j after extraction.</strong> Query Neo4j for the Deal node &mdash; verify it has the correct <code>deal_id</code>, <code>canonical_name</code>, and <code>aliases</code>. Verify Company nodes exist with correct <code>normalized_name</code> values. Verify relationship edges (TARGET_OF, ADVISOR_ON, etc.) have <code>source_file_ids</code> populated. Verify deal stage is inferred correctly from the doc_type.</li>
+      <li><strong>Test deal alias accumulation.</strong> Ingest two files from the same deal folder &mdash; one with code name &ldquo;Project Atlas&rdquo; and one with real name &ldquo;Acme Corp.&rdquo; Verify the Deal node&rsquo;s <code>aliases</code> array contains both names. Verify <code>canonical_name</code> matches the most recently modified file&rsquo;s extracted name.</li>
+    </ol>
   </div>
 
   <div class="key-takeaway">
     <div class="callout-title">Key Takeaway</div>
-    <p>BSearch runs on a set of managed Azure services with a total monthly cost of roughly $300&ndash;600 for 18 users. All infrastructure is defined in code (Bicep templates), making it repeatable and auditable. Deployments are split into three independent tracks (infrastructure, backend, frontend), and embedding model upgrades use a blue-green strategy to avoid any search downtime. Application Insights provides real-time monitoring with automated alerts when components degrade.</p>
+    <p>Phase 2 builds the data quality foundation. Every search result traces back to a chunk created here. The format-aware parsers preserve document structure (tables as tables, slides as slides). The chunking engine splits at logical boundaries with section context preserved. Hierarchical table splitting handles the financial models that are central to the firm&rsquo;s work. And the three-tier entity extraction populates the knowledge graph that makes deal-aware, entity-aware search possible.</p>
   </div>
 
   <nav class="chapter-nav bottom">
-    <a href="chapter-08.html">&larr; Previous</a>
+    <a href="chapter-08.html">&larr; Previous: Phase 1 &mdash; Project Setup &amp; Infrastructure</a>
     <span class="nav-spacer">|</span>
     <a href="index.html">Contents</a>
     <span class="nav-spacer">|</span>
-    <a href="chapter-10.html">Next &rarr;</a>
+    <a href="chapter-10.html">Next: Phase 3 &mdash; Search Index &amp; Ingestion Pipeline &rarr;</a>
   </nav>
 </div>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>

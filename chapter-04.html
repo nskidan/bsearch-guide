@@ -4,98 +4,66 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="light only">
-  <title>Chapter 4: The Ingestion Pipeline — BSearch Technical Guide</title>
+  <title>Chapter 4: How Documents Get Into the System &mdash; BSearch Technical Guide</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
 <div class="page-wrapper">
   <nav class="chapter-nav">
-    <a href="chapter-03.html">&larr; Previous: How Search Works</a>
+    <a href="chapter-03.html">&larr; Previous: How Search Actually Works</a>
     <span class="nav-spacer">|</span>
     <a href="index.html">Contents</a>
     <span class="nav-spacer">|</span>
-    <a href="chapter-05.html">Next: The Query Pipeline &rarr;</a>
+    <a href="chapter-05.html">Next: How Questions Get Answered &rarr;</a>
   </nav>
   <div class="chapter-header">
     <div class="chapter-number">Chapter 4</div>
-    <h1>The Ingestion Pipeline</h1>
-    <p class="chapter-subtitle">How documents go from SharePoint files to searchable, AI-ready index entries.</p>
+    <h1>How Documents Get Into the System</h1>
+    <p class="chapter-subtitle">Format-aware parsing, intelligent chunking, summaries, deduplication, and entity extraction &mdash; the full journey from SharePoint file to searchable index entry.</p>
   </div>
 
-  <p>Before anyone can search for a document, BSearch has to process it. Every file in SharePoint &mdash; every CIM, teaser, model, NDA, and engagement letter &mdash; must be discovered, downloaded, parsed, classified, sliced into searchable pieces, converted into mathematical representations, and loaded into the search index. This chapter walks through that nine-step journey in detail.</p>
+  <p>Before anyone can search for a document, BSearch has to process it. Every file in SharePoint &mdash; every CIM, teaser, model, NDA, and engagement letter &mdash; must be discovered, downloaded, parsed, classified, sliced into searchable pieces, converted into mathematical representations, and loaded into the search index. This chapter walks through that journey, focusing on the decisions that make ingestion <em>work well</em> rather than just work at all.</p>
 
   <div class="callout ib-analogy">
     <div class="callout-title">IB Analogy</div>
     <p>Think of the ingestion pipeline like the onboarding process for a new deal. A pitch deck doesn&rsquo;t just appear in your working folder ready to reference &mdash; someone has to receive it, file it in the right deal folder, tag it with deal metadata, extract key terms, and make sure it&rsquo;s accessible to the right people. The ingestion pipeline automates all of that for every document across the entire firm.</p>
   </div>
 
-  <!-- Mermaid: 9-step pipeline overview -->
+  <!-- Pipeline overview -->
   <h2><span class="section-number">4.1</span> The Pipeline at a Glance</h2>
 
-  <p>Here is the full pipeline. A document enters at the top and exits at the bottom as a set of searchable, AI-ready index entries.</p>
+  <p>A document enters at the top and exits at the bottom as a set of searchable, AI-ready index entries. Each step feeds its output into the next. If any single step fails for a document, that document gets queued for retry rather than blocking the rest of the pipeline.</p>
 
   <pre class="mermaid">
 flowchart TD
-    A["1. Discovery\nDetect new/changed files"] --> B["2. Download\nFetch file content from Graph API"]
-    B --> C["3. Parsing\nExtract text, tables, structure"]
-    C --> D["4. Metadata Extraction\nClassify doc type, assign deal, extract entities"]
+    A["1. Discovery\nDetect new/changed files"] --> B["2. Download\nFetch from Graph API"]
+    B --> PDF{"PDF with\nOffice companion?"}
+    PDF -- Yes --> SKIP["Skip PDF\n(Office file has better structure)"]
+    PDF -- No --> C["3. Parsing\nFormat-aware text extraction"]
+    C --> D["4. Metadata &amp; Entities\nClassify, assign deal, extract entities"]
     D --> E["5. Chunking\nSplit into index-ready pieces"]
-    E --> F["6. Summary Generation\nCreate doc + deal summaries"]
+    E --> F["6. Summaries\nDoc + deal-level summaries"]
     F --> G["7. Embedding\nConvert chunks to vectors"]
-    G --> H["8. Deduplication\nIdentify and exclude duplicates"]
+    G --> H["8. Deduplication\nFilename + embedding similarity"]
     H --> I["9. Indexing\nPush to Neo4j + Azure AI Search"]
 
     style A fill:#f5e6d3,stroke:#D4793A,color:#3B2F2F
+    style SKIP fill:#fde8e8,stroke:#C4612A,color:#3B2F2F
     style I fill:#d4edda,stroke:#2E7D5B,color:#3B2F2F
   </pre>
 
-  <p>Each step has a specific job, and each feeds its output into the next. If any single step fails for a document, that document gets queued for retry rather than blocking the rest of the pipeline. Let&rsquo;s walk through each one.</p>
+  <p>The rest of this chapter covers steps 3 through 9 in depth. Discovery (webhooks and delta sync) and download are covered in <a href="chapter-07.html">Chapter 7: The SharePoint Connection</a>. Here we focus on what happens <em>after</em> BSearch has a file in hand.</p>
 
-  <!-- STEP 1 -->
-  <h2><span class="section-number">4.2</span> Step 1 &mdash; Discovery</h2>
+  <hr>
 
-  <p>The pipeline starts with a simple question: <em>what changed?</em> BSearch needs to know when someone creates, edits, renames, moves, or deletes a file in SharePoint. It uses two complementary mechanisms to stay current.</p>
-
-  <h3>Webhooks (Primary)</h3>
+  <!-- PARSING -->
+  <h2><span class="section-number">4.2</span> Format-Aware Parsing</h2>
 
   <div class="definition">
-    <span class="term">Webhook:</span> A notification system where SharePoint proactively tells BSearch &ldquo;something changed&rdquo; rather than BSearch having to ask. Like getting a push notification on your phone vs. manually checking your email.
+    <span class="term">Parsing:</span> Extracting structured content &mdash; text, headings, tables, formulas &mdash; from a file&rsquo;s internal format. A Word document is not plain text; it&rsquo;s a compressed archive of XML files defining paragraphs, styles, and embedded objects. Parsing cracks that container open and pulls out what matters.
   </div>
 
-  <p>BSearch registers <strong>webhook subscriptions</strong> with the Microsoft Graph API for each monitored SharePoint site. When a file changes, Microsoft sends a notification to BSearch within <strong>30&ndash;120 seconds</strong>. The notification itself is lightweight &mdash; it just says &ldquo;something changed in this folder&rdquo; &mdash; and BSearch then queries for the specific changes.</p>
-
-  <p>Webhook subscriptions have a maximum lifetime of about <strong>2.95 days</strong> (a Microsoft limitation). BSearch stores subscription records in Cosmos DB and automatically renews them every 12 hours, well before they expire. If a renewal fails, the next scheduled renewal attempt picks it up.</p>
-
-  <h3>Delta Sync (Fallback)</h3>
-
-  <div class="definition">
-    <span class="term">Delta sync:</span> A periodic &ldquo;catch-up&rdquo; mechanism where BSearch asks the Graph API &ldquo;what changed since the last time I asked?&rdquo; using a <strong>delta token</strong> &mdash; a bookmark that marks the last known state.
-  </div>
-
-  <p>Every <strong>12&ndash;24 hours</strong>, regardless of webhooks, BSearch runs a delta sync. This catches anything webhooks might have missed &mdash; a network blip, a missed renewal, or an edge case where Microsoft didn&rsquo;t fire a notification. It&rsquo;s the safety net.</p>
-
-  <div class="callout ib-analogy">
-    <div class="callout-title">IB Analogy</div>
-    <p>Webhooks are like getting a Bloomberg alert when a deal you&rsquo;re tracking has news. Delta sync is like your morning routine of scanning the Journal and checking your inbox &mdash; you probably already saw the alert, but you scan anyway to make sure nothing slipped through.</p>
-  </div>
-
-  <!-- STEP 2 -->
-  <h2><span class="section-number">4.3</span> Step 2 &mdash; Download</h2>
-
-  <p>Once BSearch knows a file changed, it downloads the actual file content from SharePoint via the Graph API. This is straightforward &mdash; the Graph API provides a download URL &mdash; but the real work is handling failures gracefully:</p>
-
-  <ul>
-    <li><strong>404 errors</strong> (file was deleted between notification and download) &mdash; skip and mark as deleted</li>
-    <li><strong>Auth errors</strong> (expired tokens) &mdash; refresh credentials and retry</li>
-    <li><strong>Timeouts</strong> (large files, slow network) &mdash; retry with exponential backoff</li>
-  </ul>
-
-  <p>The downloaded content is held in memory for the next steps. BSearch doesn&rsquo;t store raw file copies &mdash; SharePoint remains the single source of truth for file content.</p>
-
-  <!-- STEP 3 -->
-  <h2><span class="section-number">4.4</span> Step 3 &mdash; Parsing</h2>
-
-  <p>A Word document is not plain text. It&rsquo;s a compressed archive of XML files defining paragraphs, headings, tables, styles, fonts, and embedded objects. An Excel file is even more complex &mdash; multiple sheets, formulas, named ranges, merged cells. The parsing step extracts <strong>structured content</strong> from each format.</p>
+  <p>Every file format stores information differently, which means every format needs its own parser. A one-size-fits-all approach would butcher the structure that makes documents useful.</p>
 
   <table>
     <thead>
@@ -103,129 +71,264 @@ flowchart TD
         <th>Format</th>
         <th>Parser</th>
         <th>What Gets Extracted</th>
+        <th>Why This Parser</th>
       </tr>
     </thead>
     <tbody>
       <tr>
-        <td>Word (.docx)</td>
-        <td><code>python-docx</code></td>
+        <td><strong>Word</strong> (.docx)</td>
+        <td>python-docx</td>
         <td>Paragraphs, headings (with hierarchy), tables, styles</td>
+        <td>Reads Office XML directly &mdash; fast, free, reliable</td>
       </tr>
       <tr>
-        <td>Excel (.xlsx)</td>
-        <td><code>openpyxl</code></td>
-        <td>Sheet names, column headers, cell values, formula text (sheet by sheet)</td>
+        <td><strong>Excel</strong> (.xlsx)</td>
+        <td>openpyxl</td>
+        <td>Sheet names, column headers, cell values, formula text (sheet by sheet), bold/indent formatting</td>
+        <td>Preserves formatting signals needed for table splitting</td>
       </tr>
       <tr>
-        <td>PowerPoint (.pptx)</td>
-        <td><code>python-pptx</code></td>
+        <td><strong>PowerPoint</strong> (.pptx)</td>
+        <td>python-pptx</td>
         <td>Slide title, body text, tables, speaker notes (slide by slide)</td>
+        <td>Slide-by-slide extraction maps naturally to chunking</td>
       </tr>
       <tr>
-        <td>PDF</td>
+        <td><strong>PDF</strong></td>
         <td>Azure Document Intelligence</td>
         <td>Text, tables, layout structure (handles scanned docs, complex layouts, watermarks)</td>
+        <td>Cloud AI service built for document understanding</td>
       </tr>
     </tbody>
   </table>
 
-  <p>The first three parsers are Python libraries that read the Office XML formats directly. They&rsquo;re fast, free, and reliable for well-formed documents.</p>
+  <p>The first three parsers are Python libraries that read the Office XML formats directly. They&rsquo;re fast, free, and reliable for well-formed documents. PDF parsing is a different story entirely.</p>
 
-  <p>PDF parsing is a different story. PDFs in investment banking are notoriously difficult &mdash; scanned CIM pages, multi-column layouts, embedded financial tables, watermarked confidential pages. Simple PDF-to-text libraries butcher these. <strong>Azure Document Intelligence</strong> is a cloud AI service specifically built for document understanding. It handles the complex layouts that other parsers cannot.</p>
+  <h3>Why PDFs Are Hard</h3>
+
+  <p>PDFs in investment banking are notoriously difficult. Scanned CIM pages, multi-column layouts, embedded financial tables, watermarked confidential pages &mdash; simple PDF-to-text libraries butcher these. <strong>Azure Document Intelligence</strong> is a cloud AI service specifically built for document understanding. It handles the complex layouts that simpler parsers cannot, but it comes at a per-page cost.</p>
 
   <div class="callout info">
     <div class="callout-title">Why Not Use Azure Document Intelligence for Everything?</div>
     <p>It&rsquo;s overkill for Word and Excel files, which have perfectly structured XML internals. Using it for everything would be slower (cloud API round-trip vs. local parsing) and more expensive (per-page pricing). We use the right tool for each job.</p>
   </div>
 
-  <!-- STEP 4 -->
-  <h2><span class="section-number">4.5</span> Step 4 &mdash; Metadata Extraction</h2>
+  <h3>PDF Pre-Dedup: Skipping Redundant PDFs</h3>
 
-  <p>Once we have the document&rsquo;s text, we need to understand <em>what kind of document this is</em>, <em>which deal it belongs to</em>, and <em>which companies and people are mentioned</em>. Three fields are extracted for every document.</p>
+  <p>In Berenson&rsquo;s SharePoint, many documents exist as both an Office file (the editable original) and a PDF export (the &ldquo;printed&rdquo; copy). When both live in the same folder, the PDF is redundant &mdash; and the Office file is always better because it preserves internal structure (headings, cell formatting, indent levels) that the PDF flattens away.</p>
 
-  <h3>Document Type Classification</h3>
+  <p>Before downloading or parsing any PDF, BSearch checks whether a matching Word, Excel, or PowerPoint file exists in the same folder. The matching logic normalizes filenames &mdash; Office files typically include a version suffix (&ldquo;Project Atlas - Board Deck - 2025.03.15 v.003.pptx&rdquo;) while PDFs omit it (&ldquo;Project Atlas - Board Deck - 2025.03.15.pdf&rdquo;). If a match is found, the PDF is skipped entirely &mdash; no download, no parsing, no indexing.</p>
 
-  <p>BSearch classifies each document into one of <strong>15 types</strong>: CIM, teaser, financial model, NDA, engagement letter, management presentation, bid letter, process letter, board materials, and so on. The approach is two-tiered:</p>
-
-  <ol>
-    <li><strong>Pattern matching first:</strong> Filename and folder path patterns handle the obvious cases. A file named <code>Project Atlas - CIM vFinal.pdf</code> in a <code>Marketing Materials</code> folder is clearly a CIM. This is fast and costs nothing.</li>
-    <li><strong>LLM fallback for ambiguous cases:</strong> When pattern matching isn&rsquo;t confident &mdash; say, a file named <code>Q3 Update.docx</code> that could be a management presentation, a board deck, or a status memo &mdash; BSearch sends the first ~500 tokens to Claude Haiku for classification. Haiku is a small, fast, inexpensive language model optimized for quick classification tasks.</li>
-  </ol>
-
-  <h3>Deal Identification</h3>
-
-  <div class="definition">
-    <span class="term">deal_id:</span> A unique identifier for each deal, computed as the SHA-256 hash of the subfolder path within one of the firm&rsquo;s deal root folders (&ldquo;Banking - General&rdquo;, &ldquo;Private Equity - General&rdquo;).
+  <div class="callout tip">
+    <div class="callout-title">Why This Matters</div>
+    <p>Roughly 75% of Berenson&rsquo;s ~225,000 PDFs are companion copies of Office files. Skipping them saves approximately $22,000 in Azure Document Intelligence costs during bulk ingestion &mdash; and produces better search results, since the Office-parsed versions retain more structure.</p>
   </div>
 
-  <p>The key insight: deal folder paths are stable identifiers even when deal names change. A deal might start as &ldquo;Project Atlas&rdquo; in early screening and become &ldquo;Acme Corp Sale&rdquo; once the engagement is signed, but the SharePoint folder path doesn&rsquo;t change. Hashing that path gives us a stable <code>deal_id</code> that persists throughout the deal lifecycle.</p>
+  <p>If the folder listing fails (a Graph API error), BSearch fails open &mdash; it ingests the PDF normally rather than risk missing content. A redundant PDF that slips through is caught later by the near-duplicate detection step.</p>
 
-  <h3>Entity Extraction (Tier 1)</h3>
+  <hr>
 
-  <p>For each document, Claude Haiku extracts <strong>structured entity information</strong>:</p>
-
-  <ul>
-    <li><strong>Companies with roles:</strong> target, acquirer, potential acquirer, financial advisor, legal advisor, lender</li>
-    <li><strong>Industry classification:</strong> what sector the deal falls in</li>
-    <li><strong>Deal stage inference:</strong> derived from the document type (an NDA suggests early stage; a purchase agreement suggests closing)</li>
-  </ul>
-
-  <p>This entity data feeds into the knowledge graph (covered later in this chapter) and enables queries like &ldquo;show me all deals where Goldman was advisor.&rdquo;</p>
-
-  <!-- STEP 5 -->
-  <h2><span class="section-number">4.6</span> Step 5 &mdash; Chunking</h2>
+  <!-- CHUNKING -->
+  <h2><span class="section-number">4.3</span> Chunking: Breaking Documents into Searchable Pieces</h2>
 
   <div class="definition">
     <span class="term">Chunking:</span> Breaking a document into smaller pieces (&ldquo;chunks&rdquo;) sized for the search index. A 100-page CIM can&rsquo;t be searched as one unit &mdash; it needs to be split into pieces that are small enough to be relevant but large enough to be meaningful.
   </div>
 
-  <p>Different content types need different chunking strategies. A paragraph of narrative text behaves very differently from a financial table or a slide deck.</p>
-
-  <h3>Narrative Content (Word, PDF)</h3>
-  <p>Target size: <strong>800&ndash;1,000 tokens</strong> per chunk. Splits happen at natural boundaries &mdash; paragraph breaks, section headings &mdash; not mid-sentence. Each chunk is prepended with its section heading so it retains context when searched in isolation. For example, a chunk from a CIM&rsquo;s &ldquo;Industry Overview&rdquo; section carries that heading, so the search system knows it&rsquo;s about industry context even if the chunk text itself doesn&rsquo;t say so.</p>
-
-  <h3>Tables (Excel)</h3>
-  <p>Tables are kept <strong>intact as one chunk</strong> if they fit within 1,500 tokens. If a table is larger, BSearch uses the table&rsquo;s own structure to find smart split points:</p>
-  <ul>
-    <li><strong>Hierarchical tables</strong> (the kind you see in CIM financials, with bold section headers, indented line items, and &ldquo;Total&rdquo; rows): split at the section-header level, keeping each group with its subtotals</li>
-    <li><strong>Flat tables</strong> (uniform rows with no hierarchy): split into fixed groups of approximately 25 rows</li>
-  </ul>
-
-  <h3>Slides (PowerPoint)</h3>
-  <p><strong>One chunk per slide</strong>, prefixed with <code>[Slide N: Title]</code>. Slides are already natural units of meaning &mdash; each one typically covers a single topic or data point.</p>
-
-  <h3>Formulas (Excel)</h3>
-  <p>Excel formula text (the formulas themselves, not their computed values) gets a <strong>separate chunk per key sheet</strong>. This lets BSearch answer questions like &ldquo;how is EBITDA calculated in the Acme model?&rdquo;</p>
+  <p>Different content types need different chunking strategies. A paragraph of narrative text behaves very differently from a financial table or a slide deck. Getting the chunk boundaries right is one of the most consequential decisions in the pipeline &mdash; bad boundaries mean the search system either retrieves too much noise or too little context.</p>
 
   <div class="callout ib-analogy">
     <div class="callout-title">IB Analogy</div>
     <p>Chunking is like how you break up a CIM for a buyer&rsquo;s internal review. You wouldn&rsquo;t hand the CFO the entire 200-page document &mdash; you&rsquo;d split it into the exec summary, the financial section, the industry overview, and each major exhibit. Each piece is self-contained enough to be useful on its own, but together they form the complete picture.</p>
   </div>
 
-  <!-- STEP 6 -->
-  <h2><span class="section-number">4.7</span> Step 6 &mdash; Summary Generation</h2>
+  <h3>Narrative Content (Word, PDF)</h3>
 
-  <p>Long documents create many chunks, and sometimes the answer to a query spans information from distant sections. Summaries act as <strong>semantic bridges</strong> &mdash; condensed representations that connect the dots.</p>
+  <p>Target size: <strong>800&ndash;1,000 tokens</strong> per chunk, with roughly 100 tokens of overlap between adjacent chunks. Splits happen at natural boundaries &mdash; paragraph breaks, section headings &mdash; never mid-sentence.</p>
 
-  <h3>Document Summaries</h3>
-  <p>For documents with <strong>4 or more chunks</strong>, Claude Haiku generates a ~200-token summary capturing key topics, financial metrics, and entities. This summary is stored as an additional chunk in the search index. When someone searches for &ldquo;Acme Corp acquisition terms,&rdquo; the summary chunk may surface even if no single text chunk contains all the relevant details.</p>
+  <p>Each chunk is prepended with its section heading so it retains context when searched in isolation. A chunk from a CIM&rsquo;s &ldquo;Industry Overview&rdquo; section carries that heading, so the search system knows it&rsquo;s about industry context even if the chunk text itself doesn&rsquo;t mention the section name.</p>
 
-  <h3>Deal Summaries</h3>
-  <p>For deals with <strong>3 or more documents</strong>, Haiku generates a ~400-token deal overview covering deal status, key metrics, involved parties, and stage. These summaries are enriched with entity data from the Neo4j knowledge graph and <strong>refreshed every 6 hours</strong> to stay current as new documents are added to a deal folder.</p>
+  <h3>Slides (PowerPoint)</h3>
 
-  <!-- STEP 7 -->
-  <h2><span class="section-number">4.8</span> Step 7 &mdash; Embedding</h2>
+  <p><strong>One chunk per slide</strong>, prefixed with the slide number and title: <em>[Slide 3: Management Team]</em>. Slides are already natural units of meaning &mdash; each one typically covers a single topic or data point.</p>
 
-  <div class="definition">
-    <span class="term">Embedding:</span> Converting text into a list of numbers (a &ldquo;vector&rdquo;) that captures its meaning. Similar texts produce similar vectors, enabling the search system to find documents that are <em>conceptually</em> related to a query, not just keyword matches. (Covered in depth in <a href="chapter-03.html">Chapter 3</a>.)
+  <h3>Formulas (Excel)</h3>
+
+  <p>Excel formula text (the formulas themselves, not their computed values) gets a <strong>separate chunk per key sheet</strong>. This lets BSearch answer questions like &ldquo;how is EBITDA calculated in the Acme model?&rdquo;</p>
+
+  <h3>Tables: The Hard Problem</h3>
+
+  <p>Tables are kept <strong>intact as one chunk</strong> if they fit within 1,500 tokens. Each table chunk gets a descriptive prefix: <em>[Sheet: Revenue Model] Table with columns: Year, Revenue, EBITDA &mdash; 15 rows</em>. This prefix gives the search system context about what the table contains even before reading the data.</p>
+
+  <p>But many IB tables &mdash; income statements, cap tables, sources-and-uses &mdash; are much larger than 1,500 tokens. These need to be split. And this is where it gets interesting.</p>
+
+  <hr>
+
+  <!-- HIERARCHICAL TABLE SPLITTING -->
+  <h2><span class="section-number">4.4</span> Hierarchical Table Splitting</h2>
+
+  <p>Splitting a large financial table is not like splitting a paragraph. You can&rsquo;t just cut at row 25 and call it a day. If you split an income statement between &ldquo;Depreciation&rdquo; and &ldquo;Total Operating Expenses,&rdquo; neither chunk makes sense on its own. The top half has line items without their subtotal; the bottom half has a subtotal with no context for what it totals.</p>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>Think of how you&rsquo;d break up a long financial model for a management presentation. You wouldn&rsquo;t split the income statement at an arbitrary row number. You&rsquo;d split it into logical sections &mdash; Revenue, Cost of Goods Sold, Operating Expenses, EBITDA &mdash; each with its own subtotal. Each section tells a complete story on its own, and you can understand any one section without seeing the others.</p>
   </div>
 
-  <p>BSearch uses <strong>Voyage AI&rsquo;s voyage-context-3</strong> model, which produces a <strong>1,024-dimensional vector</strong> for each chunk. The key feature of this model is that it&rsquo;s <strong>contextual</strong>: each chunk is embedded with awareness of the full document text, not in isolation. This means a chunk that says &ldquo;Revenue grew 15% year-over-year&rdquo; gets a different vector depending on whether it&rsquo;s from a healthcare CIM or an energy sector teaser &mdash; because the model sees the surrounding context.</p>
+  <p>BSearch does exactly this. For tables exceeding 1,500 tokens, the system uses structural signals already present in the spreadsheet to find intelligent split points. It doesn&rsquo;t need to understand financial semantics &mdash; it reads formatting cues that Excel and Word already encode.</p>
 
-  <p>Chunks are processed in <strong>batches</strong> for efficiency. Rather than making one API call per chunk, BSearch groups chunks and sends them together, significantly reducing latency and cost.</p>
+  <h3>Step 1: Detect Column Headers</h3>
 
-  <!-- STEP 8 -->
-  <h2><span class="section-number">4.9</span> Step 8 &mdash; Deduplication</h2>
+  <p>The first one or two rows of a table are identified as column headers. The heuristic: a row where all non-empty cells are bold, or where all cells are strings with no numeric values (think &ldquo;FY2022A, FY2023A, FY2024E&rdquo;). These headers are stored separately &mdash; they get <strong>prepended to every chunk</strong> so each piece of the table is self-contained.</p>
+
+  <h3>Step 2: Detect Category Boundaries</h3>
+
+  <p>Below the headers, the system scans data rows top-to-bottom looking for structural signals that mark where one logical section ends and another begins:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Signal</th>
+        <th>How It&rsquo;s Detected</th>
+        <th>Example</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Indent decrease</strong></td>
+        <td>A row at indent level 0 after rows at indent level 1 or 2</td>
+        <td>&ldquo;Operating Expenses&rdquo; at indent 0 after &ldquo;Raw Materials&rdquo; at indent 2</td>
+      </tr>
+      <tr>
+        <td><strong>Bold first cell</strong></td>
+        <td>First non-empty cell is bold and unindented</td>
+        <td><strong>Revenue by Segment</strong> (bold header row)</td>
+      </tr>
+      <tr>
+        <td><strong>Total/Subtotal row</strong></td>
+        <td>First cell text starts with &ldquo;Total,&rdquo; &ldquo;Subtotal,&rdquo; &ldquo;Net,&rdquo; or &ldquo;Grand Total&rdquo;</td>
+        <td>&ldquo;Total Operating Expenses&rdquo;</td>
+      </tr>
+      <tr>
+        <td><strong>Blank separator</strong></td>
+        <td>All cells in the row are empty or whitespace</td>
+        <td>Blank row between &ldquo;Sources&rdquo; and &ldquo;Uses&rdquo; sections</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>For PDF and Word tables (where indent data isn&rsquo;t available), the system relies on bold first-cell and blank-row signals only.</p>
+
+  <h3>Step 3: Build Row Groups</h3>
+
+  <p>Using the detected boundaries, rows are grouped into logical sections. Each group starts at a category boundary and runs until the next one. The result is a list of row groups that correspond to the table&rsquo;s natural structure.</p>
+
+  <h3>Step 4: Assemble Chunks</h3>
+
+  <p>Adjacent row groups are merged until adding the next group would exceed the 1,500-token limit. Each chunk gets:</p>
+
+  <ul>
+    <li><strong>Column headers</strong> (always prepended &mdash; so every chunk is readable standalone)</li>
+    <li><strong>Category breadcrumb</strong> for nested groups: <em>[Operating Expenses &gt; SG&amp;A]</em> when the group&rsquo;s parent category is known from indent hierarchy</li>
+    <li><strong>Descriptive prefix</strong>: <em>[Sheet: Income Statement] Rows 15&ndash;42 of 95 (Operating Expenses) &mdash; Columns: FY2022A, FY2023A, FY2024E</em></li>
+  </ul>
+
+  <h3>What This Looks Like in Practice</h3>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Table Type</th>
+        <th>Structure Detected</th>
+        <th>How It Splits</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Income statement</td>
+        <td>Bold section headers + indented line items + &ldquo;Total&rdquo; rows</td>
+        <td>Revenue section, COGS section, OpEx section, each with subtotals</td>
+      </tr>
+      <tr>
+        <td>Sources &amp; Uses</td>
+        <td>Blank row separator between &ldquo;Sources&rdquo; and &ldquo;Uses&rdquo;</td>
+        <td>One chunk per section</td>
+      </tr>
+      <tr>
+        <td>Cap table</td>
+        <td>Investor names at indent 0, share classes indented</td>
+        <td>One group per investor</td>
+      </tr>
+      <tr>
+        <td>Flat data table</td>
+        <td>No structure detected (no bold, no indent variation)</td>
+        <td>Fixed groups of ~25&ndash;30 rows</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <div class="callout-title">Edge Cases</div>
+    <p><strong>Deeply nested tables</strong> (3+ indent levels) are grouped at the top-level category only &mdash; sub-hierarchy stays intact within the chunk. <strong>Tables where every row is bold</strong> (common in summary tables) are treated as flat and use the fixed-size fallback. <strong>Merged cells</strong> are resolved to the parent cell&rsquo;s value.</p>
+  </div>
+
+  <hr>
+
+  <!-- SUMMARIES -->
+  <h2><span class="section-number">4.5</span> Document Summaries: Bridging Distant Sections</h2>
+
+  <p>Long documents create many chunks, and sometimes the answer to a query spans information from distant sections. A company description on page 5 of a CIM references financial metrics on page 30. Without some way to connect them, these chunks are isolated &mdash; a query like &ldquo;Acme&rsquo;s revenue growth story&rdquo; will surface either the narrative <em>or</em> the numbers, but not both.</p>
+
+  <div class="definition">
+    <span class="term">Document summary:</span> A ~200-token condensed representation of an entire document, generated by Claude Haiku at ingestion time. Indexed as a special chunk alongside the document&rsquo;s regular chunks, it acts as a semantic bridge connecting distant sections.
+  </div>
+
+  <p>For any document that produces <strong>4 or more chunks</strong>, Haiku generates a summary capturing the document type, deal name, key topics covered, and key entities and metrics mentioned. This summary is stored as an additional chunk in the search index with a special marker (<em>chunk_type: doc_summary</em>).</p>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>This is like the executive summary at the top of a CIM. It gives you the overview &mdash; what the company does, the key financials, why it&rsquo;s for sale &mdash; even if you haven&rsquo;t read every section. If someone asks you a question about the deal, the exec summary often has enough context to point you toward the right section, even if it doesn&rsquo;t contain the detailed answer itself.</p>
+  </div>
+
+  <h3>How It Helps Retrieval</h3>
+
+  <p>The summary chunk acts as a semantic bridge. When a user asks &ldquo;tell me about Acme&rsquo;s revenue growth,&rdquo; the summary mentions both &ldquo;company overview&rdquo; and &ldquo;revenue projections&rdquo; and &ldquo;EBITDA growth,&rdquo; so it matches the query via vector search. If the summary lands in the top results alongside specific data chunks, Claude gets a document-level map that helps it synthesize across the specific chunks it also received.</p>
+
+  <hr>
+
+  <!-- DEAL SUMMARIES -->
+  <h2><span class="section-number">4.6</span> Deal Summaries: Cross-Document Intelligence</h2>
+
+  <p>Document summaries bridge sections within a single document. But some questions require reasoning across <em>multiple documents</em> for the same deal &mdash; the CIM, the management presentation, the bid letters, the NDA. Deal summaries provide that cross-document bridge.</p>
+
+  <div class="definition">
+    <span class="term">Deal summary:</span> A ~400-token overview of an entire deal, generated by aggregating information from all documents in that deal&rsquo;s folder. Covers deal status, key metrics, involved parties, and stage progression.
+  </div>
+
+  <p>For deals with <strong>3 or more documents</strong>, Haiku generates a deal-level summary. The input is not the raw documents themselves &mdash; it&rsquo;s the individual document summaries plus entity data from the knowledge graph (deal status, target company, financials, advisors, acquirers, key contacts, stage progression). This means the deal summary is enriched with structured intelligence, not just free text.</p>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>This is like the deal team&rsquo;s internal status memo &mdash; the one-pager that summarizes everything known about a deal so far. Who&rsquo;s the target, who&rsquo;s the buyer, what stage are we at, what are the key metrics, who are the advisors. A new team member can read it and immediately understand the deal without digging through every document in the folder.</p>
+  </div>
+
+  <h3>When Deal Summaries Get Refreshed</h3>
+
+  <p>Deal summaries are not static. They stay current through three triggers:</p>
+
+  <ul>
+    <li><strong>After bulk ingestion:</strong> Generated for all deals meeting the threshold</li>
+    <li><strong>After file changes:</strong> When a file is added or updated in a deal folder, the deal summary is queued for regeneration (debounced by 5 minutes to batch rapid multi-file updates)</li>
+    <li><strong>Periodic refresh:</strong> Every 6 hours, any deal summary where a constituent document has been modified since the summary was last generated gets refreshed</li>
+  </ul>
+
+  <h3>How It Helps at Query Time</h3>
+
+  <p>When a user asks &ldquo;summarize our healthcare pipeline,&rdquo; the deal summary chunks for each healthcare deal match the query via vector search. If three deal summaries land in the top results, Claude gets pre-digested deal cards instead of raw heterogeneous chunks &mdash; the cross-deal reasoning is largely already done. Claude can focus on synthesizing across deals rather than extracting basic facts from individual document chunks.</p>
+
+  <hr>
+
+  <!-- DEDUPLICATION -->
+  <h2><span class="section-number">4.7</span> Near-Duplicate Detection</h2>
 
   <p>If you&rsquo;ve ever looked inside a deal folder, you know the problem:</p>
 
@@ -235,114 +338,77 @@ Deal Summary v3 FINAL_JK edits.docx
 Deal Summary v3 FINAL FINAL.docx
 Copy of Deal Summary v3 FINAL.docx</code></pre>
 
-  <p>Without deduplication, a search for this deal&rsquo;s summary would return five near-identical results, burying other relevant documents. BSearch catches these with a <strong>two-phase</strong> approach:</p>
-
-  <h3>Phase 1: Filename Normalization</h3>
-  <p>Strip version markers (<code>v3</code>, <code>v2.1</code>), finality markers (<code>FINAL</code>, <code>FINAL FINAL</code>), copy markers (<code>(2)</code>, <code>Copy of</code>), and editor initials (<code>_JK edits</code>). Group files by their normalized name and source folder. Files that normalize to the same name in the same folder are <strong>candidate duplicates</strong>.</p>
-
-  <h3>Phase 2: Embedding Similarity</h3>
-  <p>Filename normalization alone isn&rsquo;t enough &mdash; sometimes files with similar names have genuinely different content (e.g., a v1 and v3 that diverged significantly). So BSearch compares the <strong>first-chunk embeddings</strong> of candidate duplicates. If the cosine similarity is <strong>&ge; 0.95</strong> (nearly identical), they&rsquo;re confirmed duplicates.</p>
-
-  <p>The <strong>most recently modified</strong> file becomes the canonical version. All other copies are excluded from search results but tracked in the index so they can be restored if the canonical version is deleted.</p>
-
-  <div class="callout tip">
-    <div class="callout-title">Why 0.95?</div>
-    <p>A cosine similarity of 0.95 is extremely high &mdash; it means the two chunks are nearly identical in meaning. Two unrelated documents about the same company might score 0.7&ndash;0.8. Two versions of the same document with minor edits typically score 0.96&ndash;0.99. The 0.95 threshold sits right at the boundary, catching true duplicates while preserving meaningfully different versions.</p>
-  </div>
-
-  <!-- STEP 9 -->
-  <h2><span class="section-number">4.10</span> Step 9 &mdash; Indexing</h2>
-
-  <p>The final step pushes all processed data into the storage systems that power search. The write order matters:</p>
-
-  <ol>
-    <li><strong>Neo4j first</strong> &mdash; Entity data (companies, people, deals, relationships) is written to the knowledge graph. Neo4j is the <strong>source of truth</strong> for entity information.</li>
-    <li><strong>Azure AI Search second</strong> &mdash; Chunks with all their metadata, entity fields, and embedding vectors are pushed to the search index. The chunks include denormalized (copied) entity data from Neo4j so that search queries don&rsquo;t need to hit the graph at query time.</li>
-  </ol>
-
-  <div class="definition">
-    <span class="term">Denormalized:</span> Storing a copy of data in multiple places for faster reads, even though it means the data could get out of sync. Like putting a deal summary in both the deal folder <em>and</em> the weekly pipeline report &mdash; it&rsquo;s duplicated, but the report is faster to read than digging through the folder.
-  </div>
-
-  <p>This write order ensures that if the pipeline crashes mid-indexing, the knowledge graph has the entity data and the search index can be rebuilt from it. The reverse order would risk orphaned search entries with no entity backing.</p>
-
-  <hr>
-
-  <!-- KNOWLEDGE GRAPH -->
-  <h2><span class="section-number">4.11</span> The Knowledge Graph</h2>
-
-  <p>Steps 1&ndash;9 describe the linear pipeline. But there&rsquo;s a parallel data structure being built alongside it: the <strong>knowledge graph</strong> in Neo4j. While the search index stores document chunks, the knowledge graph stores the <em>relationships between entities</em> that those documents mention.</p>
-
-  <div class="definition">
-    <span class="term">Knowledge graph:</span> A database that stores things (nodes) and the connections between them (relationships). Unlike a traditional database table with rows and columns, a knowledge graph naturally represents networks of relationships &mdash; exactly what you need for &ldquo;which companies has Goldman advised on deals where JP Morgan was the lender?&rdquo;
-  </div>
-
-  <h3>What Gets Stored</h3>
-
-  <p>Neo4j holds four types of nodes:</p>
-
-  <table>
-    <thead>
-      <tr>
-        <th>Node Type</th>
-        <th>What It Represents</th>
-        <th>Example</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr>
-        <td><strong>Deal</strong></td>
-        <td>An engagement or potential transaction</td>
-        <td>Project Atlas / Acme Corp Sale</td>
-      </tr>
-      <tr>
-        <td><strong>Company</strong></td>
-        <td>A firm involved in a deal</td>
-        <td>Acme Corp, Goldman Sachs, First Republic</td>
-      </tr>
-      <tr>
-        <td><strong>Person</strong></td>
-        <td>An individual mentioned in documents</td>
-        <td>John Smith (CEO of Acme Corp)</td>
-      </tr>
-      <tr>
-        <td><strong>StageEntry</strong></td>
-        <td>A timestamped record of a deal reaching a stage</td>
-        <td>&ldquo;Project Atlas reached LOI stage on 2024-03-15&rdquo;</td>
-      </tr>
-    </tbody>
-  </table>
-
-  <p>These nodes are connected by <strong>typed relationships</strong> that capture the role each entity plays:</p>
-
-  <ul>
-    <li><code>TARGET_OF</code> &mdash; Acme Corp is the target of the deal</li>
-    <li><code>POTENTIAL_ACQUIRER</code> &mdash; BuyerCo is a potential acquirer</li>
-    <li><code>ACQUIRER_OF</code> &mdash; BuyerCo acquired Acme Corp (deal closed)</li>
-    <li><code>ADVISOR_ON</code> &mdash; Goldman Sachs is an advisor on the deal</li>
-    <li><code>LENDER_ON</code> &mdash; First Republic is a lender</li>
-    <li><code>EXECUTIVE_AT</code> &mdash; John Smith is an executive at Acme Corp</li>
-    <li><code>APPEARED_IN</code> &mdash; links entities to specific documents</li>
-    <li><code>REACHED_STAGE</code> &mdash; links a deal to its stage progression</li>
-  </ul>
-
-  <h3>Deal Alias Accumulation</h3>
-
-  <p>Early in a deal lifecycle, documents may use a code name (&ldquo;Project Atlas&rdquo;). Later documents use the real company name (&ldquo;Acme Corp&rdquo;). Some documents use both. The knowledge graph handles this by <strong>accumulating aliases</strong>:</p>
-
-  <ul>
-    <li>Every name variation encountered for a deal is stored as an alias</li>
-    <li>The <strong>canonical name</strong> is always the name from the most recently modified file</li>
-    <li>Search queries match against all aliases, so searching &ldquo;Project Atlas&rdquo; or &ldquo;Acme Corp&rdquo; finds the same deal</li>
-  </ul>
+  <p>Without deduplication, a search for this deal&rsquo;s summary would return five near-identical results, burying other relevant documents. BSearch catches these with a <strong>two-phase</strong> approach.</p>
 
   <div class="callout ib-analogy">
     <div class="callout-title">IB Analogy</div>
-    <p>This is exactly how you mentally track deals. Early on it&rsquo;s &ldquo;Project Atlas&rdquo; in every email. Then the engagement letter says &ldquo;Acme Corp.&rdquo; Six months later, someone asks about &ldquo;that Acme deal&rdquo; and you know they mean Project Atlas. The knowledge graph does the same mapping automatically.</p>
+    <p>This is like knowing that &ldquo;Acme CIM v3 FINAL (2).docx&rdquo; and &ldquo;Acme CIM.docx&rdquo; are the same document. You always want to look at the latest version. You don&rsquo;t want five copies cluttering your search results when you just need the current one.</p>
   </div>
 
-  <!-- Entity extraction tiers -->
-  <h2><span class="section-number">4.12</span> Entity Extraction: The Three Tiers</h2>
+  <h3>Phase 1: Filename Normalization</h3>
+
+  <p>Strip away the noise that humans add to filenames:</p>
+
+  <ul>
+    <li><strong>Version markers:</strong> <em>v3</em>, <em>v2.1</em>, <em>version 4</em></li>
+    <li><strong>Finality markers:</strong> <em>FINAL</em>, <em>FINAL FINAL</em>, <em>revised</em>, <em>draft</em>, <em>clean</em>, <em>markup</em>, <em>redline</em></li>
+    <li><strong>Copy markers:</strong> <em>(2)</em>, <em>Copy of</em>, <em>- copy</em></li>
+    <li><strong>Editor initials:</strong> <em>_JK edits</em></li>
+  </ul>
+
+  <p>After normalization, files are grouped by their cleaned name <strong>within the same folder</strong>. Files that normalize to the same name in the same folder are <strong>candidate duplicates</strong>.</p>
+
+  <div class="callout tip">
+    <div class="callout-title">The Same-Folder Constraint</div>
+    <p>Only files in the same folder are compared. This prevents false positives between intentionally different documents that happen to share a name &mdash; a buyer&rsquo;s &ldquo;Term Sheet.docx&rdquo; and a seller&rsquo;s &ldquo;Term Sheet.docx&rdquo; are not duplicates. Neither are a template in a Templates folder and a filled version in an Active Deals folder.</p>
+  </div>
+
+  <h3>Phase 2: Embedding Similarity</h3>
+
+  <p>Filename normalization alone isn&rsquo;t enough. Sometimes files with similar names have genuinely different content &mdash; a v1 and v3 that diverged significantly. So BSearch compares the <strong>first-chunk embeddings</strong> of candidate duplicates using cosine similarity (the same mathematical measure of meaning-similarity described in <a href="chapter-03.html">Chapter 3</a>).</p>
+
+  <div class="definition">
+    <span class="term">Cosine similarity threshold (0.95):</span> Two chunks scoring 0.95 or above are nearly identical in meaning. For context: two unrelated documents about the same company might score 0.70&ndash;0.80. Two versions of the same document with minor edits typically score 0.96&ndash;0.99. The 0.95 threshold sits right at the boundary, catching true duplicates while preserving meaningfully different versions.
+  </div>
+
+  <p>If the cosine similarity is <strong>&ge; 0.95</strong>, the files are confirmed duplicates. No additional API calls are needed &mdash; these embeddings were already computed during the embedding step.</p>
+
+  <h3>Canonical Selection</h3>
+
+  <p>The <strong>most recently modified</strong> file becomes the canonical version (on tie: the largest file by byte count, since a more complete version is likely larger). All other copies remain in the index but are marked non-canonical and excluded from search results. They&rsquo;re tracked so they can be promoted back to canonical if the current canonical version is deleted.</p>
+
+  <p>At query time, a simple filter (<em>is_canonical eq true</em>) excludes non-canonical chunks. This adds zero measurable latency to searches.</p>
+
+  <hr>
+
+  <!-- METADATA -->
+  <h2><span class="section-number">4.8</span> Metadata Extraction</h2>
+
+  <p>Once BSearch has the document&rsquo;s text, it needs to understand <em>what kind of document this is</em> and <em>which deal it belongs to</em>. Two key metadata fields are extracted for every document.</p>
+
+  <h3>Document Type Classification</h3>
+
+  <p>BSearch classifies each document into one of <strong>15 types</strong>: CIM, teaser, financial model, NDA, engagement letter, management presentation, bid letter, process letter, board materials, and so on. The approach is two-tiered:</p>
+
+  <ol>
+    <li><strong>Pattern matching first:</strong> Filename and folder path patterns handle the obvious cases. A file named &ldquo;Project Atlas - CIM vFinal.pdf&rdquo; in a &ldquo;Marketing Materials&rdquo; folder is clearly a CIM. This is fast and costs nothing.</li>
+    <li><strong>LLM fallback for ambiguous cases:</strong> When pattern matching isn&rsquo;t confident &mdash; say, a file named &ldquo;Q3 Update.docx&rdquo; that could be a management presentation, a board deck, or a status memo &mdash; BSearch sends the first ~500 tokens to Claude Haiku for classification.</li>
+  </ol>
+
+  <div class="definition">
+    <span class="term">Claude Haiku:</span> A small, fast, inexpensive language model optimized for quick classification and extraction tasks. BSearch uses it throughout the ingestion pipeline for tasks that need language understanding but don&rsquo;t require the full reasoning power of larger models.
+  </div>
+
+  <h3>Deal Identification</h3>
+
+  <div class="definition">
+    <span class="term">deal_id:</span> A unique identifier for each deal, computed as a hash of the subfolder path within the firm&rsquo;s deal root folders. The key insight: deal folder paths are stable identifiers even when deal names change. A deal might start as &ldquo;Project Atlas&rdquo; in early screening and become &ldquo;Acme Corp Sale&rdquo; once the engagement is signed, but the SharePoint folder path doesn&rsquo;t change. Hashing that path gives a stable identifier that persists throughout the deal lifecycle.
+  </div>
+
+  <hr>
+
+  <!-- ENTITY EXTRACTION -->
+  <h2><span class="section-number">4.9</span> Entity Extraction: Three Tiers of Intelligence</h2>
 
   <p>Not every document deserves the same level of entity extraction effort. A 200-page CIM has dense entity information worth deep analysis; a one-page NDA cover letter does not. BSearch uses a <strong>three-tier</strong> extraction strategy that balances thoroughness against cost and speed.</p>
 
@@ -365,67 +431,107 @@ flowchart TD
     style T3 fill:#d4edda,stroke:#2E7D5B,color:#3B2F2F
   </pre>
 
-  <table>
-    <thead>
-      <tr>
-        <th>Tier</th>
-        <th>Method</th>
-        <th>Applied To</th>
-        <th>What It Finds</th>
-        <th>Cost</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr>
-        <td><strong>Tier 1</strong></td>
-        <td>Claude Haiku (document-level)</td>
-        <td>Every document</td>
-        <td>Companies with roles, industry, deal stage</td>
-        <td>Low (one LLM call per doc)</td>
-      </tr>
-      <tr>
-        <td><strong>Tier 2</strong></td>
-        <td>Claude Haiku (chunk-level)</td>
-        <td>High-value chunks only (exec summaries, transaction overviews, key terms sections)</td>
-        <td>Additional entities, relationships, specific metrics</td>
-        <td>Medium (selective LLM calls)</td>
-      </tr>
-      <tr>
-        <td><strong>Tier 3</strong></td>
-        <td>Local NER + regex</td>
-        <td>All remaining chunks</td>
-        <td>Known company names, dollar amounts, dates</td>
-        <td>Zero (no API calls)</td>
-      </tr>
-    </tbody>
-  </table>
+  <h3>Tier 1: Document-Level LLM Extraction</h3>
+
+  <p><strong>Runs on every document.</strong> One Haiku call per document, using about 1,000 tokens of input. Extracts:</p>
+
+  <ul>
+    <li><strong>Companies with roles:</strong> target, acquirer, potential acquirer, financial advisor, legal advisor, lender &mdash; with confidence levels</li>
+    <li><strong>Industry classification:</strong> what sector the deal falls in</li>
+    <li><strong>Deal stage inference:</strong> derived from the document type (an NDA suggests early stage; a purchase agreement suggests closing)</li>
+  </ul>
+
+  <p>This provides the baseline entity data for every document. The results feed into the Neo4j knowledge graph and enable queries like &ldquo;show me all deals where Goldman was advisor.&rdquo;</p>
+
+  <h3>Tier 2: High-Value Chunk Extraction</h3>
+
+  <p><strong>Runs selectively.</strong> After chunking, Haiku runs additional extraction on specific chunk types only:</p>
+
+  <ul>
+    <li><strong>Table chunks with financial headers</strong> (&ldquo;Revenue,&rdquo; &ldquo;EBITDA,&rdquo; &ldquo;Enterprise Value&rdquo;) &mdash; extracts financial metrics with values, periods, and currency</li>
+    <li><strong>Structured people sections</strong> (management team bios, signature blocks, engagement letter parties) &mdash; extracts person names, titles, and company affiliations</li>
+    <li><strong>IOI/LOI body chunks</strong> &mdash; extracts offer terms and acquirer details</li>
+    <li><strong>Process letter chunks</strong> &mdash; extracts potential acquirer lists</li>
+  </ul>
+
+  <p>This adds roughly 1&ndash;3 additional Haiku calls per document. Many documents (memos, board decks) get zero additional calls because they lack high-value chunk types.</p>
+
+  <h3>Tier 3: Local NER and Regex</h3>
 
   <div class="definition">
     <span class="term">NER (Named Entity Recognition):</span> A technique for finding known types of things in text &mdash; company names, dollar amounts, dates, people &mdash; using pattern rules rather than an AI model. Fast and free, but only catches patterns it&rsquo;s been told to look for.
   </div>
 
-  <p>Tier 1 runs on every document and provides the baseline. Tier 2 goes deeper on the chunks most likely to contain rich entity information &mdash; an executive summary typically names every party, while page 47 of a CIM&rsquo;s market analysis may not add new entities. Tier 3 sweeps everything else with simple pattern matching, catching company names already known from Tier 1 and standard formats like dollar amounts.</p>
+  <p><strong>Runs on every remaining chunk, with zero API calls.</strong> Simple pattern matching catches:</p>
 
-  <p>All three tiers feed into a merge-and-deduplicate step before writing to Neo4j, ensuring that &ldquo;Goldman Sachs,&rdquo; &ldquo;Goldman Sachs &amp; Co.,&rdquo; and &ldquo;GS&rdquo; resolve to the same entity.</p>
+  <ul>
+    <li>Company names already known from Tier 1 (matched against a cached list from Neo4j)</li>
+    <li>Dollar amounts, percentages, and dates in standard formats</li>
+    <li>Person names in structured contexts</li>
+  </ul>
+
+  <p>Tier 3 doesn&rsquo;t classify roles or relationships &mdash; it only detects mentions. But those mentions are valuable for search relevance (&ldquo;which chunks mention Goldman?&rdquo;).</p>
+
+  <h3>Merge and Deduplicate</h3>
+
+  <p>All three tiers feed into a merge step before writing to the knowledge graph. This ensures that &ldquo;Goldman Sachs,&rdquo; &ldquo;Goldman Sachs &amp; Co.,&rdquo; and &ldquo;GS&rdquo; resolve to the same entity. Company names are normalized by stripping common suffixes (Inc., Corp., LLC, Ltd., &amp; Co., Group, Holdings) and matching on the cleaned form.</p>
+
+  <div class="comparison">
+    <div class="comparison-col">
+      <h4>What Goes to Neo4j (Structured Intelligence)</h4>
+      <ul>
+        <li>Companies with roles (Tier 1 + 2)</li>
+        <li>People with titles (Tier 2)</li>
+        <li>Financial metrics (Tier 2)</li>
+        <li>Deal stage and status</li>
+        <li>Industry classification</li>
+      </ul>
+    </div>
+    <div class="comparison-col">
+      <h4>What Goes to Search Index (Per-Chunk)</h4>
+      <ul>
+        <li>Company mentions in this chunk (Tier 3)</li>
+        <li>Person mentions in this chunk (Tier 3)</li>
+        <li>Company roles from Tier 1 (copied to all chunks in the document)</li>
+        <li>Deal name, aliases, status, industry (from Neo4j, same for all chunks in the deal)</li>
+      </ul>
+    </div>
+  </div>
+
+  <hr>
+
+  <!-- INDEXING -->
+  <h2><span class="section-number">4.10</span> Indexing: Writing to Two Systems</h2>
+
+  <p>The final step pushes all processed data into the two storage systems that power search. The write order matters:</p>
+
+  <ol>
+    <li><strong>Neo4j first</strong> &mdash; Entity data (companies, people, deals, relationships) is written to the knowledge graph. Neo4j is the <strong>source of truth</strong> for entity information.</li>
+    <li><strong>Azure AI Search second</strong> &mdash; Chunks with all their metadata, entity fields, and embedding vectors are pushed to the search index. The chunks include denormalized (copied) entity data from Neo4j so that search queries don&rsquo;t need to hit the graph at query time.</li>
+  </ol>
+
+  <div class="definition">
+    <span class="term">Denormalized:</span> Storing a copy of data in multiple places for faster reads, even though it means the data could get out of sync. Like putting a deal summary in both the deal folder <em>and</em> the weekly pipeline report &mdash; it&rsquo;s duplicated, but the report is faster to read than digging through the folder.
+  </div>
+
+  <p>This write order ensures that if the pipeline crashes mid-indexing, the knowledge graph has the entity data and the search index can be rebuilt from it. The reverse order would risk orphaned search entries with no entity backing.</p>
 
   <hr>
 
   <!-- KEY TAKEAWAY -->
   <div class="key-takeaway">
     <div class="callout-title">Key Takeaway</div>
-    <p>The ingestion pipeline transforms raw SharePoint files into two complementary data structures: a <strong>search index</strong> (Azure AI Search) containing document chunks with embeddings for fast retrieval, and a <strong>knowledge graph</strong> (Neo4j) containing the entities and relationships those documents mention. Together, these let BSearch answer both &ldquo;find me the Acme CIM&rdquo; and &ldquo;which deals has Goldman advised on?&rdquo; &mdash; questions that require fundamentally different data representations.</p>
+    <p>The ingestion pipeline is a series of deliberate trade-offs. Format-aware parsing preserves document structure at the cost of format-specific code. Hierarchical table splitting preserves financial logic at the cost of structural detection heuristics. Three-tier entity extraction balances thoroughness against API costs. Near-duplicate detection prevents clutter without risking false positives via the same-folder constraint. At every step, the goal is the same: transform raw SharePoint files into index entries that are <strong>small enough to be relevant, rich enough to be useful, and clean enough to not waste the searcher&rsquo;s time</strong>.</p>
   </div>
-
-  <p>The pipeline processes documents incrementally &mdash; only changed files are re-ingested, not the entire corpus. For Berenson&rsquo;s ~550,000 documents, a full re-index takes hours, but the steady state is handling a few dozen file changes per hour in near-real-time via webhooks.</p>
 
   <p>Next, we&rsquo;ll see what happens when someone actually types a question into BSearch &mdash; the <a href="chapter-05.html">query pipeline</a>.</p>
 
   <nav class="chapter-nav bottom">
-    <a href="chapter-03.html">&larr; Previous</a>
+    <a href="chapter-03.html">&larr; Previous: How Search Actually Works</a>
     <span class="nav-spacer">|</span>
     <a href="index.html">Contents</a>
     <span class="nav-spacer">|</span>
-    <a href="chapter-05.html">Next &rarr;</a>
+    <a href="chapter-05.html">Next: How Questions Get Answered &rarr;</a>
   </nav>
 </div>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>

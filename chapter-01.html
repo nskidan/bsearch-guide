@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="light only">
-  <title>Chapter 1: Executive Summary — BSearch Technical Guide</title>
+  <title>Chapter 1: What BSearch Does &mdash; BSearch Technical Guide</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -13,33 +13,39 @@
   <nav class="chapter-nav">
     <a href="index.html">Contents</a>
     <span class="nav-spacer">|</span>
-    <a href="chapter-02.html">Next: Architecture Overview &rarr;</a>
+    <a href="chapter-02.html">Next: How the System Fits Together &rarr;</a>
   </nav>
 
   <div class="chapter-header">
     <div class="chapter-number">Chapter 1</div>
-    <h1>Executive Summary</h1>
-    <p class="chapter-subtitle">What BSearch is, the problem it solves, and why it matters for Berenson.</p>
+    <h1>What BSearch Does</h1>
+    <p class="chapter-subtitle">The problem, the product, and what it means for how Berenson works.</p>
   </div>
 
-  <!-- 1.1 What Is BSearch? -->
-  <h2><span class="section-number">1.1</span> What Is BSearch?</h2>
+  <!-- 1.1 Executive Summary -->
+  <h2><span class="section-number">1.1</span> Executive Summary</h2>
 
-  <p>BSearch is an enterprise search and AI synthesis system built for Berenson &amp; Company. It connects to the firm's Microsoft 365 tenant &mdash; roughly 550,000 documents across SharePoint and OneDrive &mdash; and gives every user the ability to ask questions in plain English and get real answers, not just a list of file links.</p>
+  <p>BSearch is an enterprise search and AI synthesis system built for Berenson &amp; Company. It connects to the firm's Microsoft 365 tenant &mdash; roughly 550,000 documents across SharePoint and OneDrive &mdash; and gives all 18 users the ability to ask questions in plain English and get real answers, not just a list of file links.</p>
 
-  <div class="definition">
-    <p><span class="term">Enterprise search</span> &mdash; A system that lets people search across all of a company's internal documents, email, and files from one place, much like Google but for internal content only.</p>
+  <p>The system reads every Word document, Excel model, PowerPoint deck, and PDF in the firm's file structure. When you search, it finds the relevant content, reads it, and streams back a written answer with source citations &mdash; typically in under three seconds. For questions that span multiple deals or documents, it takes a few seconds longer but synthesizes information that would otherwise require hours of manual digging.</p>
+
+  <div class="key-takeaway">
+    <div class="callout-title">The One-Sentence Version</div>
+    <p>BSearch turns Berenson's 550,000 documents into a system that answers questions &mdash; not one that returns file links you have to open and read yourself.</p>
   </div>
 
-  <p>When someone types a query like <em>"What was the EV/EBITDA for the Acme deal?"</em>, BSearch does not just find the relevant CIM or model &mdash; it reads the documents, extracts the answer, and streams back a written response with source citations. You can also ask broader questions like <em>"What healthcare deals have we worked on in the last two years?"</em> and get a synthesized summary drawn from multiple files.</p>
+  <!-- 1.2 The Junior Analyst Analogy -->
+  <h2><span class="section-number">1.2</span> The Junior Analyst Who Never Forgets</h2>
 
   <div class="callout ib-analogy">
     <div class="callout-title">IB Analogy</div>
-    <p>Think of BSearch as a junior analyst who has read every document in every deal folder, remembers all of it, and can answer any question about any deal in under five seconds &mdash; without ever pulling up the wrong version.</p>
+    <p>Think of BSearch as a junior analyst who has read every document in every deal folder, remembers all of it, and can answer any question about any deal in under five seconds &mdash; without ever pulling up the wrong version. Ask for a specific file, and you get the link. Ask a question about a deal, and you get a written answer with citations. Ask about the full pipeline, and you get a deal-by-deal overview drawn from hundreds of documents.</p>
   </div>
 
-  <!-- 1.2 The Problem -->
-  <h2><span class="section-number">1.2</span> The Problem BSearch Solves</h2>
+  <p>That analogy is useful because it captures the core design goal: BSearch does not just find files. It reads them, understands them, and gives you the information you were actually looking for. The product is the answer, not the search result.</p>
+
+  <!-- 1.3 The Problem -->
+  <h2><span class="section-number">1.3</span> The Problem BSearch Solves</h2>
 
   <p>Berenson has roughly 550,000 documents spread across SharePoint and OneDrive: Word documents, Excel models, PowerPoint decks, and PDFs. These files contain the collective knowledge of the firm &mdash; deal terms, financial metrics, client communications, precedent transactions, and model outputs. But today, finding the right information is painful:</p>
 
@@ -54,8 +60,58 @@
     <p>Imagine you are staffed on a new healthcare deal and need to reference the fee structure from a comparable transaction Berenson advised on two years ago. Today, you would ask around, dig through folders, and hope you find the right version. With BSearch, you type your question, and the answer appears in seconds &mdash; with a link to the source document.</p>
   </div>
 
-  <!-- 1.3 The Key Insight -->
-  <h2><span class="section-number">1.3</span> The Key Insight: AI Synthesis Is the Product</h2>
+  <!-- 1.4 What You Can Actually Ask -->
+  <h2><span class="section-number">1.4</span> What You Can Actually Ask</h2>
+
+  <p>The best way to understand what BSearch does is to see the kinds of questions it can answer. These five queries are the acceptance tests for the system &mdash; if BSearch can answer all five well, it is working as designed:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Query</th>
+        <th>What BSearch Returns</th>
+        <th>What This Tests</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1</td>
+        <td><em>"Where's the latest GovTech deck?"</em></td>
+        <td>The correct file with a direct SharePoint link &mdash; not three old versions.</td>
+        <td>File lookup: finding the right document, fast.</td>
+      </tr>
+      <tr>
+        <td>2</td>
+        <td><em>"Which firms did we reach out to for Govini?"</em></td>
+        <td>A list of firm names, extracted from the relevant documents, with source citations.</td>
+        <td>Data extraction: pulling specific facts from documents.</td>
+      </tr>
+      <tr>
+        <td>3</td>
+        <td><em>"Find me a good situation overview slide we've put together in the past for a banking deal"</em></td>
+        <td>A specific slide from a specific deck, with a link to the full presentation.</td>
+        <td>Slide-level retrieval: finding content inside documents, not just the documents themselves.</td>
+      </tr>
+      <tr>
+        <td>4</td>
+        <td><em>"What multiple did we use for [deal name]?"</em></td>
+        <td>The EV/EBITDA or other relevant multiple, pulled from the model or deal summary.</td>
+        <td>Synonym expansion: understanding that "multiple" means "EV/EBITDA" in IB context.</td>
+      </tr>
+      <tr>
+        <td>5</td>
+        <td><em>"Where do we stand on our active deals?"</em></td>
+        <td>A deal-by-deal overview, organized by deal name, with citations per claim and gaps flagged.</td>
+        <td>Multi-document synthesis: pulling together information from dozens of documents across multiple deals into one coherent answer.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>These range from simple (find a file) to complex (synthesize the state of the entire deal pipeline from hundreds of documents). Query #5 is the hardest &mdash; it requires BSearch to reason across deals, organize information coherently, and tell you what it does <em>not</em> know as well as what it does.</p>
+
+  <!-- 1.5 The Key Insight -->
+  <h2><span class="section-number">1.5</span> The Key Insight: AI Synthesis Is the Product</h2>
 
   <p>BSearch is not just a better file search. The core insight behind the system is that <strong>AI synthesis is the product</strong>. Finding the right document is necessary but not sufficient &mdash; what users actually want is the <em>answer</em> that lives inside those documents.</p>
 
@@ -73,11 +129,27 @@
   <p>This distinction matters because it shapes every design decision in the system. The ingestion pipeline does not just index file names and metadata &mdash; it parses document content, understands table structures, extracts deal-level entities, and creates the kind of rich, searchable representation that an AI model needs to produce accurate answers.</p>
 
   <div class="definition">
-    <p><span class="term">AI synthesis</span> &mdash; The process of an AI model reading multiple pieces of retrieved content and composing a coherent, cited answer. In BSearch, this is handled by Anthropic's Claude model, which reads the top search results and writes the response that the user sees.</p>
+    <p><span class="term">AI synthesis</span> &mdash; The process of an AI model reading multiple pieces of retrieved content and composing a coherent, cited answer. In BSearch, this is handled by Anthropic's Claude Sonnet 4.6, which reads the top search results and writes the response that the user sees.</p>
   </div>
 
-  <!-- 1.4 How It Works (User's Perspective) -->
-  <h2><span class="section-number">1.4</span> The User Experience, End to End</h2>
+  <!-- 1.6 Deal Summaries: Pre-Digested Intelligence -->
+  <h2><span class="section-number">1.6</span> Deal Summaries: Pre-Digested Intelligence</h2>
+
+  <p>One of BSearch's most important features is something the user never directly sees: <strong>deal summaries</strong>. For every deal with enough documents, BSearch uses a fast AI model (Claude Haiku 4.5) to generate a concise summary of that deal &mdash; roughly 400 words covering the deal status, target company, financials, advisors, key contacts, and stage progression.</p>
+
+  <div class="definition">
+    <p><span class="term">Deal summary</span> &mdash; An AI-generated intelligence brief about a deal, created by reading all of the deal's documents and entity data. Stored as a searchable chunk alongside the deal's actual documents. Automatically refreshed when any of the deal's files change.</p>
+  </div>
+
+  <p>These summaries are what make query #5 ("Where do we stand on our active deals?") possible. Without them, answering a pipeline question would require Claude to read and reason across hundreds of raw document chunks from dozens of deals in a single query &mdash; too much content, too little structure. With deal summaries, Claude gets pre-digested deal cards that already contain the key facts, making cross-deal reasoning practical and fast.</p>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>Deal summaries are like the one-page deal overviews that a team maintains for each active engagement &mdash; except BSearch generates them automatically from every document in the deal folder, updates them whenever anything changes, and makes them instantly available to anyone who searches.</p>
+  </div>
+
+  <!-- 1.7 How It Works (User's Perspective) -->
+  <h2><span class="section-number">1.7</span> The User Experience, End to End</h2>
 
   <p>From the user's perspective, BSearch is simple: you open the web app, type a question, and get an answer. But behind the scenes, two major pipelines make this possible.</p>
 
@@ -90,7 +162,8 @@
     <li>Each document is parsed by a format-aware parser &mdash; Word, Excel, PowerPoint, and PDF each get specialized treatment to preserve structure (tables stay as tables, slides stay as slides).</li>
     <li>The content is split into searchable chunks, converted into mathematical representations called <span class="jargon-box"><span class="jargon-term">embeddings</span></span> (numbers that capture meaning), and stored in Azure AI Search.</li>
     <li>Deal-level entities (company names, deal stages, financial metrics) are extracted and stored in a knowledge graph for richer query understanding.</li>
-    <li>When files change, BSearch detects the update via webhooks (real-time notifications from Microsoft) and re-indexes only what changed.</li>
+    <li>For each deal with enough documents, Haiku 4.5 generates a deal summary &mdash; a pre-digested intelligence brief that makes pipeline-level queries possible.</li>
+    <li>When files change, BSearch detects the update via webhooks (real-time notifications from Microsoft) and re-indexes only what changed &mdash; including refreshing the relevant deal summary.</li>
   </ol>
 
   <h3>The Query Pipeline (runs when you search)</h3>
@@ -100,7 +173,7 @@
     <li>BSearch classifies your query: Are you looking for a specific file? Extracting a data point? Or asking a question that spans multiple documents?</li>
     <li>It searches the index using a hybrid approach (both keyword matching and semantic meaning).</li>
     <li>Results are re-ranked for relevance by a specialized model.</li>
-    <li>The top results are sent to Claude, which reads them and streams back a written answer with citations.</li>
+    <li>The top results &mdash; including any relevant deal summaries &mdash; are sent to Claude Sonnet 4.6, which reads them and streams back a written answer with citations.</li>
   </ol>
 
   <div class="callout ib-analogy">
@@ -117,15 +190,15 @@ flowchart LR
     B --> C{"Query type?"}
     C -->|File Lookup| D["Find the file,\nreturn link"]
     C -->|Data Extraction| E["Search index,\nrerank results"]
-    C -->|Multi-Doc Synthesis| F["Search broadly,\nrerank top results"]
+    C -->|Multi-Doc Synthesis| F["Search broadly,\ninclude deal summaries"]
     E --> G["Claude reads chunks,\nstreams answer"]
     F --> G
     D --> H["User sees result\nwith source links"]
     G --> H
   </pre>
 
-  <!-- 1.5 Key Constraints -->
-  <h2><span class="section-number">1.5</span> Key Constraints and Design Parameters</h2>
+  <!-- 1.8 Key Constraints -->
+  <h2><span class="section-number">1.8</span> Key Constraints and Design Parameters</h2>
 
   <p>Every system operates within constraints. These are the ones that shape BSearch's design:</p>
 
@@ -174,9 +247,9 @@ flowchart LR
         <td>Simplifies access control &mdash; BSearch filters results by which folders a user can access.</td>
       </tr>
       <tr>
-        <td>LLM calls per query</td>
-        <td>1 (Claude only)</td>
-        <td>Single-call architecture keeps latency predictable and costs manageable.</td>
+        <td>AI models</td>
+        <td>Claude Sonnet 4.6 (answers), Haiku 4.5 (classification + deal summaries)</td>
+        <td>Sonnet handles the user-facing synthesis. Haiku handles fast, cheap background tasks.</td>
       </tr>
     </tbody>
   </table>
@@ -185,8 +258,8 @@ flowchart LR
     <p><span class="term">Time to first token (TTFT)</span> &mdash; How long the user waits before the first word of the AI response appears on screen. BSearch streams answers as they are generated, so even though the full response takes longer, the user sees progress almost immediately.</p>
   </div>
 
-  <!-- 1.6 What's In and Out of Scope -->
-  <h2><span class="section-number">1.6</span> v1 Scope: What's In and What's Not</h2>
+  <!-- 1.9 What's In and Out of Scope -->
+  <h2><span class="section-number">1.9</span> v1 Scope: What's In and What's Not</h2>
 
   <p>BSearch is being built incrementally. The first version (v1) focuses on the highest-value, most-tractable features:</p>
 
@@ -197,8 +270,9 @@ flowchart LR
         <li>SharePoint and OneDrive file search</li>
         <li>Format-aware parsing (Word, Excel, PPT, PDF)</li>
         <li>Hybrid search (keyword + semantic)</li>
-        <li>AI-synthesized answers via Claude</li>
+        <li>AI-synthesized answers via Claude Sonnet 4.6</li>
         <li>Deal and entity extraction (knowledge graph)</li>
+        <li>Deal summary chunks (Haiku-generated intelligence per deal)</li>
         <li>Near-real-time sync via webhooks</li>
         <li>Web app with Azure AD authentication</li>
         <li>Near-duplicate file detection</li>
@@ -210,28 +284,56 @@ flowchart LR
         <li>Outlook email search</li>
         <li>Teams bot interface</li>
         <li>Document vision (images, charts within docs)</li>
-        <li>Model summaries (auto-generated Excel model descriptions)</li>
-        <li>Two-pass extraction (Haiku then Sonnet)</li>
-        <li>Sibling chunk retrieval</li>
-        <li>Reconciliation jobs</li>
+        <li>Excel model summaries (auto-generated model descriptions)</li>
+        <li>Two-pass extraction (Haiku screening then Sonnet deep-read)</li>
+        <li>Sibling chunk retrieval (pulling nearby chunks for context)</li>
       </ul>
     </div>
   </div>
 
-  <!-- 1.7 Key Takeaway -->
-  <h2><span class="section-number">1.7</span> Why This Matters</h2>
+  <!-- 1.10 Cost -->
+  <h2><span class="section-number">1.10</span> What It Costs</h2>
+
+  <p>BSearch has two cost components: a one-time ingestion cost to process all 550,000 documents, and an ongoing monthly cost to keep the system running.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Category</th>
+        <th>Cost</th>
+        <th>What It Covers</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Monthly ongoing</strong></td>
+        <td>~$395&ndash;510/month</td>
+        <td>Search infrastructure, AI model usage (50&ndash;200 queries/day), database, hosting, and monitoring.</td>
+      </tr>
+      <tr>
+        <td><strong>One-time ingestion</strong></td>
+        <td>~$11,000&ndash;12,000</td>
+        <td>Processing all 550K documents: PDF parsing, AI extraction, embedding generation. This is a one-time cost &mdash; ongoing updates are incremental and covered by the monthly budget.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>The monthly cost is modest because the user base is small (18 people) and the system is designed to minimize AI model calls &mdash; one Claude call per query, with cheaper Haiku handling classification and background tasks.</p>
+
+  <!-- 1.11 Key Takeaway -->
+  <h2><span class="section-number">1.11</span> Why This Matters</h2>
 
   <p>BSearch exists because Berenson's collective knowledge &mdash; hundreds of thousands of documents spanning years of deals &mdash; is only valuable if people can actually access it. Today, finding the right document (or the right version of the right document) is unreliable and slow. BSearch changes that by making every document searchable and every answer extractable, in seconds.</p>
 
   <div class="key-takeaway">
     <div class="callout-title">Key Takeaway</div>
-    <p>BSearch is not just a search engine. It is an AI system that reads your firm's documents and gives you answers. The goal is not to return a list of files &mdash; it is to return the information you were actually looking for, cited back to its source, in under five seconds.</p>
+    <p>BSearch is not just a search engine. It is an AI system that reads your firm's documents and gives you answers. It knows what deal you are asking about, understands IB terminology, generates pre-digested deal intelligence, and returns the information you were actually looking for &mdash; cited back to its source, in under five seconds.</p>
   </div>
 
   <nav class="chapter-nav bottom">
     <a href="index.html">Contents</a>
     <span class="nav-spacer">|</span>
-    <a href="chapter-02.html">Next: Architecture Overview &rarr;</a>
+    <a href="chapter-02.html">Next: How the System Fits Together &rarr;</a>
   </nav>
 </div>
 

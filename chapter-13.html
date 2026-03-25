@@ -4,363 +4,593 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="light only">
-  <title>Chapter 13: Glossary — BSearch Technical Guide</title>
+  <title>Chapter 13: Phase 6 &mdash; Testing &amp; Go-Live &mdash; BSearch Technical Guide</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
 <div class="page-wrapper">
+
   <nav class="chapter-nav">
-    <a href="chapter-12.html">&larr; Previous: Failure Modes &amp; Resilience</a>
+    <a href="chapter-12.html">&larr; Previous: Phase 5 &mdash; Web Frontend</a>
     <span class="nav-spacer">|</span>
     <a href="index.html">Contents</a>
+    <span class="nav-spacer">|</span>
+    <a href="chapter-14.html">Next: Design Decisions &rarr;</a>
   </nav>
+
   <div class="chapter-header">
     <div class="chapter-number">Chapter 13</div>
-    <h1>Glossary</h1>
-    <p class="chapter-subtitle">Every technical term in this guide, defined in plain English.</p>
+    <h1>Phase 6 &mdash; Testing &amp; Go-Live</h1>
+    <p class="chapter-subtitle">Acceptance tests, bulk ingestion, bootstrap deployment, and the cost model. This is where you prove BSearch works.</p>
   </div>
 
-  <div class="glossary-entry">
-    <div class="glossary-term">API (Application Programming Interface)</div>
-    <p class="glossary-def">A defined set of rules that lets one piece of software talk to another. When you hear "call an API," it means one system is sending a structured request to another and getting a structured response back.</p>
-    <p class="glossary-usage">In BSearch: the query pipeline is itself a FastAPI-based API. It also calls external APIs &mdash; Microsoft Graph for document access, Voyage AI for embeddings, Cohere for reranking, and Anthropic's Claude for synthesis.</p>
+  <!-- ================================================================ -->
+  <!-- 13.1 What You're Building -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">13.1</span> What You're Building</h2>
+
+  <p>This is the final phase. Everything built in Phases 1&ndash;5 &mdash; the infrastructure, parsers, ingestion pipeline, query API, and frontend &mdash; now gets wired together and validated against real acceptance criteria. You are doing three things: running a comprehensive test suite that proves BSearch answers real questions correctly, executing the full bulk ingestion of ~550,000 documents, and deploying the complete system to production in a specific sequence that avoids race conditions and wasted cost.</p>
+
+  <p>The acceptance tests are not abstract. They are five specific queries that Berenson users will actually ask, chosen to exercise every capability of the system: finding a file, extracting a data point, synthesizing across documents, navigating entity relationships, and handling version recency. If BSearch can answer all five well &mdash; with correct citations, within latency targets &mdash; the system is working as designed.</p>
+
+  <p>The bulk ingestion is the most operationally intensive step in the entire project. Processing 550K documents into ~2.2M searchable chunks takes 18&ndash;36 hours and costs ~$11&ndash;12K (primarily embedding and PDF parsing). It runs once, and after that, ongoing ingestion is incremental via webhooks and delta sync. The bootstrap deployment sequence ensures everything comes up in the right order: infrastructure first, then code, then webhooks (only after bulk ingestion completes, to avoid noise during the initial load), then the frontend.</p>
+
+  <!-- ================================================================ -->
+  <!-- 13.2 Before You Start -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">13.2</span> Before You Start</h2>
+
+  <div class="before-you-start">
+    <div class="section-label">Before You Start</div>
+    <ul>
+      <li><strong>All previous phases complete.</strong> Phases 1&ndash;5 are done and working individually. The config loads, parsers handle all four formats, the ingestion pipeline processes documents end-to-end, the query API returns streaming answers, and the frontend renders results with citations.</li>
+      <li><strong>Full SharePoint access confirmed.</strong> The Azure AD app registration has <code>Sites.Read.All</code>, <code>Files.Read.All</code>, and <code>User.Read.All</code> permissions &mdash; all with admin consent granted by IT. Test this by running a Graph API call that lists all SharePoint sites in the tenant. If you get a 403, stop here and get IT to grant consent.</li>
+      <li><strong>Confirm bulk ingestion timing.</strong> The full ingestion takes an estimated 18&ndash;36 hours. Plan to start it on a Friday evening or Saturday morning so it can run over a weekend. Durable Functions checkpointing means it survives restarts, but you want an uninterrupted window for the initial load.</li>
+      <li><strong>Budget approved for one-time ingestion cost.</strong> The bulk ingestion costs approximately $11,000&ndash;$12,000. The largest component is Azure Document Intelligence for PDF parsing (~$9,200 after pre-parse PDF deduplication), followed by Claude Haiku entity extraction (~$1,200&ndash;$1,800) and Voyage AI bulk embedding (~$500&ndash;$1,000). This is a one-time cost &mdash; ongoing monthly costs are ~$395&ndash;$510. Get explicit sign-off before starting.</li>
+    </ul>
   </div>
 
-  <div class="glossary-entry">
-    <div class="glossary-term">Azure AD / Entra ID</div>
-    <p class="glossary-def">Microsoft's cloud identity service that manages who can sign in and what they can access. Originally called Azure Active Directory, now rebranded to Microsoft Entra ID.</p>
-    <p class="glossary-usage">In BSearch: every user authenticates via Azure AD using the firm's existing M365 credentials. The web app and FastAPI backend both validate Azure AD tokens. Folder-level permissions are mapped to Azure AD identities to filter search results.</p>
+  <!-- ================================================================ -->
+  <!-- 13.3 The Spec -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">13.3</span> The Spec</h2>
+
+  <p>This section covers the acceptance test queries, latency targets, bulk ingestion throughput model, bootstrap deployment sequence, monthly cost model, recovery paths, and blue-green re-indexing strategy.</p>
+
+  <!-- 13.3.1 Acceptance Test Queries -->
+  <h3>5 Acceptance Test Queries</h3>
+
+  <p>These five queries are the definition of &ldquo;done.&rdquo; Each one tests a different capability of the system. If BSearch answers all five correctly &mdash; with accurate citations and within latency targets &mdash; the system is production-ready.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Query</th>
+        <th>Expected Result</th>
+        <th>What It Tests</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1</td>
+        <td><em>"Where's the latest GovTech deck?"</em></td>
+        <td>The correct file with a direct SharePoint link &mdash; not three old versions. Should route via regex fast path (file_lookup), skip embedding entirely, and use BM25 on the <code>file_name</code> field. Near-duplicate dedup ensures only the canonical version surfaces.</td>
+        <td><strong>File lookup</strong> &mdash; finding the right document, fast. Also validates dedup and version detection.</td>
+      </tr>
+      <tr>
+        <td>2</td>
+        <td><em>"Which firms did we reach out to for Govini?"</em></td>
+        <td>A list of firm names extracted from the relevant documents, with source citations pointing to specific chunks. Should route to data_extraction via Haiku classification.</td>
+        <td><strong>Data extraction</strong> &mdash; pulling specific facts from documents with precise citations.</td>
+      </tr>
+      <tr>
+        <td>3</td>
+        <td><em>"Find me a good situation overview slide we've put together in the past for a banking deal"</em></td>
+        <td>A specific slide from a specific deck, with a link to the full presentation. PowerPoint chunks are one-per-slide, so the result should point to the exact slide, not just the file.</td>
+        <td><strong>Slide-level retrieval</strong> &mdash; finding content <em>inside</em> documents. Also validates format-aware chunking for PowerPoint.</td>
+      </tr>
+      <tr>
+        <td>4</td>
+        <td><em>"What multiple did we use for [deal name]?"</em></td>
+        <td>The EV/EBITDA or other relevant multiple, pulled from the model or deal summary. Results should include chunks with &ldquo;EV/EBITDA&rdquo; or &ldquo;Enterprise Value&rdquo; terminology, even though the query says &ldquo;multiple.&rdquo;</td>
+        <td><strong>Synonym expansion</strong> &mdash; understanding that &ldquo;multiple&rdquo; means &ldquo;EV/EBITDA&rdquo; in IB context. Validates both the static IB synonym map and Haiku query expansion.</td>
+      </tr>
+      <tr>
+        <td>5</td>
+        <td><em>"Where do we stand on our active deals?"</em></td>
+        <td>A deal-by-deal overview organized by deal name (not by source chunk), with citations per claim and gaps flagged. Should trigger multi_doc_synthesis routing, extended thinking, and pull deal summary chunks. The <code>deep_search: true</code> flag should appear in the SSE stream.</td>
+        <td><strong>Multi-document synthesis</strong> &mdash; cross-deal reasoning using deal summaries + extended thinking. The hardest query &mdash; validates the entire pipeline.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <div class="callout-title">Beyond the five</div>
+    <p>The five acceptance queries are necessary but not sufficient. Phase 6 also includes testing query classification routing (verify &ldquo;find the Catalyst NDA&rdquo; routes to file_lookup, not data_extraction), query expansion (verify &ldquo;pull the comps for Acme&rdquo; finds &ldquo;comparable companies&rdquo;), relevance gating (query for a nonexistent deal &rarr; no-results response, not a hallucination), permission filtering, document versioning, source deep links, and the full suite of entity-aware queries.</p>
   </div>
 
-  <div class="glossary-entry">
-    <div class="glossary-term">Azure AI Search</div>
-    <p class="glossary-def">Microsoft's managed search service that stores and queries indexed content. It supports full-text keyword search, vector search, and combinations of both.</p>
-    <p class="glossary-usage">In BSearch: the primary search index. Stores all document chunks with their text, embeddings (1024-dimensional vectors from Voyage AI), metadata fields (doc_type, deal_id, source_folder), and entity fields. Supports hybrid queries combining BM25 keyword matching with vector similarity, plus OData filters for permissions and entity-aware narrowing.</p>
+  <!-- 13.3.2 TTFT Measurement Targets -->
+  <h3>TTFT Measurement Targets</h3>
+
+  <p>Time to first token (TTFT) is measured per query type. Each target is tested by running 20+ queries of that type and computing p50 (median) and p95 (worst case excluding extreme outliers). If p95 exceeds the target, there is a latency problem to diagnose.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Query Type</th>
+        <th>TTFT Target (p95)</th>
+        <th>Why This Target</th>
+        <th>What Drives Latency</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>file_lookup</code></td>
+        <td>&lt;2 seconds</td>
+        <td>File lookups skip embedding entirely (BM25 on filename is sufficient). Users expect near-instant results for &ldquo;find me this file.&rdquo;</td>
+        <td>BM25 query + Claude terse response. No embedding, no reranking.</td>
+      </tr>
+      <tr>
+        <td><code>data_extraction</code></td>
+        <td>&lt;3 seconds</td>
+        <td>The default query type and the most common. Classification + embedding + search + reranking + Claude all run, but context is limited to 5 chunks.</td>
+        <td>Parallel classification/embedding (~500ms) + search + rerank (~200ms) + Claude start (~1&ndash;1.5s).</td>
+      </tr>
+      <tr>
+        <td><code>multi_doc_synthesis</code></td>
+        <td>&lt;5 seconds</td>
+        <td>Cross-document reasoning requires more context (10 chunks + deal summaries) and extended thinking (~2,000 token budget). Users see a &ldquo;Searching across multiple documents...&rdquo; indicator while waiting.</td>
+        <td>Same pipeline as data_extraction, plus extended thinking overhead and larger context window.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="definition">
+    <p><span class="term">p50 vs. p95</span> &mdash; p50 is the median: half of queries are faster, half slower. p95 means 95% of queries meet the target. The acceptance criteria use p95 because it catches latency spikes that p50 would hide. If p50 is 1.5s but p95 is 4s, you have a problem even though the &ldquo;average&rdquo; looks fine.</p>
   </div>
 
-  <div class="glossary-entry">
-    <div class="glossary-term">Azure App Service</div>
-    <p class="glossary-def">A managed platform for hosting web applications without managing servers. You deploy your code; Azure handles the infrastructure, scaling, and uptime.</p>
-    <p class="glossary-usage">In BSearch: hosts the FastAPI query API on a B1 tier (~$13/month). Chosen over Azure Functions for the API because App Service is always-on &mdash; no cold-start delays that would violate the &lt;3-second TTFT target.</p>
+  <!-- 13.3.3 Bulk Ingestion Throughput Model -->
+  <h3>Bulk Ingestion Throughput Model</h3>
+
+  <p>The initial ingestion of ~550,000 documents produces approximately 2.2 million searchable chunks. The bottleneck is Graph API download speed and embedding generation. The entire process runs as a Durable Functions fan-out/fan-in orchestrator with automatic checkpointing &mdash; if it crashes at hour 14, it resumes from where it stopped.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Stage</th>
+        <th>Rate Limit</th>
+        <th>Estimated Time (550K docs)</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Graph API download</td>
+        <td>~10,000 requests per 10-minute window</td>
+        <td>~9&ndash;12 hours</td>
+      </tr>
+      <tr>
+        <td>Format parsing (Word, Excel, PPT, PDF)</td>
+        <td>CPU-bound, parallelized across activity functions</td>
+        <td>~2&ndash;4 hours</td>
+      </tr>
+      <tr>
+        <td>Haiku entity extraction (Tier 1 &mdash; doc-level)</td>
+        <td>~100 requests/second</td>
+        <td>~1.5 hours (550K calls)</td>
+      </tr>
+      <tr>
+        <td>Haiku entity extraction (Tier 2 &mdash; high-value chunks)</td>
+        <td>~100 requests/second</td>
+        <td>~0.5 hours (~150K high-value chunks)</td>
+      </tr>
+      <tr>
+        <td>Voyage AI embedding</td>
+        <td>~100&ndash;500 embeddings/second</td>
+        <td>~1&ndash;6 hours (~2.2M chunks)</td>
+      </tr>
+      <tr>
+        <td>Neo4j entity writes</td>
+        <td>~500 operations/second</td>
+        <td>~1&ndash;2 hours</td>
+      </tr>
+      <tr>
+        <td>Azure AI Search indexing</td>
+        <td>~1,000 documents/second</td>
+        <td>~0.5&ndash;1 hour</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="key-takeaway">
+    <div class="callout-title">Total Wall Time</div>
+    <p><strong>18&ndash;36 hours estimated.</strong> The bottleneck is Graph API download + embedding. Plan for a 2-day weekend window with checkpoint/resume via Durable Functions. Progress is monitored through Application Insights. Neo4j Aura Pro (~$65/month) is required for bulk load &mdash; the Free tier's 200K node limit is exceeded by the full entity graph.</p>
   </div>
 
-  <div class="glossary-entry">
-    <div class="glossary-term">Azure Document Intelligence</div>
-    <p class="glossary-def">A Microsoft AI service (formerly Form Recognizer) that extracts text, tables, and structure from documents &mdash; especially PDFs and scanned images &mdash; using machine learning models trained on document layouts.</p>
-    <p class="glossary-usage">In BSearch: the PDF parser in the ingestion pipeline. It preserves table structures and reading order that simple text extraction would lose, which is critical for financial documents where tables contain the most valuable data.</p>
+  <div class="callout info">
+    <div class="callout-title">Run a pilot first</div>
+    <p>Before running the full 550K ingestion, run a pilot on a test SharePoint folder with ~100 representative documents (a mix of Word, Excel, PowerPoint, and PDF). This validates the entire pipeline end-to-end at low cost. Run the 5 acceptance test queries against the pilot data. Only proceed to full ingestion after the pilot passes.</p>
   </div>
 
-  <div class="glossary-entry">
-    <div class="glossary-term">Azure Durable Functions</div>
-    <p class="glossary-def">An extension of Azure Functions that lets you write long-running, stateful workflows in code. It handles checkpointing, retries, and coordination automatically &mdash; if a workflow fails partway through, it can resume from where it left off.</p>
-    <p class="glossary-usage">In BSearch: the ingestion pipeline runs as Durable Functions orchestrators. The bulk ingestion of ~550K documents uses the fan-out/fan-in pattern to process documents in parallel with automatic checkpointing. Webhook-triggered and delta sync ingestion use the same orchestrator codepath.</p>
+  <!-- 13.3.4 Bootstrap Deployment Sequence -->
+  <h3>Bootstrap Deployment Sequence (9 Steps)</h3>
+
+  <p>This is the greenfield runbook &mdash; the exact order for deploying BSearch from scratch. Each step must succeed before proceeding to the next. The sequence is designed to avoid two specific problems: webhook noise during bulk ingestion (step 7 comes after step 6), and wasted compute from deploying the frontend before the index has data (step 8 comes last).</p>
+
+  <ol>
+    <li>
+      <strong>Create Azure AD app registration.</strong> Register the application with <code>Sites.Read.All</code>, <code>Files.Read.All</code>, and <code>User.Read.All</code> permissions. Get admin consent from IT. Save the <code>client_id</code>, <code>client_secret</code>, and <code>tenant_id</code>.
+    </li>
+    <li>
+      <strong>Provision Azure resources via Bicep.</strong> Deploy <code>infra/main.bicep</code> with the production parameter file. This creates Azure AI Search (S1), App Service (B2), Durable Functions (Consumption), Cosmos DB (serverless), Key Vault, Static Web Apps, and Application Insights. Verify all resources appear in the Azure portal.
+    </li>
+    <li>
+      <strong>Store API keys in Key Vault.</strong> Populate Key Vault with all secrets: Voyage AI, Cohere, Anthropic API keys; Graph API credentials (<code>client_id</code>, <code>client_secret</code>, <code>tenant_id</code>); Neo4j credentials (<code>uri</code>, <code>username</code>, <code>password</code>); Cosmos DB connection string; Azure AI Search admin key. Verify App Service and Functions can read secrets via managed identity.
+    </li>
+    <li>
+      <strong>Deploy Azure Functions + App Service code.</strong> Deploy the ingestion pipeline (Durable Functions) and the query API (FastAPI on App Service). Verify the <code>/health</code> endpoint returns 200 on the App Service.
+    </li>
+    <li>
+      <strong>Create Neo4j Aura Pro instance.</strong> Create the instance, run the index creation script (constraints and indexes for Deal, Company, Person nodes), and verify connectivity from the Azure Functions environment.
+    </li>
+    <li>
+      <strong>Run bulk ingestion (18&ndash;36 hours, NO webhooks yet).</strong> Start the Durable Functions bulk ingestion orchestrator. It enumerates all documents across all SharePoint sites via Graph API delta queries, fans out to parse/chunk/embed/index activity functions, and writes progress to Cosmos DB. Webhooks are not registered yet &mdash; this prevents noise during the initial load. Monitor progress via Application Insights.
+    </li>
+    <li>
+      <strong>Create Graph API webhook subscriptions.</strong> After bulk ingestion completes, register webhooks for all monitored drives. This enables near-real-time sync going forward. Verify by modifying a test file in SharePoint and confirming BSearch re-indexes it within a few minutes.
+    </li>
+    <li>
+      <strong>Deploy Static Web App (React frontend).</strong> Deploy the web frontend with Azure AD authentication configured. Verify the login flow works with a Berenson user account.
+    </li>
+    <li>
+      <strong>Smoke test.</strong> Verify the <code>/health</code> endpoint, run acceptance test query #1 (&ldquo;Where's the latest GovTech deck?&rdquo;), and check the Application Insights live stream for instrumentation events. If all three pass, the system is live.
+    </li>
+  </ol>
+
+  <div class="callout info">
+    <div class="callout-title">Why webhooks come after bulk ingestion</div>
+    <p>If you register webhooks before bulk ingestion, every document in SharePoint triggers a webhook notification as it is being processed &mdash; creating a flood of duplicate work. By deferring webhook registration to step 7, the bulk ingestion runs uninterrupted, and webhooks only fire for genuinely new changes after the baseline is established.</p>
   </div>
 
-  <div class="glossary-entry">
-    <div class="glossary-term">Azure Static Web Apps</div>
-    <p class="glossary-def">A hosting service optimized for static frontends (HTML, CSS, JavaScript). It serves files from a global CDN with built-in Azure AD authentication and custom domain support, requiring zero server management.</p>
-    <p class="glossary-usage">In BSearch: hosts the Vite + React single-page application. Platform-managed Azure AD OIDC authentication means the frontend gets secure login without any custom auth code.</p>
+  <!-- 13.3.5 Monthly Cost Model -->
+  <h3>Monthly Cost Model</h3>
+
+  <p>BSearch has two cost components: a one-time ingestion cost and an ongoing monthly cost. The monthly cost is modest because the user base is small (18 people) and the system minimizes AI model calls &mdash; one Claude Sonnet call per query, with cheaper Haiku handling classification and background tasks.</p>
+
+  <h4>Ongoing Monthly Cost</h4>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Service</th>
+        <th>Monthly Cost</th>
+        <th>What It Covers</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Azure AI Search (S1)</td>
+        <td>~$250</td>
+        <td>Hybrid search index for 2.2M chunks. The largest fixed cost &mdash; required for vector search at this scale.</td>
+      </tr>
+      <tr>
+        <td>Neo4j Aura Pro</td>
+        <td>~$65</td>
+        <td>Knowledge graph hosting. Required (Free tier exceeded by bulk load).</td>
+      </tr>
+      <tr>
+        <td>Claude Sonnet (synthesis)</td>
+        <td>~$30&ndash;120</td>
+        <td>One call per query, 50&ndash;200 queries/day. Range depends on actual usage volume.</td>
+      </tr>
+      <tr>
+        <td>App Service (B2)</td>
+        <td>~$26</td>
+        <td>Always-on FastAPI host. Dual-core, 3.5GB RAM, no cold start.</td>
+      </tr>
+      <tr>
+        <td>Application Insights</td>
+        <td>~$5&ndash;15</td>
+        <td>Latency instrumentation, health check events, query flight recorder, alerts.</td>
+      </tr>
+      <tr>
+        <td>Claude Haiku (classification + extraction)</td>
+        <td>~$3&ndash;12</td>
+        <td>Query classification, expansion, doc_type tagging, deal summary generation.</td>
+      </tr>
+      <tr>
+        <td>Cosmos DB (serverless)</td>
+        <td>~$5&ndash;10</td>
+        <td>Conversations, sync tokens, webhooks, retry queue, duplicate clusters. Near-zero at 18 users.</td>
+      </tr>
+      <tr>
+        <td>Cohere Rerank</td>
+        <td>~$5&ndash;6</td>
+        <td>Re-scoring top-20 candidates per query. Low volume keeps this cheap.</td>
+      </tr>
+      <tr>
+        <td>Voyage AI (query embeddings)</td>
+        <td>~$5&ndash;6</td>
+        <td>One embedding per query. LRU cache reduces repeat calls.</td>
+      </tr>
+      <tr>
+        <td>Azure Functions (Consumption)</td>
+        <td>~$5&ndash;10</td>
+        <td>Ingestion orchestrator, webhook receiver, delta sync timer. Pay-per-execution.</td>
+      </tr>
+      <tr>
+        <td>Static Web Apps</td>
+        <td>Free</td>
+        <td>React frontend hosting with CDN and built-in Azure AD auth.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="key-takeaway">
+    <div class="callout-title">Monthly Total</div>
+    <p><strong>~$395&ndash;510/month ongoing.</strong> Azure AI Search S1 is the dominant cost (~50% of the total). Everything else is consumption-based and scales with usage volume, which is low at 18 users.</p>
   </div>
 
-  <div class="glossary-entry">
-    <div class="glossary-term">Bicep</div>
-    <p class="glossary-def">A domain-specific language for deploying Azure resources as code. Instead of clicking through the Azure portal, you define your infrastructure in .bicep files that can be version-controlled, reviewed, and deployed repeatably.</p>
-    <p class="glossary-usage">In BSearch: all Azure infrastructure (AI Search, App Service, Durable Functions, Cosmos DB, Static Web Apps, Key Vault) is defined in Bicep templates under the <code>infra/</code> directory, with separate parameter files for dev and prod environments.</p>
+  <h4>One-Time Bulk Ingestion Cost</h4>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Service</th>
+        <th>One-Time Cost</th>
+        <th>What It Covers</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Azure Document Intelligence (PDF parsing)</td>
+        <td>~$9,200</td>
+        <td>Structure-preserving extraction from PDFs. Cost reflects post-dedup volume (pre-parse PDF companion dedup skips PDFs that have matching Office source files).</td>
+      </tr>
+      <tr>
+        <td>Claude Haiku (entity extraction)</td>
+        <td>~$1,200&ndash;1,800</td>
+        <td>Tier 1 doc-level extraction (~$550) + Tier 2 high-value chunk extraction (~$200&ndash;400) + deal/doc summary generation.</td>
+      </tr>
+      <tr>
+        <td>Voyage AI (bulk embedding)</td>
+        <td>~$500&ndash;1,000</td>
+        <td>Embedding all ~2.2M chunks with voyage-context-3 (1024 dimensions).</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="key-takeaway">
+    <div class="callout-title">One-Time Total</div>
+    <p><strong>~$11,000&ndash;$12,000.</strong> This is a one-time cost. After the initial bulk load, ongoing ingestion is incremental &mdash; only new or modified files are processed, covered by the monthly budget.</p>
   </div>
 
-  <div class="glossary-entry">
-    <div class="glossary-term">BM25</div>
-    <p class="glossary-def">A keyword-matching algorithm that ranks documents by how well their words match the query. It considers word frequency, document length, and how rare a word is across the entire index. It is the standard algorithm behind most traditional search engines.</p>
-    <p class="glossary-usage">In BSearch: one half of hybrid search. BM25 handles exact keyword matches (company names, deal terms, file names) where vector search might miss. Static IB synonym expansions and Haiku-generated reformulations are appended to the BM25 query to improve recall. Original query terms receive a higher BM25 boost weight (3.0) than expansion terms (1.5).</p>
+  <!-- 13.3.6 Recovery Paths -->
+  <h3>Recovery Paths</h3>
+
+  <p>Three failure scenarios require specific recovery procedures:</p>
+
+  <h4>Neo4j Data Loss</h4>
+
+  <p>If Neo4j data is lost, search continues without entity intelligence. The full entity graph can be rebuilt from scratch by re-running the ingestion orchestrator on all indexed files &mdash; Azure AI Search retains all document content, so no data is truly lost.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Metric</th>
+        <th>Value</th>
+        <th>Meaning</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>RPO (Recovery Point Objective)</td>
+        <td>24 hours</td>
+        <td>Neo4j Aura Pro provides daily automated backups. Worst case, you lose one day of entity changes.</td>
+      </tr>
+      <tr>
+        <td>RTO (Recovery Time Objective)</td>
+        <td>18&ndash;36 hours</td>
+        <td>Full re-ingestion from Azure AI Search content to rebuild the graph.</td>
+      </tr>
+      <tr>
+        <td>Degradation during rebuild</td>
+        <td>Document-only search</td>
+        <td>Entity-aware queries fall back to document-only search. No entity context in Claude prompts. <code>neo4j_fallback</code> logged. Users see normal results without entity enrichment.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h4>Azure AI Search 503</h4>
+
+  <p>If Azure AI Search returns 503 (service unavailable), this is hard downtime &mdash; there is no fallback for the search index itself. The query API returns a clear error, and the frontend shows &ldquo;Search unavailable.&rdquo; Auto-retry with exponential backoff covers transient issues. For sustained outages, check App Service health, then Azure AI Search availability, then Application Insights for error spikes.</p>
+
+  <h4>Reranker Failure (Cohere Down)</h4>
+
+  <p>When Cohere is unavailable, the system enters degraded mode: reranking is skipped, Azure Search's hybrid ranking (vector + BM25 + recency) is used on the top 12 results instead of the normal top 20, and confidence is capped at LOW. The background health checker detects the outage within 60 seconds (3 consecutive failures trigger an alert). The frontend renders a distinct orange degraded banner (different from the yellow LOW confidence banner). When Cohere recovers, the health checker detects it within 60 seconds, the next query returns <code>degraded_reranker: false</code>, and the orange banner disappears.</p>
+
+  <!-- 13.3.7 Blue-Green Re-Indexing -->
+  <h3>Blue-Green Re-Indexing</h3>
+
+  <p>When you need to swap embedding models (e.g., upgrading from voyage-context-3 to a future model, or scaling from 1024 to 2048 dimensions), you cannot do a rolling update. Cosine similarity between vectors from different models is meaningless &mdash; the index must be fully consistent. The solution is blue-green re-indexing: create a parallel index, re-embed everything into it, validate, then flip.</p>
+
+  <h4>The 5-Step Process</h4>
+
+  <ol>
+    <li>
+      <strong>Create new index.</strong> Create <code>bsearch-v2</code> (or <code>bsearch-{embedding_version}</code>) with the new provider's vector dimensions. Identical schema to the current index except <code>content_vector.dimensions</code> matches the new model. This is a Bicep parameter change.
+    </li>
+    <li>
+      <strong>Background re-indexing orchestrator.</strong> A Durable Functions orchestrator (reusing the existing fan-out/fan-in pattern) iterates all chunks in the old index: read chunk content + metadata in 1,000-chunk batches, embed the <code>content</code> field with the new provider, and write to the new index with updated <code>embedding_model</code>, <code>embedding_dimensions</code>, <code>embedding_version</code>, and <code>content_vector</code>. At ~500 embeddings/second, 2.2M chunks completes in <strong>~1&ndash;2 hours</strong>. Durable Functions checkpointing means it survives restarts.
+    </li>
+    <li>
+      <strong>Validation.</strong> Verify chunk count in the new index matches the old index (&plusmn;tolerance for concurrent ingestion). Sample 100 random chunks and verify <code>embedding_version</code> and vector dimensions are correct. Run the acceptance test queries against the new index and compare result quality to the old index. Re-run dedup cluster evaluation with new-model embeddings and recalibrate <code>dedup_cosine_threshold</code> if the similarity distribution shifts.
+    </li>
+    <li>
+      <strong>Flip active index.</strong> Update the <code>ACTIVE_INDEX_NAME</code> environment variable on App Service. The search API starts querying the new index. Restart App Service to flush the LRU embedding cache (cached vectors are from the old model).
+    </li>
+    <li>
+      <strong>Cleanup / rollback.</strong> Keep the old index for 48 hours as a rollback safety net. If issues are found, flip <code>ACTIVE_INDEX_NAME</code> back. After the grace period, delete the old index.
+    </li>
+  </ol>
+
+  <div class="callout info">
+    <div class="callout-title">Concurrent ingestion during re-index</div>
+    <p>New files arriving via webhooks or delta sync during the re-index window are written to <strong>both</strong> indexes. The ingestion pipeline checks <code>config.reindex_in_progress</code> &mdash; when true, it embeds with both the old and new providers and writes to both indexes. This prevents gaps in the new index. The config keys controlling re-indexing:</p>
+    <table>
+      <thead>
+        <tr>
+          <th>Config Key</th>
+          <th>Default</th>
+          <th>Description</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>ACTIVE_INDEX_NAME</code></td>
+          <td><code>"bsearch-v1"</code></td>
+          <td>Which index the search API queries</td>
+        </tr>
+        <tr>
+          <td><code>REINDEX_TARGET_INDEX</code></td>
+          <td><code>null</code></td>
+          <td>Target index for re-indexing job (null = no re-index in progress)</td>
+        </tr>
+        <tr>
+          <td><code>REINDEX_IN_PROGRESS</code></td>
+          <td><code>false</code></td>
+          <td>When true, ingestion dual-writes to active + target indexes</td>
+        </tr>
+        <tr>
+          <td><code>EMBEDDING_VERSION</code></td>
+          <td><code>"v1"</code></td>
+          <td>Incremented on any model/provider/dimension change</td>
+        </tr>
+      </tbody>
+    </table>
   </div>
 
-  <div class="glossary-entry">
-    <div class="glossary-term">Chunk</div>
-    <p class="glossary-def">A segment of a document that has been split into a manageable piece for indexing and retrieval. Documents are too long to process whole, so they are divided into chunks that each capture a coherent unit of information.</p>
-    <p class="glossary-usage">In BSearch: chunking is format-aware. Narrative text is split into 800&ndash;1,000 token chunks. Tables are kept intact (or split at structural boundaries if over 1,500 tokens). PowerPoint slides become one chunk per slide. Each chunk is embedded independently and stored in Azure AI Search with metadata linking it back to its source document.</p>
+  <p>The key property of this approach: <strong>zero downtime, zero query impact.</strong> Queries always hit the active index, which has fully consistent embeddings. The re-indexing orchestrator runs in the background without affecting search performance. If re-indexing fails or produces worse results, the old index is still serving and the new index can be deleted.</p>
+
+  <!-- 13.3.8 Operational Runbook -->
+  <h3>Operational Runbook</h3>
+
+  <p>Six common scenarios and what to do about each:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Scenario</th>
+        <th>What to Check</th>
+        <th>Resolution</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Search returns 503</td>
+        <td>App Service health &rarr; Azure AI Search availability &rarr; Application Insights error spike</td>
+        <td>Hard downtime. Wait for Azure AI Search recovery. Auto-retry with backoff handles transient issues.</td>
+      </tr>
+      <tr>
+        <td>Orange degraded banner</td>
+        <td>Cohere status page</td>
+        <td>Cohere is down. System auto-degrades. Wait for recovery &mdash; health checker restores automatically within 60 seconds.</td>
+      </tr>
+      <tr>
+        <td>Poor result quality</td>
+        <td>Flight recorder for the query &rarr; inspect retrieved chunks + rerank scores</td>
+        <td>Recalibrate relevance gate thresholds (<code>no_results_threshold</code>, <code>low_confidence_threshold</code>, <code>min_rerank_score</code>). Adjustable via env vars without redeploy.</td>
+      </tr>
+      <tr>
+        <td>Missing documents</td>
+        <td>Delta sync logs &rarr; webhook subscription status</td>
+        <td>Run manual delta sync. If webhook subscription expired, it is re-created on the next renewal cycle.</td>
+      </tr>
+      <tr>
+        <td>Neo4j down</td>
+        <td>Aura dashboard</td>
+        <td>Entity enrichment degrades, search still works in document-only mode. Wait for recovery.</td>
+      </tr>
+      <tr>
+        <td>High embedding fallback rate</td>
+        <td>Health checker status &rarr; Voyage AI status page</td>
+        <td>Voyage AI is degraded. BM25 fallback + reranker compensate. Application Insights alert fires if sustained &gt;10% over 1 hour.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- 13.3.9 Threshold Calibration -->
+  <h3>Threshold Calibration</h3>
+
+  <p>Two sets of thresholds must be calibrated against real data before the system is production-ready. This calibration runs against the full 550K document index &mdash; not the pilot data.</p>
+
+  <h4>Relevance Gate Thresholds</h4>
+
+  <p>Run 30+ queries spanning all three query types (file_lookup, data_extraction, multi_doc_synthesis). Log all Cohere rerank scores. For each query, manually verify the top-10 results as correct or irrelevant. Analyze the score distributions to determine what percentage of correct results fall in each confidence tier (HIGH &ge;0.50 / LOW 0.15&ndash;0.50 / NONE &lt;0.15), and what percentage of irrelevant results sneak above the NONE threshold. Adjust <code>no_results_threshold</code>, <code>low_confidence_threshold</code>, and <code>min_rerank_score</code> based on the observed distributions. Document the calibrated values for quarterly re-evaluation as the corpus grows.</p>
+
+  <h4>BM25 Boost Weights</h4>
+
+  <p>Run acceptance test query #4 (&ldquo;What multiple did we use for [deal name]?&rdquo;) and 2&ndash;3 additional synonym-dependent queries (e.g., &ldquo;pull the comps for Acme,&rdquo; &ldquo;what leverage did we use on the Catalyst deal&rdquo;). Log which chunks surface and their BM25 component scores. Verify that expansion terms contribute to recall (synonym-matched chunks appear in top-20) without pushing original-term matches out. If expansion terms dominate or contribute nothing, adjust <code>BM25_ORIGINAL_BOOST</code> (default 3.0) and <code>BM25_EXPANSION_BOOST</code> (default 1.5).</p>
+
+  <!-- ================================================================ -->
+  <!-- 13.4 What to Tell Claude Code -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">13.4</span> What to Tell Claude Code</h2>
+
+  <div class="claude-prompt">
+    <div class="prompt-label">What to Tell Claude Code &mdash; Prompt 1: Acceptance Test Suite</div>
+    <div class="prompt-text">Set up the BSearch acceptance test suite. Create 5 test queries that cover file lookup, data extraction, multi-doc synthesis, entity/relationship queries, and recency/version queries. The exact queries:<br><br>1. "Where's the latest GovTech deck?" &mdash; expects correct file with SharePoint link, file_lookup routing, regex fast path, no embedding call<br>2. "Which firms did we reach out to for Govini?" &mdash; expects firm names with source citations, data_extraction routing<br>3. "Find me a good situation overview slide we've put together in the past for a banking deal" &mdash; expects slide-level result with deck link<br>4. "What multiple did we use for [deal name]?" &mdash; expects EV/EBITDA value, validates synonym expansion ("multiple" &rarr; "EV/EBITDA")<br>5. "Where do we stand on our active deals?" &mdash; expects deal-by-deal overview organized by deal, citations per claim, gaps flagged, deep_search flag in SSE<br><br>For each test, measure TTFT and verify the response includes relevant citations. Run each test 20 times to get p50/p95 TTFT numbers. Targets: file_lookup p95 &lt;2s, data_extraction p95 &lt;3s, multi_doc_synthesis p95 &lt;5s.<br><br>Also test: query classification routing (verify "find the Catalyst NDA" routes to file_lookup, "summarize our healthcare pipeline" routes to multi_doc_synthesis), query expansion (verify "pull the comps for Acme" finds "comparable companies"), relevance gating (nonexistent deal &rarr; no-results message, not a hallucination), and permission filtering (query as user with limited folder access &mdash; verify restricted documents not returned).</div>
   </div>
 
-  <div class="glossary-entry">
-    <div class="glossary-term">CIM (Confidential Information Memorandum)</div>
-    <p class="glossary-def">A detailed document prepared by a sell-side investment bank that describes the company being sold &mdash; its business, financials, market position, and growth prospects. It is the primary marketing document in an M&amp;A process, shared with prospective buyers after they sign an NDA.</p>
-    <p class="glossary-usage">In BSearch: CIMs are among the most frequently searched document types. The system classifies them via doc_type extraction, and the IB synonym map expands "CIM" to include "confidential information memorandum," "offering memorandum," and "info memo" so queries find them regardless of phrasing.</p>
+  <div class="claude-prompt">
+    <div class="prompt-label">What to Tell Claude Code &mdash; Prompt 2: Bulk Ingestion Job</div>
+    <div class="prompt-text">Implement the bulk ingestion job for BSearch. The Durable Functions orchestrator should:<br><br>1. Enumerate all documents across all SharePoint sites via Graph API delta queries<br>2. Fan out to activity functions that parse/chunk/embed/index each document<br>3. Respect Graph API rate limits (~10K requests per 10-minute window) and Voyage AI embedding throughput<br>4. Write progress to Cosmos DB for resumability via Durable Functions checkpointing<br>5. Skip _Archive folders and pre-parse PDF companions (PDFs that have matching Office source files in the same folder)<br>6. Run near-duplicate detection (normalize filenames, compare first-chunk embeddings at cosine similarity &ge;0.95, mark canonical versions)<br>7. Write entity data to Neo4j (deals, companies, people, relationships) with dual-write retry if Neo4j is temporarily unavailable<br>8. Generate doc summaries (for documents with &ge;4 chunks) and deal summaries (for deals with &ge;3 documents)<br><br>Concurrency: cap concurrent file activities to avoid provider rate limits. If any provider returns 429, halve concurrency and auto-restore after a quiet period. Target: &lt;1% error rate across the full 550K document set. Estimated total time: 18&ndash;36 hours for ~550K docs producing ~2.2M chunks.</div>
   </div>
 
-  <div class="glossary-entry">
-    <div class="glossary-term">Claude (Sonnet / Haiku)</div>
-    <p class="glossary-def">A family of large language models built by Anthropic. Sonnet is the mid-tier model optimized for quality and speed. Haiku is the smallest and fastest model, designed for high-volume, low-latency tasks.</p>
-    <p class="glossary-usage">In BSearch: Claude Sonnet 4.6 is the synthesis model &mdash; it reads retrieved document chunks and generates the final answer streamed to the user. Claude Haiku 4.5 handles lightweight tasks: query classification, query expansion, doc_type classification during ingestion, and doc/deal summary generation. This split keeps latency low and costs manageable (~$11/month for Sonnet at expected query volume).</p>
+  <div class="claude-prompt">
+    <div class="prompt-label">What to Tell Claude Code &mdash; Prompt 3: Bootstrap Deployment Script</div>
+    <div class="prompt-text">Create the bootstrap deployment script for BSearch. Each step verifies success before proceeding to the next:<br><br>1. Create Azure AD app registration (Sites.Read.All, Files.Read.All, User.Read.All, admin consent)<br>2. Provision Azure resources via Bicep (AI Search S1, Functions Consumption, App Service B2, Cosmos DB serverless, Key Vault, Static Web Apps, Application Insights)<br>3. Store API keys in Key Vault (Voyage, Cohere, Anthropic, Graph API secrets, Neo4j credentials, Cosmos connection string, AI Search admin key)<br>4. Deploy Azure Functions + App Service code<br>5. Create Neo4j Aura Pro instance + run index creation script<br>6. Start bulk ingestion (NO webhooks yet &mdash; prevents noise during initial load)<br>7. After bulk ingestion completes: register Graph API webhook subscriptions<br>8. Deploy Static Web App (React frontend with Azure AD auth)<br>9. Smoke test: /health endpoint, acceptance test query #1, Application Insights live stream<br><br>Each step should log what it is doing, verify its output, and fail clearly if something goes wrong. Include a --dry-run flag that validates without executing.</div>
   </div>
 
-  <div class="glossary-entry">
-    <div class="glossary-term">Cohere Rerank</div>
-    <p class="glossary-def">A service from Cohere that takes a query and a list of candidate text passages, then re-scores them by how relevant each passage actually is to the query. It uses a cross-encoder model that reads the query and each passage together, producing much more accurate relevance scores than initial retrieval alone.</p>
-    <p class="glossary-usage">In BSearch: after hybrid search returns the top 20 candidates, Cohere Rerank re-scores them against the original query (not the expanded version) and selects the top 5. This step filters out noise introduced by synonym expansion and corrects ranking errors from the initial retrieval. A background health check pings Cohere every 60 seconds; on failure, reranking is skipped and confidence is capped at LOW.</p>
+  <!-- ================================================================ -->
+  <!-- 13.5 How to Verify -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">13.5</span> How to Verify</h2>
+
+  <div class="verify-checklist">
+    <div class="section-label">How to Verify</div>
+    <ol>
+      <li><strong>All 5 acceptance test queries return reasonable, cited answers.</strong> Each query produces a response with relevant content and source citations that link to real SharePoint documents. Query #5 (pipeline overview) organizes results by deal, not by source chunk. No hallucinated answers for any query.</li>
+      <li><strong>TTFT is within targets for each query type.</strong> Across 20+ runs per query type: <code>file_lookup</code> p95 &lt;2s, <code>data_extraction</code> p95 &lt;3s, <code>multi_doc_synthesis</code> p95 &lt;5s. If p95 exceeds the target but p50 is well within it, investigate the tail &mdash; it may be cold-start related or a transient API spike.</li>
+      <li><strong>Permission filtering works.</strong> Test with a user who has limited folder access (e.g., only one of the five top-level folders). Query for content that exists in a restricted folder &mdash; verify it does not appear in results. Then query for content in the user's accessible folder &mdash; verify it does appear.</li>
+      <li><strong>Document versioning works.</strong> Update a file in SharePoint (add a sentence to a Word doc). Wait for the webhook to trigger re-ingestion (should happen within minutes). Query for the new content &mdash; verify old chunks are replaced and the new content appears in results.</li>
+      <li><strong>Reranker degradation and recovery.</strong> Block the Cohere API (e.g., via firewall rule or mock). Verify: health check detects failure within 60 seconds, subsequent queries return <code>degraded_reranker: true</code> in the SSE stream, frontend renders orange degraded banner, confidence is capped at LOW. Unblock Cohere. Verify: health check recovers within 60 seconds, next query returns <code>degraded_reranker: false</code>, orange banner disappears. Confirm <code>reranker_degraded</code> event appears in Application Insights.</li>
+      <li><strong>Full ingestion completes without errors (or with &lt;1% error rate).</strong> After the 550K document ingestion, check Application Insights for failed files. A small number of failures is expected (corrupt files, unsupported formats), but the overall error rate should be below 1%. Verify chunk count in Azure AI Search is approximately 2.2M. Verify Neo4j contains deal, company, and person nodes with relationships.</li>
+    </ol>
   </div>
 
-  <div class="glossary-entry">
-    <div class="glossary-term">Confidence Gating</div>
-    <p class="glossary-def">A mechanism that evaluates how confident the system is in its search results before deciding what to do with them. Instead of always sending results to the LLM, the system checks whether results are good enough to warrant an answer.</p>
-    <p class="glossary-usage">In BSearch: a three-tier gate based on Cohere rerank scores. HIGH (&ge;0.50): proceed to Claude synthesis normally. LOW (0.15&ndash;0.50): proceed but add hedging language to the Claude prompt. NONE (&lt;0.15): skip the Claude call entirely and tell the user no relevant results were found. Individual chunks below 0.10 are dropped. Thresholds are configurable via environment variables.</p>
-  </div>
+  <!-- ================================================================ -->
+  <!-- 13.6 What Happens Next -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">13.6</span> What Happens Next</h2>
 
-  <div class="glossary-entry">
-    <div class="glossary-term">Contextual Embeddings</div>
-    <p class="glossary-def">A technique where each chunk's embedding is generated with awareness of the full document it came from, not just the chunk's own text. This produces richer numerical representations because the model understands each chunk's role within the broader document.</p>
-    <p class="glossary-usage">In BSearch: Voyage AI's voyage-context-3 model supports contextual embeddings natively. During ingestion, each chunk is embedded with its document context (up to 32K tokens), so a table labeled "Revenue" is understood differently when it appears in a CIM versus a quarterly report. The embedding provider abstraction passes a <code>document_context</code> parameter that contextual models use and standard models ignore.</p>
-  </div>
+  <p>With Phase 6 complete, BSearch is live. The system is ingesting documents in near-real-time, answering questions with cited sources, and running within its cost envelope. From here, the path forward is monitoring, calibration, and the v2 feature backlog: Outlook email search, Teams bot interface, document vision, and two-pass extraction. But those are future phases. Right now, all 18 users at Berenson have a system that turns 550,000 documents into answers.</p>
 
-  <div class="glossary-entry">
-    <div class="glossary-term">Cosine Similarity</div>
-    <p class="glossary-def">A mathematical measure of how similar two vectors are, based on the angle between them. A score of 1.0 means identical direction (very similar meaning); 0.0 means completely unrelated. It ignores magnitude and focuses purely on direction.</p>
-    <p class="glossary-usage">In BSearch: used in two places. First, vector search in Azure AI Search ranks chunks by cosine similarity between the query embedding and chunk embeddings. Second, deduplication compares first-chunk embeddings of candidate duplicate files &mdash; pairs with cosine similarity &ge;0.95 are confirmed as near-duplicates.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Cosmos DB</div>
-    <p class="glossary-def">Microsoft's globally distributed, serverless NoSQL database. In serverless mode, you pay only for the storage and compute you actually use &mdash; at low volumes the cost approaches zero.</p>
-    <p class="glossary-usage">In BSearch: stores operational state &mdash; conversation history, delta sync tokens, webhook subscription records, retry queues, permission configuration, and duplicate cluster state. Chosen for its serverless pricing model (~$0/month at 18 users) and native integration with Azure Functions.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Cross-Encoder</div>
-    <p class="glossary-def">A neural network architecture that reads a query and a document passage together as a single combined input, then outputs a relevance score. Unlike bi-encoders (which embed query and document separately), cross-encoders capture fine-grained interactions between query and document words, producing more accurate relevance judgments &mdash; but at higher computational cost.</p>
-    <p class="glossary-usage">In BSearch: Cohere Rerank is a cross-encoder. It is used after initial retrieval (not for first-pass search, which would be too slow at 550K documents) to re-score the top 20 candidates down to the top 5.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Data Extraction</div>
-    <p class="glossary-def">The process of pulling a specific piece of information &mdash; a number, name, date, or metric &mdash; out of one or more documents. Distinguished from broad summarization by its precision: the user wants a particular fact, not an overview.</p>
-    <p class="glossary-usage">In BSearch: one of three query types. When the classifier detects a data extraction query (e.g., "What was the EBITDA for Acme?"), the pipeline biases retrieval toward table and model_summary chunk types, uses standard top-20 &rarr; rerank top-5, and prompts Claude for precise extraction with citations. This is the default classification when ambiguous.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Deal Summary</div>
-    <p class="glossary-def">A pre-computed, concise summary (~400 tokens) that captures the key facts about a deal &mdash; parties involved, deal stage, financial metrics, and timeline &mdash; synthesized from all documents associated with that deal.</p>
-    <p class="glossary-usage">In BSearch: generated by Haiku during ingestion for deals with &ge;3 associated documents. Stored as a special chunk type in the search index. Refreshed when deal-related files change and on a 6-hour timer. At query time, deal summaries reduce the cross-deal reasoning burden for multi-doc synthesis queries.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Deduplication (Near-Duplicate Detection)</div>
-    <p class="glossary-def">The process of identifying files that are effectively the same document &mdash; different versions, copies with minor edits, or files saved under slightly different names. The goal is to surface only the most current version in search results.</p>
-    <p class="glossary-usage">In BSearch: a two-phase process at ingestion time. Phase 1: normalize filenames (strip "FINAL," "(2)," version markers) and group by normalized name within the same source folder. Phase 2: compare first-chunk embeddings via cosine similarity (&ge;0.95 = confirmed duplicate). The most recently modified file is marked <code>is_canonical = true</code>; all search queries filter on this field. Non-canonical chunks remain indexed for re-evaluation when files change.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Delta Sync</div>
-    <p class="glossary-def">A synchronization strategy that only processes changes since the last sync &mdash; new, modified, or deleted items &mdash; rather than re-processing everything from scratch. "Delta" means "the difference."</p>
-    <p class="glossary-usage">In BSearch: the primary ongoing ingestion mechanism. Microsoft Graph delta queries return only files that changed since the last sync token. A timer-triggered delta sync runs every 12&ndash;24 hours as a fallback for any changes that webhooks might have missed. Delta tokens are stored in Cosmos DB.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Doc Summary</div>
-    <p class="glossary-def">A brief summary (~200 tokens) of an entire document's content, generated by an LLM. It acts as a semantic bridge &mdash; connecting the themes of distant sections within the same document.</p>
-    <p class="glossary-usage">In BSearch: generated by Haiku for documents that produce &ge;4 chunks. Indexed as <code>chunk_type: "doc_summary"</code> in Azure AI Search. Helps retrieval find the right document even when no single chunk matches the query well. Sibling chunk retrieval (injecting doc summaries alongside related chunks at query time) is deferred to v2.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Embedding</div>
-    <p class="glossary-def">A list of numbers (a vector) that represents the meaning of a piece of text. Texts with similar meanings produce vectors that point in similar directions, enabling semantic search &mdash; finding content by meaning rather than exact keywords.</p>
-    <p class="glossary-usage">In BSearch: every document chunk and every search query is converted into a 1024-dimensional embedding vector using Voyage AI's voyage-context-3 model. These vectors are stored in Azure AI Search and compared via cosine similarity during vector search. The system supports scaling to 2048 dimensions via Matryoshka Representation Learning if needed.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Entity Extraction</div>
-    <p class="glossary-def">The process of identifying and extracting structured information &mdash; company names, people, financial figures, deal stages &mdash; from unstructured document text. A subset of Named Entity Recognition, focused on domain-specific entities.</p>
-    <p class="glossary-usage">In BSearch: during ingestion, Haiku extracts deal-level entities (company names, roles, industries, financial metrics, deal stage, key contacts) from documents. These entities are written to Neo4j as nodes and relationships, and key fields (deal_id, doc_type, industries, company_roles) are stored as filterable fields on each chunk in Azure AI Search.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Extended Thinking</div>
-    <p class="glossary-def">A Claude feature that allocates a separate "thinking" budget before generating the visible response. The model reasons through the problem internally &mdash; planning, cross-referencing, and organizing &mdash; before writing its answer, producing higher-quality output for complex tasks.</p>
-    <p class="glossary-usage">In BSearch: enabled for multi-doc synthesis queries with a budget of ~2,000 thinking tokens. This lets Claude organize cross-document reasoning (comparing deals, aggregating findings) before streaming the answer. Not used for file lookup or data extraction queries where speed matters more than reasoning depth.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Fan-out / Fan-in</div>
-    <p class="glossary-def">A workflow pattern where a single task spawns many parallel sub-tasks (fan-out), waits for all of them to complete, then aggregates the results (fan-in). Common in distributed processing when you need to apply the same operation to many items concurrently.</p>
-    <p class="glossary-usage">In BSearch: the bulk ingestion orchestrator uses this Durable Functions pattern. A single orchestrator fans out to process thousands of documents in parallel (each getting parsed, chunked, embedded, and indexed), then fans in to report completion status and update sync tokens.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">FastAPI</div>
-    <p class="glossary-def">A modern Python web framework for building APIs. It uses Python type hints for automatic request validation and documentation, supports asynchronous request handling, and is one of the fastest Python frameworks available.</p>
-    <p class="glossary-usage">In BSearch: the query API runs on FastAPI, deployed to Azure App Service. It handles the full query pipeline: classification, expansion, hybrid search, reranking, confidence gating, and Claude synthesis streaming. FastAPI's native async support is essential for the parallel execution of classification and embedding tasks.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">File Lookup</div>
-    <p class="glossary-def">A query type where the user wants to locate a specific document &mdash; they want a link to open it, not information extracted from it.</p>
-    <p class="glossary-usage">In BSearch: one of three query types. Detected by regex fast path (filename with extension, or locator verb + document name with no content-question words) or by Haiku classification. Uses BM25-heavy search on the file_name field, returns top-1 with a direct link. Skips embedding entirely &mdash; BM25 on filenames is sufficient. Claude generates a terse response with the link and minimal context.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Graph API (Microsoft)</div>
-    <p class="glossary-def">Microsoft's unified API for accessing data across Microsoft 365 services &mdash; SharePoint, OneDrive, Outlook, Teams, and more. It provides a single endpoint for reading files, user profiles, emails, calendar events, and organizational data.</p>
-    <p class="glossary-usage">In BSearch: the data source for all document content. The ingestion pipeline uses Graph API to enumerate SharePoint sites and OneDrive drives, download file content, and track changes via delta queries. Graph API webhooks provide near-real-time notifications when files are created, modified, or deleted.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">HNSW (Hierarchical Navigable Small World)</div>
-    <p class="glossary-def">An algorithm for efficiently searching through millions of high-dimensional vectors. It builds a layered graph structure where each layer provides a progressively coarser view, enabling fast approximate nearest-neighbor search without scanning every vector.</p>
-    <p class="glossary-usage">In BSearch: the vector index algorithm used by Azure AI Search to find chunks whose embeddings are most similar to the query embedding. HNSW enables sub-second vector search across millions of chunk embeddings (the ~550K documents produce roughly 2.2M chunks).</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Hybrid Search</div>
-    <p class="glossary-def">A search strategy that combines two complementary approaches: keyword search (BM25) for exact term matching and vector search for semantic meaning matching. The results from both are merged, capturing documents that match either by words or by concepts.</p>
-    <p class="glossary-usage">In BSearch: every non-file-lookup query uses hybrid search. BM25 catches exact company names, deal terms, and financial jargon that vectors might miss. Vector search catches conceptually related content even when wording differs. Azure AI Search runs both in a single query and merges results using Reciprocal Rank Fusion. If the embedding times out, the system falls back to BM25-only.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Index (Search Index)</div>
-    <p class="glossary-def">A structured data store optimized for fast retrieval. Like a book's index, it lets you find information quickly without scanning every page. In search systems, an index stores pre-processed content (text, vectors, metadata) in a format designed for rapid querying.</p>
-    <p class="glossary-usage">In BSearch: the Azure AI Search index (named <code>bsearch-v1</code>) stores all document chunks with their text content, 1024-dimensional embedding vectors, and metadata fields (doc_type, deal_id, source_folder, is_canonical, duplicate_group_id, industries, company_roles, deal_status). The index schema is defined in Bicep and supports blue-green re-indexing for embedding model swaps.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Ingestion Pipeline</div>
-    <p class="glossary-def">The end-to-end process that takes raw documents and transforms them into searchable, indexed content. It includes downloading files, parsing their content, splitting them into chunks, generating embeddings, extracting entities, and storing everything in the search index.</p>
-    <p class="glossary-usage">In BSearch: runs as Azure Durable Functions with format-aware parsers for Word (python-docx), Excel (openpyxl), PowerPoint (python-pptx), and PDF (Azure Document Intelligence). After parsing, content is chunked, embedded via Voyage AI, enriched with entity metadata via Haiku, and indexed into Azure AI Search. Entity data is written to Neo4j. The same pipeline handles bulk ingestion, webhook-triggered updates, and periodic delta syncs.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Knowledge Graph</div>
-    <p class="glossary-def">A database that stores information as entities (things) and relationships (connections between things) in a graph structure. Unlike tables, graphs naturally represent complex webs of relationships &mdash; which company is the target of which deal, who advises whom, how entities relate across transactions.</p>
-    <p class="glossary-usage">In BSearch: Neo4j Aura stores the knowledge graph with nodes for Deals, Companies, People, and StageEntry records. Relationships capture roles (ADVISED_BY, TARGET_OF, ACQUIRER_OF), affiliations (WORKS_AT), and stage progression. At query time, entity context from the graph is injected into Claude's synthesis prompt, and graph traversals answer relationship questions ("Which companies has Berenson advised in healthcare?").</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">LRU Cache (Least Recently Used Cache)</div>
-    <p class="glossary-def">A fixed-size in-memory store that keeps the most recently accessed items and automatically evicts the oldest when full. It speeds up repeated operations by returning cached results instead of recomputing them.</p>
-    <p class="glossary-usage">In BSearch: an in-memory LRU cache (~1,000 entries) stores query-to-embedding mappings. Before calling Voyage AI for a query embedding, the cache is checked first (~0ms on hit). This reduces latency and API costs for repeated or similar queries, and provides a fallback data source if the embedding service is temporarily unavailable.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Matryoshka Representation Learning (MRL)</div>
-    <p class="glossary-def">A training technique that produces embedding vectors where the first N dimensions are themselves a valid (lower-resolution) embedding. Like nested Russian dolls, you can truncate the vector to a smaller size and still get useful similarity scores &mdash; just with less precision.</p>
-    <p class="glossary-usage">In BSearch: Voyage AI's voyage-context-3 supports MRL. The system uses 1024 dimensions by default but can scale to 2048 dimensions for higher precision without re-training the model or changing the embedding pipeline &mdash; only the index configuration needs updating.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Mermaid</div>
-    <p class="glossary-def">A JavaScript library that renders diagrams from text descriptions. You write a simple text-based syntax (like a flowchart or sequence diagram), and Mermaid converts it into a visual diagram in the browser.</p>
-    <p class="glossary-usage">In BSearch: used throughout this technical guide to render architecture diagrams, flow charts, and sequence diagrams directly in the HTML pages without requiring image files. The Mermaid library is loaded from a CDN and initializes on page load.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Multi-Doc Synthesis</div>
-    <p class="glossary-def">The process of reading across multiple documents and composing a single, coherent answer that draws on information from all of them. This requires the AI to reason about relationships, identify patterns, and reconcile potentially conflicting information from different sources.</p>
-    <p class="glossary-usage">In BSearch: one of three query types, used for broad questions like "What healthcare deals have we worked on?" or "Where do we stand on the Acme process?" Retrieval expands to top-10 chunks through reranking. Claude uses extended thinking (~2,000 token budget) with a structured extraction-then-synthesis prompt. Pre-computed deal summaries reduce the reasoning burden. TTFT target is relaxed to 5 seconds (vs. 3 seconds for other query types).</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Neo4j</div>
-    <p class="glossary-def">A graph database that stores data as nodes (entities) and relationships (connections), with properties on both. It uses the Cypher query language, which is designed for traversing and pattern-matching across graph structures.</p>
-    <p class="glossary-usage">In BSearch: Neo4j Aura hosts the knowledge graph. Entity extraction during ingestion writes Deal, Company, and People nodes with their relationships. At query time, Cypher queries retrieve entity context (deal status, financials, company roles, stage history) that is injected into Claude's prompt. For cross-deal queries, a composable Cypher query builder constructs traversals dynamically. Free tier for dev; ~$65/month Pro tier for production.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">NER (Named Entity Recognition)</div>
-    <p class="glossary-def">A natural language processing task that identifies and classifies named entities in text &mdash; such as people, companies, locations, dates, and monetary amounts &mdash; into predefined categories.</p>
-    <p class="glossary-usage">In BSearch: entity extraction during ingestion is a form of NER, performed by Haiku rather than a traditional NER model. Haiku identifies domain-specific entities (company names with roles, deal stages, financial metrics, industry classifications) that a generic NER system would miss or miscategorize in investment banking documents.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">OData</div>
-    <p class="glossary-def">A standardized query protocol that lets you filter, sort, and select data using URL parameters. It provides a SQL-like filtering syntax that can be appended to API requests.</p>
-    <p class="glossary-usage">In BSearch: Azure AI Search uses OData filter expressions to enforce permissions and entity-aware narrowing. Every search query includes <code>source_folder</code> and <code>is_canonical eq true</code> filters. Entity-aware queries add filters like <code>industries/any(i: i eq 'healthcare')</code> or <code>deal_status eq 'active'</code>.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">OIDC (OpenID Connect)</div>
-    <p class="glossary-def">An authentication protocol built on top of OAuth 2.0 that lets applications verify a user's identity through a trusted provider (like Microsoft) and obtain basic profile information. The user signs in once with the provider and the application receives a verified identity token.</p>
-    <p class="glossary-usage">In BSearch: Azure Static Web Apps uses platform-managed OIDC with Azure AD. Users authenticate with their existing Berenson M365 credentials. The OIDC token is validated by the FastAPI backend to determine user identity and folder permissions.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Query Expansion</div>
-    <p class="glossary-def">The technique of adding related terms, synonyms, and alternative phrasings to a search query before executing it. This improves recall by matching documents that use different words to express the same concept.</p>
-    <p class="glossary-usage">In BSearch: two-layer expansion with zero added latency. Layer 1: a static IB synonym map (<code>ib_synonyms.json</code>) expands terms like "comp" to "comparable companies, precedent transactions, trading comps." Layer 2: Haiku generates 2&ndash;3 reformulations as part of the classification call (already running in parallel with embedding). Expansions enrich BM25 only; vector search uses the original query. Cohere reranker scores against the original query to filter expansion noise.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Query Pipeline</div>
-    <p class="glossary-def">The sequence of processing steps that transforms a user's natural-language question into a final answer. Each stage refines, retrieves, filters, ranks, or synthesizes until a response is ready.</p>
-    <p class="glossary-usage">In BSearch: the pipeline has five stages, executed in the FastAPI backend. (1) Query classification + expansion (regex or Haiku, in parallel with embedding). (2) Entity context lookup from Neo4j if entity intent is detected. (3) Hybrid search in Azure AI Search with permission and entity filters. (4) Cohere reranking of top-20 to top-5, with confidence gating. (5) Claude streaming synthesis with retrieved chunks and optional entity context.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Reranking</div>
-    <p class="glossary-def">A second-pass relevance scoring step applied to an initial set of search results. A more expensive but more accurate model re-evaluates each candidate against the original query, producing a refined ranking that better reflects true relevance.</p>
-    <p class="glossary-usage">In BSearch: Cohere Rerank re-scores the top 20 candidates from hybrid search down to the top 5 (or top 10 for multi-doc synthesis). Scoring is against the original query, not the expanded version, so expansion noise is filtered out. Rerank scores also drive confidence gating &mdash; the highest score determines whether the system proceeds with HIGH, LOW, or NONE confidence.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Scoring Profile</div>
-    <p class="glossary-def">A set of rules in Azure AI Search that adjusts how results are ranked beyond basic text or vector matching. Scoring profiles can boost results based on field values, freshness, geographic proximity, or custom weights.</p>
-    <p class="glossary-usage">In BSearch: a recency scoring profile boosts more recently modified documents in search results. This helps surface the latest version of a document when multiple versions exist and addresses the firm's core pain point of working from outdated files.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">SHA-256</div>
-    <p class="glossary-def">A cryptographic hash function that takes any input and produces a fixed 256-bit (64-character hex) fingerprint. Even a tiny change in the input produces a completely different hash, making it useful for detecting whether content has changed.</p>
-    <p class="glossary-usage">In BSearch: used during ingestion to generate content hashes for document chunks. When a document is re-ingested (via webhook or delta sync), chunk hashes are compared against stored values to determine whether re-embedding is necessary, avoiding redundant Voyage AI API calls for unchanged content.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Source Folder</div>
-    <p class="glossary-def">A top-level folder in SharePoint or OneDrive that serves as both an organizational unit and a permission boundary. Access is granted or denied at the folder level, not per individual file.</p>
-    <p class="glossary-usage">In BSearch: there are 5 top-level source folders. Each chunk in the search index carries a <code>source_folder</code> field. Every search query includes an OData filter that restricts results to folders the authenticated user has access to, enforcing the firm's existing permission model without any per-file ACL complexity.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">SSE (Server-Sent Events)</div>
-    <p class="glossary-def">A web standard for pushing real-time updates from a server to a browser over a single HTTP connection. Unlike WebSockets (which are bidirectional), SSE is one-way: the server streams data to the client. Simple, reliable, and works through most firewalls and proxies.</p>
-    <p class="glossary-usage">In BSearch: the FastAPI backend streams Claude's synthesis response to the React frontend via SSE. As Claude generates each token, it is pushed to the browser in real time, giving the user visible progress within seconds of submitting a query. SSE events also carry metadata like <code>degraded_reranker: true</code> to trigger UI indicators.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Streaming</div>
-    <p class="glossary-def">Sending data incrementally as it becomes available rather than waiting for the entire result to be ready. In the context of LLMs, streaming means sending each generated token to the user as soon as it is produced, so the response appears word-by-word in real time.</p>
-    <p class="glossary-usage">In BSearch: Claude's synthesis response is streamed via SSE from FastAPI to the React frontend. This is critical for perceived latency &mdash; the user sees the first words of the answer within 3&ndash;5 seconds (TTFT), even though the full response may take 10&ndash;15 seconds to complete. Without streaming, users would stare at a blank screen until the entire response was finished.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Synonym Map</div>
-    <p class="glossary-def">A lookup table that maps a word or phrase to a set of equivalent or related terms. When a search query contains a mapped term, the system automatically includes the synonyms, improving recall without requiring the user to guess the exact wording used in documents.</p>
-    <p class="glossary-usage">In BSearch: a curated JSON file (<code>ib_synonyms.json</code>) loaded at startup. Maps IB-specific terms &mdash; e.g., "comp" to ["comparable companies," "trading comps," "precedent transactions"], "lbo" to ["leveraged buyout," "LBO model," "buyout model"]. Applied to the BM25 portion of hybrid search only (not vector). Editable without redeployment.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">TTFT (Time to First Token)</div>
-    <p class="glossary-def">The elapsed time from when a user submits a query to when the first word of the AI-generated response appears on screen. A key measure of perceived responsiveness in streaming systems &mdash; even if the full answer takes longer, a fast TTFT makes the system feel instant.</p>
-    <p class="glossary-usage">In BSearch: the primary latency target. File lookup and data extraction queries target &lt;3-second TTFT. Multi-doc synthesis queries target &lt;5-second TTFT (with a "Searching across multiple documents..." indicator). Every stage of the query pipeline is optimized to minimize TTFT: parallel classification and embedding, LRU caching, reranker health monitoring, and streaming synthesis.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Vector Search</div>
-    <p class="glossary-def">A search technique that finds content by comparing the mathematical meaning of a query against the mathematical meaning of indexed content. Instead of matching keywords, it compares embedding vectors using similarity measures like cosine similarity, finding content that is conceptually related even when different words are used.</p>
-    <p class="glossary-usage">In BSearch: one half of hybrid search. Vector search uses HNSW-indexed 1024-dimensional embeddings from Voyage AI to find chunks whose meaning is closest to the query. It catches conceptual matches that keyword search misses (e.g., a query about "valuation" matching a chunk discussing "enterprise value multiples"). Falls back gracefully to BM25-only if the embedding service times out.</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Voyage AI</div>
-    <p class="glossary-def">An AI company specializing in embedding models optimized for retrieval and search. Their models convert text into high-quality vector representations with support for contextual embeddings and Matryoshka Representation Learning.</p>
-    <p class="glossary-usage">In BSearch: the embedding provider. The voyage-context-3 model generates 1024-dimensional contextual embeddings for both document chunks (at ingestion time, with full document context) and search queries (at query time). Selected over OpenAI's text-embedding-3-large for +14.24% chunk retrieval performance and native contextual embedding support. voyage-4-large is the designated fallback model (drop-in, no pipeline changes required).</p>
-  </div>
-
-  <div class="glossary-entry">
-    <div class="glossary-term">Webhook</div>
-    <p class="glossary-def">A mechanism where one system automatically sends a notification to another when a specific event occurs. Instead of constantly polling ("did anything change?"), the source system pushes a message the moment something happens &mdash; a file is created, modified, or deleted.</p>
-    <p class="glossary-usage">In BSearch: Microsoft Graph API webhooks notify the ingestion pipeline within 30&ndash;120 seconds when files change in SharePoint or OneDrive. Webhook subscriptions are stored in Cosmos DB and renewed every 12 hours via a timer trigger. Webhooks trigger the same delta query + orchestrator pipeline used by periodic sync. A 12&ndash;24-hour delta sync timer runs as a safety net for any missed webhook events.</p>
+  <div class="key-takeaway">
+    <div class="callout-title">Key Takeaway</div>
+    <p>Phase 6 is where BSearch goes from &ldquo;it works in dev&rdquo; to &ldquo;it works for real.&rdquo; The five acceptance test queries prove the system answers the questions Berenson users actually ask. The bulk ingestion of 550K documents is a one-time, 18&ndash;36 hour operation costing ~$11&ndash;12K. After that, ongoing monthly cost is ~$395&ndash;510 for 18 users. The bootstrap deployment sequence ensures everything comes up in the right order, and the blue-green re-indexing strategy means future embedding model swaps happen with zero downtime.</p>
   </div>
 
   <nav class="chapter-nav bottom">
-    <a href="chapter-12.html">&larr; Previous</a>
+    <a href="chapter-12.html">&larr; Previous: Phase 5 &mdash; Web Frontend</a>
     <span class="nav-spacer">|</span>
     <a href="index.html">Contents</a>
+    <span class="nav-spacer">|</span>
+    <a href="chapter-14.html">Next: Design Decisions &rarr;</a>
   </nav>
 </div>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad: true, theme: 'neutral'});</script>
 </body>
 </html>

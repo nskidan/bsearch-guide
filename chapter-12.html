@@ -4,390 +4,744 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="light only">
-  <title>Chapter 12: Failure Modes &amp; Resilience &mdash; BSearch Technical Guide</title>
+  <title>Chapter 12: Phase 5 &mdash; Web Frontend &mdash; BSearch Technical Guide</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
 <div class="page-wrapper">
+
   <nav class="chapter-nav">
-    <a href="chapter-11.html">&larr; Previous: Key Design Decisions</a>
+    <a href="chapter-11.html">&larr; Previous: Phase 4 &mdash; Query Pipeline &amp; Synthesis</a>
     <span class="nav-spacer">|</span>
     <a href="index.html">Contents</a>
     <span class="nav-spacer">|</span>
-    <a href="chapter-13.html">Next: Glossary &rarr;</a>
+    <a href="chapter-13.html">Next: Phase 6 &mdash; Testing &amp; Go-Live &rarr;</a>
   </nav>
+
   <div class="chapter-header">
     <div class="chapter-number">Chapter 12</div>
-    <h1>Failure Modes &amp; Resilience</h1>
-    <p class="chapter-subtitle">What can go wrong, how the system recovers, and what you&rsquo;ll see as a user.</p>
+    <h1>Phase 5 &mdash; Web Frontend</h1>
+    <p class="chapter-subtitle">The user-facing web application &mdash; what people at Berenson actually interact with.</p>
   </div>
 
-  <p>No system runs perfectly all of the time. External APIs time out, files arrive corrupted, networks hiccup. The measure of a well-built system is not whether failures happen &mdash; it is how the system <em>responds</em> when they do. BSearch is designed around five resilience principles:</p>
+  <!-- ================================================================ -->
+  <!-- 12.1 What You're Building -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">12.1</span> What You're Building</h2>
 
-  <ol>
-    <li><strong>Every failure has a handler.</strong> Retry, fallback, or explicit error &mdash; nothing is silently swallowed.</li>
-    <li><strong>Fail fast on configuration errors.</strong> If the embedding provider is misconfigured, the app refuses to start rather than producing garbage results.</li>
-    <li><strong>User transparency.</strong> When quality is degraded, BSearch tells you with colored banners &mdash; it never pretends everything is fine when it is not.</li>
-    <li><strong>Self-healing.</strong> Most transient failures resolve automatically through retries, delta sync, or periodic maintenance jobs.</li>
-    <li><strong>Bounded degradation.</strong> Even in the worst non-catastrophic failure, BSearch still returns results &mdash; they are just less refined.</li>
-  </ol>
+  <p>This phase builds the thing people actually see: a React single-page application hosted on Azure Static Web Apps. Everything built in Phases 1 through 4 &mdash; the parsers, the index, the query pipeline &mdash; converges here into an interface that 18 people at Berenson will use every day. The web app connects to the FastAPI backend you built in Phase 4, consumes its SSE stream, and renders answers with inline citations, source cards, and confidence indicators.</p>
 
-  <div class="callout ib-analogy">
-    <div class="callout-title">IB Analogy</div>
-    <p>Think of BSearch&rsquo;s resilience like a deal team&rsquo;s backup plan. If the MD is stuck in another meeting, the VP runs the call. If the model is not ready, the team presents from the memo. The deal does not stop &mdash; it continues with a slightly leaner team. Similarly, BSearch always tries to give you an answer, even if some of its best tools are temporarily unavailable.</p>
+  <p>The design goal is a clean, fast interface that feels like a natural extension of the search experience. No cluttered navigation, no sidebar, no dashboard widgets. A search bar, an answer, and the sources behind it. When an analyst types a question at 11pm, the interface should get out of the way and deliver the answer as quickly as the pipeline can produce it.</p>
+
+  <p>There is one deliberate design choice that runs through every visual decision in this chapter: <strong>AI slop mitigation</strong>. The answer text renders in Instrument Serif (a serif font that gives AI answers a "written" feel, not a "generated" feel), there are no "AI Answer" labels, and every claim is visibly linked to a source document. The goal is trust through transparency &mdash; not through branding the output as artificial.</p>
+
+  <!-- ================================================================ -->
+  <!-- 12.2 Before You Start -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">12.2</span> Before You Start</h2>
+
+  <div class="before-you-start">
+    <div class="section-label">Before You Start</div>
+    <ul>
+      <li><strong>FastAPI backend running and tested</strong> (Phase 4 complete). The <code>/api/search</code> SSE endpoint should stream answers with citations, confidence tiers, follow-up suggestions, and degraded-reranker flags. You will be consuming this stream in the frontend.</li>
+      <li><strong>Azure Static Web Apps provisioned</strong> via the Phase 1 Bicep template (<code>infra/modules/staticwebapp.bicep</code>). The resource should exist in your Azure resource group with Azure AD authentication configured.</li>
+      <li><strong>Font choices confirmed:</strong>
+        <ul>
+          <li><strong>Instrument Serif</strong> &mdash; for answer text. A serif font that gives AI-generated content a "written" feel rather than a "generated" feel. Available on Google Fonts.</li>
+          <li><strong>JetBrains Mono</strong> &mdash; for numbers, financial figures, and code-like content (file names, paths). A monospace font with clear number distinction. Available on Google Fonts.</li>
+          <li>System sans-serif stack for UI elements (buttons, labels, navigation).</li>
+        </ul>
+      </li>
+      <li><strong>Node.js 18+ installed</strong> on your development machine for running Vite and the React dev server.</li>
+    </ul>
   </div>
 
-  <p>This chapter walks through every failure mode, organized by how much you &mdash; the user &mdash; would actually notice. Most failures are invisible. A few trigger a gentle banner. Only a handful result in an actual error screen.</p>
-
   <!-- ================================================================ -->
-  <!-- 12.1 Silent Failures -->
+  <!-- 12.3 The Spec -->
   <!-- ================================================================ -->
-  <h2><span class="section-number">12.1</span> Silent Failures &mdash; You Never Notice</h2>
+  <h2><span class="section-number">12.3</span> The Spec</h2>
 
-  <p>These are failures the system handles entirely on its own. You will never see an error message, and in most cases the issue resolves before it could ever affect a search result.</p>
+  <p>This section is the technical specification for Claude Code. It covers every page, component, interaction, and design constraint in the web application.</p>
 
-  <h3>Ingestion-Side Failures</h3>
+  <!-- 12.3.1 Project Setup -->
+  <h3>Project Setup</h3>
 
-  <p>These happen in the background when BSearch is pulling files from SharePoint and processing them into the search index.</p>
+  <p>The frontend lives in the <code>web/</code> directory of the BSearch monorepo. It is a Vite + React + TypeScript application deployed to Azure Static Web Apps.</p>
+
+  <pre><code>web/
+├── src/
+│   ├── components/
+│   │   ├── SearchBar.tsx
+│   │   ├── AnswerCard.tsx
+│   │   ├── SourceCard.tsx
+│   │   ├── CitationPopover.tsx
+│   │   ├── ConfidenceBanner.tsx
+│   │   ├── IntentChip.tsx
+│   │   ├── FollowUpSuggestions.tsx
+│   │   ├── FeedbackButtons.tsx
+│   │   ├── HistoryList.tsx
+│   │   └── DarkModeToggle.tsx
+│   ├── pages/
+│   │   ├── LandingPage.tsx
+│   │   ├── ResultsPage.tsx
+│   │   └── HistoryPage.tsx
+│   ├── hooks/
+│   │   ├── useSSEStream.ts
+│   │   ├── useDarkMode.ts
+│   │   └── useHistory.ts
+│   ├── services/
+│   │   └── api.ts
+│   ├── types/
+│   │   └── index.ts
+│   ├── App.tsx
+│   ├── main.tsx
+│   └── index.css
+├── public/
+├── index.html
+├── vite.config.ts
+├── tsconfig.json
+├── package.json
+└── staticwebapp.config.json</code></pre>
 
   <table>
     <thead>
       <tr>
-        <th>What Fails</th>
-        <th>What Happens</th>
-        <th>User Experience</th>
-        <th>Self-Healing?</th>
+        <th>Category</th>
+        <th>Packages</th>
       </tr>
     </thead>
     <tbody>
-      <tr class="failure-silent">
-        <td><strong>Graph API download</strong> (404, auth error, timeout)</td>
-        <td>Durable Functions retry the download automatically, then log and skip if retries are exhausted</td>
-        <td>One file is not indexed</td>
-        <td>Yes &mdash; next delta sync retries</td>
-      </tr>
-      <tr class="failure-silent">
-        <td><strong>Parser fails</strong> (corrupt or unsupported file)</td>
-        <td>try/except catches the error, logs it, skips the file</td>
-        <td>One file is not indexed</td>
-        <td>No &mdash; file must be fixed at the source</td>
-      </tr>
-      <tr class="failure-silent">
-        <td><strong>Voyage AI embedding</strong> (during ingestion)</td>
-        <td>Durable Functions retry with exponential backoff</td>
-        <td>Ingestion slows down temporarily</td>
-        <td>Yes &mdash; retries succeed once the service recovers</td>
-      </tr>
-      <tr class="failure-silent">
-        <td><strong>Neo4j deal record lookup</strong> (during ingestion)</td>
-        <td>Chunk gets per-file deal_name as fallback, queued for retry</td>
-        <td>Temporarily inconsistent deal name</td>
-        <td>Yes &mdash; self-heals on next successful ingestion</td>
-      </tr>
-      <tr class="failure-silent">
-        <td><strong>Neo4j write failure</strong> (during ingestion)</td>
-        <td>Chunks are written without entity fields, queued for retry</td>
-        <td>Entity filtering unavailable for this file</td>
-        <td>Yes &mdash; retry restores entity fields</td>
-      </tr>
-      <tr class="failure-silent">
-        <td><strong>Dedup Cosmos lookup timeout</strong></td>
-        <td>Skip dedup check, file indexed as canonical</td>
-        <td>Temporary duplicate results possible</td>
-        <td>Yes &mdash; periodic re-evaluation cleans up</td>
-      </tr>
-      <tr class="failure-silent">
-        <td><strong>Doc summary generation</strong> (Haiku 5s timeout)</td>
-        <td>Skip summary, doc indexed normally</td>
-        <td>Cross-section bridging unavailable for this doc</td>
-        <td>Yes &mdash; regenerated on file update</td>
-      </tr>
-      <tr class="failure-silent">
-        <td><strong>Deal summary generation</strong> (Haiku 8s timeout)</td>
-        <td>Skip summary, deal docs still individually searchable</td>
-        <td>Cross-deal aggregation slightly degraded</td>
-        <td>Yes &mdash; retried on next 6-hour cycle</td>
-      </tr>
-      <tr class="failure-silent">
-        <td><strong>Canonical name re-tagging</strong></td>
-        <td>Old deal_name persists on existing chunks</td>
-        <td>Older chunks show previous name</td>
-        <td>Yes &mdash; next ingestion triggers retag</td>
-      </tr>
-      <tr class="failure-silent">
-        <td><strong>Table splitter</strong> (no hierarchy detected)</td>
-        <td>Falls back to fixed-size row splits (~25 rows)</td>
-        <td>Slightly less precise table chunking</td>
-        <td>N/A &mdash; fallback is adequate</td>
-      </tr>
-    </tbody>
-  </table>
-
-  <h3>Query-Side Failures</h3>
-
-  <p>These happen in the few seconds between you pressing &ldquo;Search&rdquo; and seeing results.</p>
-
-  <table>
-    <thead>
       <tr>
-        <th>What Fails</th>
-        <th>What Happens</th>
-        <th>User Experience</th>
-        <th>Self-Healing?</th>
+        <td>Framework</td>
+        <td><code>react</code>, <code>react-dom</code>, <code>react-router-dom</code></td>
       </tr>
-    </thead>
-    <tbody>
-      <tr class="failure-silent">
-        <td><strong>Haiku classifier timeout</strong> (&gt;500ms)</td>
-        <td>Defaults to <code>data_extraction</code> intent</td>
-        <td>Slightly less optimal retrieval strategy</td>
-        <td>Yes &mdash; per-query, next query may succeed</td>
-      </tr>
-      <tr class="failure-silent">
-        <td><strong>Voyage AI query embedding timeout</strong> (&gt;500ms)</td>
-        <td>Falls back to BM25-only search (skip vector)</td>
-        <td>Slightly lower recall</td>
-        <td>Yes &mdash; per-query, cached next time</td>
-      </tr>
-      <tr class="failure-silent">
-        <td><strong>Cosmos DB write timeout</strong> (conversation log)</td>
-        <td>Fire-and-forget with logging</td>
-        <td>One conversation entry lost</td>
-        <td>Yes &mdash; next write succeeds</td>
-      </tr>
-      <tr class="failure-silent">
-        <td><strong>Webhook missed</strong></td>
-        <td>Delta sync catches up within 12&ndash;24 hours</td>
-        <td>Brief stale window</td>
-        <td>Yes &mdash; delta sync is the safety net</td>
-      </tr>
-      <tr class="failure-silent">
-        <td><strong>Neo4j query failure</strong> (at query time)</td>
-        <td>Skip alias expansion and entity context</td>
-        <td>Search works without entity enrichment</td>
-        <td>Yes &mdash; per-query transient</td>
-      </tr>
-      <tr class="failure-silent">
-        <td><strong>Extended thinking budget exhausted</strong></td>
-        <td>Claude truncates its reasoning, still generates answer</td>
-        <td>May miss some cross-chunk connections</td>
-        <td>N/A &mdash; inherent model limit</td>
-      </tr>
-    </tbody>
-  </table>
-
-  <div class="callout tip">
-    <div class="callout-title">Why so many &ldquo;silent&rdquo; failures?</div>
-    <p>This is by design. The majority of things that can go wrong are transient (a brief API timeout, a momentary network blip). Showing an error message for something that fixes itself in seconds would just be noise. BSearch logs every failure internally for monitoring, but only surfaces issues to you when they actually affect your experience.</p>
-  </div>
-
-  <!-- ================================================================ -->
-  <!-- 12.2 Graceful Visible Failures -->
-  <!-- ================================================================ -->
-  <h2><span class="section-number">12.2</span> Graceful Visible Failures &mdash; You See a Banner</h2>
-
-  <p>These failures are significant enough that you should know about them, but not severe enough to stop you from working. BSearch uses colored banners to communicate what is happening.</p>
-
-  <table>
-    <thead>
       <tr>
-        <th>What Fails</th>
-        <th>What Happens</th>
-        <th>What You See</th>
+        <td>Build</td>
+        <td><code>vite</code>, <code>@vitejs/plugin-react</code>, <code>typescript</code></td>
       </tr>
-    </thead>
-    <tbody>
-      <tr class="failure-graceful">
-        <td><strong>Cohere rerank API</strong> (error or timeout)</td>
-        <td>Skip reranking, use Azure Search&rsquo;s built-in ranking on the top 12 results, cap confidence at LOW</td>
-        <td>Orange banner: <em>&ldquo;Search quality may be reduced&rdquo;</em></td>
+      <tr>
+        <td>Auth</td>
+        <td><code>@azure/msal-browser</code>, <code>@azure/msal-react</code></td>
       </tr>
-      <tr class="failure-graceful">
-        <td><strong>LOW confidence</strong> (rerank scores 0.15&ndash;0.50)</td>
-        <td>Claude adds hedging language to its synthesis</td>
-        <td>Yellow banner: <em>&ldquo;Results may not fully answer your query&rdquo;</em></td>
+      <tr>
+        <td>Export</td>
+        <td><code>docx</code> (for .docx export of answers)</td>
       </tr>
-      <tr class="failure-graceful">
-        <td><strong>Multi-doc synthesis</strong> (5s+ time-to-first-token)</td>
-        <td>Streaming starts late but still completes</td>
-        <td><em>&ldquo;Searching across multiple documents...&rdquo;</em> visible for 2&ndash;3 seconds before text appears</td>
-      </tr>
-      <tr class="failure-graceful">
-        <td><strong>Relevance gate miscalibrated</strong></td>
-        <td>Valid queries incorrectly get &ldquo;not found&rdquo;</td>
-        <td>User sees no results (fixable by adjusting thresholds)</td>
+      <tr>
+        <td>Fonts</td>
+        <td>Google Fonts CDN: Instrument Serif, JetBrains Mono</td>
       </tr>
     </tbody>
   </table>
 
   <div class="callout info">
-    <div class="callout-title">Orange vs. Yellow Banners</div>
-    <p><strong>Orange</strong> means a system component failed and BSearch is running in a degraded mode &mdash; results are still useful but may not be as well-ranked. <strong>Yellow</strong> means the system is working normally but is not confident it found great results for your particular query. Both are informational &mdash; you can still trust and use the results.</p>
+    <div class="callout-title">Why Vite, not Create React App?</div>
+    <p>Create React App is effectively unmaintained. Vite starts the dev server in under 300ms, has native TypeScript support, and produces smaller production builds. For a project with 18 users, the build tooling choice barely matters &mdash; but Vite is what Claude Code will generate the cleanest output with.</p>
   </div>
 
-  <!-- ================================================================ -->
-  <!-- 12.3 Visible Errors -->
-  <!-- ================================================================ -->
-  <h2><span class="section-number">12.3</span> Visible Errors &mdash; Something Is Clearly Wrong</h2>
+  <!-- 12.3.2 Landing Page -->
+  <h3>Landing Page</h3>
 
-  <p>These are the rare failures where you see an actual error message or are interrupted. They typically mean a core service is down and BSearch cannot work around it.</p>
+  <p>The landing page is the first thing users see. It has three elements, centered vertically and horizontally:</p>
+
+  <ol>
+    <li><strong>BSearch wordmark</strong> &mdash; the product name rendered in large text. No logo image, just typeset text. Styled in Instrument Serif at a large size.</li>
+    <li><strong>Pill-shaped search bar</strong> &mdash; a rounded-rectangle input field, roughly 600px wide, centered below the wordmark. Placeholder text: <em>"Ask anything about Berenson's documents..."</em>. On submit (Enter or click), navigates to the results page.</li>
+    <li><strong>5 example queries</strong> &mdash; clickable text chips below the search bar. Each one is a real BSearch query. Clicking any chip populates the search bar and immediately fires the search.</li>
+  </ol>
+
+  <p>The five example queries match the acceptance test queries from Chapter 1:</p>
 
   <table>
     <thead>
       <tr>
-        <th>What Fails</th>
-        <th>What Happens</th>
-        <th>What You See</th>
+        <th>#</th>
+        <th>Example Query</th>
       </tr>
     </thead>
     <tbody>
-      <tr class="failure-visible">
-        <td><strong>Azure AI Search down</strong></td>
-        <td>503 error from the search service</td>
-        <td><em>&ldquo;Search unavailable&rdquo;</em> error message</td>
+      <tr>
+        <td>1</td>
+        <td><em>"Where's the latest GovTech deck?"</em></td>
       </tr>
-      <tr class="failure-visible">
-        <td><strong>Claude synthesis failure</strong></td>
-        <td>Return raw search results as source cards</td>
-        <td>Degraded but functional &mdash; you see sources without AI synthesis</td>
+      <tr>
+        <td>2</td>
+        <td><em>"Which firms did we reach out to for Govini?"</em></td>
       </tr>
-      <tr class="failure-visible">
-        <td><strong>Azure AD token expired/invalid</strong></td>
-        <td>401 Unauthorized</td>
-        <td>Brief redirect to Microsoft login page</td>
+      <tr>
+        <td>3</td>
+        <td><em>"Find me a good situation overview slide for a banking deal"</em></td>
       </tr>
-      <tr class="failure-visible">
-        <td><strong>Embedding provider misconfigured</strong></td>
-        <td>App refuses to start, health check fails</td>
-        <td>App down until configuration is fixed (fail-fast)</td>
+      <tr>
+        <td>4</td>
+        <td><em>"What multiple did we use for [deal name]?"</em></td>
+      </tr>
+      <tr>
+        <td>5</td>
+        <td><em>"Where do we stand on our active deals?"</em></td>
       </tr>
     </tbody>
   </table>
 
-  <p>Notice that even within visible errors, BSearch tries to degrade gracefully. If Claude fails, you still get the source documents as clickable cards. The system only shows a full error screen when the search index itself is unreachable &mdash; because at that point, there is genuinely nothing to show.</p>
+  <p>Design constraints: no sidebar, no navigation bar, no footer. The landing page is deliberately minimal. A small history icon (clock) and dark mode toggle sit in the top-right corner &mdash; unobtrusive but accessible.</p>
 
-  <!-- ================================================================ -->
-  <!-- 12.4 Infrastructure Concerns -->
-  <!-- ================================================================ -->
-  <h2><span class="section-number">12.4</span> Infrastructure-Level Concerns</h2>
+  <!-- 12.3.3 Results Page -->
+  <h3>Results Page</h3>
 
-  <p>These are behind-the-scenes issues that affect the system&rsquo;s ability to maintain and update the search index. They are invisible to users in the short term but could affect data freshness if left unresolved.</p>
+  <p>When the user submits a query, the interface transitions to the results page. The key layout change: the search bar slides from the center of the page to a sticky topbar, freeing the viewport for the answer.</p>
+
+  <h4>Topbar</h4>
+
+  <p>The sticky topbar contains the search bar (now in its compact form), the history icon, and the dark mode toggle. The search bar retains its pill shape but is narrower in topbar mode. The user can edit and re-submit a query without returning to the landing page.</p>
+
+  <h4>Answer Area</h4>
+
+  <p>The main content area renders the AI-synthesized answer. Key rendering rules:</p>
+
+  <ul>
+    <li><strong>Font:</strong> Instrument Serif for answer body text. This is the single most important anti-slop decision &mdash; serif text reads as "written" rather than "generated."</li>
+    <li><strong>Streaming:</strong> Text appears word-by-word as it arrives from the SSE stream. The cursor (a blinking bar) sits at the end of the currently rendered text.</li>
+    <li><strong>Inline citations:</strong> Numbered references like <code>[1]</code>, <code>[2]</code>, <code>[3]</code> appear inline within the answer text. These are rendered as small, clickable badges.</li>
+    <li><strong>No "AI Answer" label.</strong> No badge, no disclaimer, no "Generated by AI" banner. The user knows what BSearch is. Trust their intelligence.</li>
+    <li><strong>No emoji, no markdown artifacts.</strong> If Claude's output contains raw markdown symbols (like <code>**bold**</code> that did not parse), strip them. No emoji in synthesized answers.</li>
+  </ul>
+
+  <h4>Citation Popovers</h4>
+
+  <p>When the user hovers over a citation badge (e.g., <code>[1]</code>), a popover appears showing:</p>
+
+  <ul>
+    <li>Source file name</li>
+    <li>A brief excerpt from the cited chunk (first ~100 characters)</li>
+    <li>"Open in SharePoint" link</li>
+  </ul>
+
+  <p>The popover is positioned above or below the badge (whichever has more viewport space). It dismisses on mouse-out or Escape. For keyboard users, popovers open on focus and close on blur or Escape.</p>
+
+  <h4>Confidence Banners</h4>
+
+  <p>Banners appear between the topbar and the answer area. They communicate search quality to the user:</p>
 
   <table>
     <thead>
       <tr>
-        <th>Issue</th>
-        <th>How BSearch Handles It</th>
+        <th>Confidence Level</th>
+        <th>Banner Color</th>
+        <th>Message</th>
       </tr>
     </thead>
     <tbody>
-      <tr class="failure-silent">
-        <td><strong>Index quota exceeded</strong></td>
-        <td>Alert fires via Application Insights. New files are not indexed until storage is freed, but existing searches continue normally.</td>
+      <tr>
+        <td>HIGH</td>
+        <td>None (no banner)</td>
+        <td>&mdash;</td>
       </tr>
-      <tr class="failure-silent">
-        <td><strong>Re-index orchestrator crash</strong></td>
-        <td>Durable Functions checkpointing resumes from the last completed batch. The old index continues serving searches in the meantime.</td>
+      <tr>
+        <td>LOW</td>
+        <td>Yellow / amber</td>
+        <td><em>"Limited results &mdash; answer may be incomplete"</em></td>
       </tr>
-      <tr class="failure-silent">
-        <td><strong>Re-index validation failure</strong></td>
-        <td>Blocks the flip to the new index. The old index keeps serving &mdash; users never see incomplete data.</td>
+      <tr>
+        <td>NONE</td>
+        <td>Red</td>
+        <td><em>"No relevant results found"</em></td>
       </tr>
-      <tr class="failure-silent">
-        <td><strong>Concurrent ingestion during re-index</strong> (target write fails)</td>
-        <td>The old index already has the file. The gap is caught by post-flip validation.</td>
-      </tr>
-      <tr class="failure-silent">
-        <td><strong>Dedup false positive</strong> (different files grouped together)</td>
-        <td>Cosine similarity threshold of 0.95 plus same-folder constraint minimizes this risk. Non-canonical chunks remain indexed for periodic re-evaluation.</td>
+      <tr>
+        <td>Reranker degraded</td>
+        <td>Orange</td>
+        <td><em>"Search quality temporarily reduced"</em></td>
       </tr>
     </tbody>
   </table>
 
-  <div class="callout ib-analogy">
-    <div class="callout-title">IB Analogy</div>
-    <p>The re-index process works like a CIM revision. The team prepares the updated version in a separate workspace. The old version stays live and available to buyers. Only when the new version passes QC does it replace the old one. If the new version has issues, the old version stays in circulation &mdash; nobody ever sees a half-finished document.</p>
+  <div class="callout info">
+    <div class="callout-title">Banners can stack</div>
+    <p>A query can trigger both a LOW confidence banner (yellow) and a reranker degraded banner (orange) simultaneously. They are independent signals: LOW means "the documents may not answer your query well," while degraded means "the system that selects the best documents is temporarily unavailable." When both appear, the orange banner renders above the yellow one.</p>
+  </div>
+
+  <h4>Intent Chip</h4>
+
+  <p>A subtle chip below the topbar shows the detected query type: <code>file lookup</code>, <code>data extraction</code>, or <code>multi-doc synthesis</code>. This is informational &mdash; it helps the user understand why results are structured the way they are (e.g., a file lookup returns a single link rather than a full synthesized answer). Styled as a small, muted pill with lowercase text.</p>
+
+  <h4>Deep Search Indicator</h4>
+
+  <p>For <code>multi_doc_synthesis</code> queries, the SSE stream includes <code>deep_search: true</code> in its initial metadata event. The frontend renders a distinct progress state: instead of the standard blinking cursor, a message reads <em>"Searching across multiple documents..."</em> This indicator may be visible for 2&ndash;3 seconds before text starts streaming. This is expected &mdash; the 5-second TTFT target for multi-doc queries means users need feedback that the system is working, not broken.</p>
+
+  <h4>Source Cards</h4>
+
+  <p>Below the answer, source cards list every document that was cited. Each card contains:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Field</th>
+        <th>Description</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>File name</td>
+        <td>The document title (e.g., <em>Catalyst CIM v3.pdf</em>)</td>
+      </tr>
+      <tr>
+        <td><code>doc_type</code> badge</td>
+        <td>A small colored pill: CIM, model, teaser, engagement letter, etc.</td>
+      </tr>
+      <tr>
+        <td>Last modified date</td>
+        <td>Rendered in JetBrains Mono (e.g., <code>Mar 15, 2025</code>)</td>
+      </tr>
+      <tr>
+        <td>Deep SharePoint link</td>
+        <td>A clickable "Open in SharePoint" button that uses the <code>m365_url</code> from the search result to open the file directly in SharePoint &mdash; not a folder page, the actual file</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>Source cards are ordered by citation number (matching the inline references in the answer). Each card has a citation number badge in its top-left corner so the user can visually connect <code>[1]</code> in the text to source card #1 below.</p>
+
+  <h4>Follow-Up Suggestions</h4>
+
+  <p>Below the source cards, 2&ndash;3 follow-up question chips appear. These are parsed from the Claude synthesis response (the <code>&lt;follow_ups&gt;</code> tag). Each chip is clickable &mdash; clicking it populates the search bar and fires a new search. Styled as bordered pill buttons that match the example query chips on the landing page.</p>
+
+  <h4>Feedback Buttons</h4>
+
+  <p>A thumbs-up and thumbs-down button pair appears next to the answer. Clicking either sends a POST to the <code>/api/feedback</code> endpoint with the <code>conversation_id</code> and the rating. The button that was clicked fills in to confirm the selection. Feedback is stored in the Cosmos DB <code>feedback</code> container (partition key: <code>conversation_id</code>).</p>
+
+  <h4>Export to .docx</h4>
+
+  <p>An "Export" button below the feedback buttons generates a Word document containing the answer text and a formatted source list. Uses the <code>docx</code> npm package for client-side generation. The exported document uses Instrument Serif for the answer body (embedded as a font in the .docx) and includes citation references matched to a "Sources" section at the bottom. File name format: <code>BSearch &mdash; {first 50 chars of query}.docx</code>.</p>
+
+  <h4>Mid-Stream Cancel</h4>
+
+  <p>While the answer is streaming, a "Stop" button appears below the streaming text. Clicking it aborts the SSE connection (calls <code>abort()</code> on the <code>AbortController</code>). The answer rendered so far stays on screen with source cards for any citations already received. The stop button is replaced by the normal feedback buttons once streaming completes or is cancelled.</p>
+
+  <!-- 12.3.4 History Page -->
+  <h3>History Page</h3>
+
+  <p>The history page shows a chronological list of past conversations. It is accessible from the clock icon in the topbar.</p>
+
+  <ul>
+    <li><strong>Day-grouped:</strong> Entries are grouped under date headers &mdash; "Today," "Yesterday," or the date (e.g., "March 23, 2026"). Each entry shows the query text and a truncated preview of the answer (first ~80 characters).</li>
+    <li><strong>Infinite scroll:</strong> Loads more entries as the user scrolls down. Uses Cosmos DB cursor-based pagination on the <code>conversations</code> container (partition key: <code>user_id</code>), not offset-based pagination. Each page request includes the continuation token from the previous response.</li>
+    <li><strong>Click to re-open:</strong> Clicking an entry navigates to the results page and displays the full saved conversation (query, answer, sources). Re-opened conversations show the cached answer &mdash; they do not re-run the search.</li>
+  </ul>
+
+  <div class="definition">
+    <p><span class="term">Cursor-based pagination</span> &mdash; Instead of requesting "page 5" (which requires counting through all previous entries), each response includes a token that says "start from here next time." This is faster and more reliable for growing datasets &mdash; like using a bookmark in a book instead of counting pages from the beginning.</p>
+  </div>
+
+  <!-- 12.3.5 SSE Stream Consumption -->
+  <h3>SSE Stream Consumption</h3>
+
+  <p>The frontend connects to the FastAPI <code>/api/search</code> endpoint using the browser's native <code>EventSource</code> API (or a <code>fetch</code> + <code>ReadableStream</code> approach if custom headers are needed for auth tokens). The SSE stream sends these event types:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Event Type</th>
+        <th>Payload</th>
+        <th>Frontend Action</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>metadata</code></td>
+        <td><code>{ confidence, degraded_reranker, deep_search, intent, conversation_id }</code></td>
+        <td>Render confidence banners, intent chip, deep search indicator</td>
+      </tr>
+      <tr>
+        <td><code>token</code></td>
+        <td><code>{ text }</code></td>
+        <td>Append to answer text, parse inline citations</td>
+      </tr>
+      <tr>
+        <td><code>sources</code></td>
+        <td><code>[ { file_name, doc_type, last_modified, m365_url, excerpt } ]</code></td>
+        <td>Render source cards</td>
+      </tr>
+      <tr>
+        <td><code>follow_ups</code></td>
+        <td><code>[ "question 1", "question 2", "question 3" ]</code></td>
+        <td>Render follow-up suggestion chips</td>
+      </tr>
+      <tr>
+        <td><code>done</code></td>
+        <td><code>{}</code></td>
+        <td>Stop cursor animation, show feedback buttons</td>
+      </tr>
+      <tr>
+        <td><code>error</code></td>
+        <td><code>{ message }</code></td>
+        <td>Show error message in the answer area</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>The <code>useSSEStream</code> hook manages the connection lifecycle: opening the stream on query submit, buffering tokens into a rendered string, parsing citation markers as they arrive, handling mid-stream cancellation, and cleaning up on unmount. Token text is appended to a React state variable using a ref-based approach to avoid re-render storms (update the ref on every token, batch-flush to state on <code>requestAnimationFrame</code>).</p>
+
+  <!-- 12.3.6 Search Bar Transition -->
+  <h3>Search Bar Transition</h3>
+
+  <p>The search bar has two modes:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Mode</th>
+        <th>Location</th>
+        <th>Width</th>
+        <th>Context</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Landing (centered)</td>
+        <td>Vertically and horizontally centered</td>
+        <td>~600px</td>
+        <td>Landing page</td>
+      </tr>
+      <tr>
+        <td>Topbar (compact)</td>
+        <td>Sticky top bar, left-aligned or centered</td>
+        <td>~400px</td>
+        <td>Results page, history page</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>The transition from centered to topbar is animated with a CSS transition (position, width, and top). The animation should take ~300ms with an ease-out curve. The <code>SearchBar</code> component accepts a <code>mode</code> prop (<code>"landing"</code> or <code>"topbar"</code>) and renders accordingly.</p>
+
+  <!-- 12.3.7 Dark Mode -->
+  <h3>Dark Mode</h3>
+
+  <p>The app supports dark mode via two mechanisms:</p>
+
+  <ol>
+    <li><strong>Auto-detect:</strong> On first load, the app checks the user's system preference via <code>prefers-color-scheme</code> media query and applies the matching theme.</li>
+    <li><strong>Manual toggle:</strong> A sun/moon icon button in the topbar lets the user override the system preference. The choice is persisted in <code>localStorage</code>.</li>
+  </ol>
+
+  <p>Dark mode is implemented with CSS custom properties on the <code>:root</code> element. A <code>data-theme="dark"</code> attribute on <code>&lt;html&gt;</code> switches the property values. Key color mappings:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Property</th>
+        <th>Light</th>
+        <th>Dark</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Background</td>
+        <td><code>#FFFFFF</code></td>
+        <td><code>#1A1A1A</code></td>
+      </tr>
+      <tr>
+        <td>Answer text</td>
+        <td><code>#2B2B2B</code></td>
+        <td><code>#E8E8E8</code></td>
+      </tr>
+      <tr>
+        <td>Source card bg</td>
+        <td><code>#F7F7F7</code></td>
+        <td><code>#2A2A2A</code></td>
+      </tr>
+      <tr>
+        <td>Citation badge</td>
+        <td><code>#E8EDF2</code></td>
+        <td><code>#3A4555</code></td>
+      </tr>
+      <tr>
+        <td>Confidence: LOW</td>
+        <td><code>#FFF3CD</code> (amber)</td>
+        <td><code>#4A3F1F</code> (dark amber)</td>
+      </tr>
+      <tr>
+        <td>Confidence: NONE</td>
+        <td><code>#F8D7DA</code> (red)</td>
+        <td><code>#4A1F1F</code> (dark red)</td>
+      </tr>
+      <tr>
+        <td>Degraded banner</td>
+        <td><code>#FFE0B2</code> (orange)</td>
+        <td><code>#4A351F</code> (dark orange)</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>The <code>useDarkMode</code> hook encapsulates the detection, toggle, and persistence logic. It returns <code>{ isDark, toggle }</code>.</p>
+
+  <!-- 12.3.8 Responsive Layout -->
+  <h3>Responsive Layout</h3>
+
+  <p>The results page has three responsive breakpoints:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Breakpoint</th>
+        <th>Width</th>
+        <th>Layout</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Wide</td>
+        <td>&gt;1200px</td>
+        <td>3-column: history sidebar (left), answer content (center), source panel (right)</td>
+      </tr>
+      <tr>
+        <td>Medium</td>
+        <td>1024&ndash;1200px</td>
+        <td>2-column: answer content (left), source panel (right). History accessible via icon.</td>
+      </tr>
+      <tr>
+        <td>Narrow</td>
+        <td>&lt;1024px</td>
+        <td>Single column: everything stacked vertically. Sources below the answer. History via icon.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>The wide layout's history sidebar shows the most recent 10&ndash;15 past queries (truncated to one line each) with a "View all" link that navigates to the full history page. This sidebar is hidden at medium and narrow breakpoints &mdash; history is accessible only via the clock icon.</p>
+
+  <p>Use CSS Grid for the multi-column layouts and media queries for breakpoint switching. The landing page is always single-column centered, regardless of viewport width.</p>
+
+  <!-- 12.3.9 Accessibility -->
+  <h3>Accessibility</h3>
+
+  <p>The web app must meet WCAG 2.1 AA for the following:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Requirement</th>
+        <th>Implementation</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>ARIA landmarks</td>
+        <td><code>role="main"</code> on the answer area, <code>role="search"</code> on the search bar, <code>role="navigation"</code> on the topbar, <code>role="complementary"</code> on the source panel</td>
+      </tr>
+      <tr>
+        <td>Keyboard navigation</td>
+        <td>Tab through all interactive elements (search bar, citation badges, source cards, follow-up chips, feedback buttons, dark mode toggle). Enter activates. Escape closes popovers.</td>
+      </tr>
+      <tr>
+        <td>Touch targets</td>
+        <td>All clickable elements have a minimum touch target of 44x44px on mobile breakpoints. This includes citation badges, follow-up chips, and feedback buttons.</td>
+      </tr>
+      <tr>
+        <td>Citation popovers</td>
+        <td>Screen reader friendly: popovers use <code>aria-describedby</code> linking the badge to the popover content. Announced as "Source 1: [file name], [excerpt]" when focused.</td>
+      </tr>
+      <tr>
+        <td>Streaming announcements</td>
+        <td>An <code>aria-live="polite"</code> region announces when the answer starts streaming and when it completes. Individual tokens are not announced (too noisy).</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- 12.3.10 Authentication -->
+  <h3>Authentication</h3>
+
+  <p>Azure Static Web Apps provides built-in Azure AD authentication via OIDC. Configuration lives in <code>staticwebapp.config.json</code>:</p>
+
+  <pre><code>{
+  "auth": {
+    "identityProviders": {
+      "azureActiveDirectory": {
+        "registration": {
+          "openIdIssuer": "https://login.microsoftonline.com/{tenant_id}/v2.0",
+          "clientIdSettingName": "AAD_CLIENT_ID",
+          "clientSecretSettingName": "AAD_CLIENT_SECRET"
+        }
+      }
+    }
+  },
+  "routes": [
+    { "route": "/api/*", "allowedRoles": ["authenticated"] },
+    { "route": "/*", "allowedRoles": ["authenticated"] }
+  ],
+  "navigationFallback": {
+    "rewrite": "/index.html"
+  }
+}</code></pre>
+
+  <p>All routes require authentication. The Static Web Apps platform handles the OIDC flow &mdash; no login page needs to be built. Unauthenticated users are automatically redirected to the Microsoft login page. The auth token is forwarded to the FastAPI backend via the <code>x-ms-client-principal</code> header that Static Web Apps injects automatically.</p>
+
+  <!-- 12.3.11 Component Summary -->
+  <h3>Component Summary</h3>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Component</th>
+        <th>Props</th>
+        <th>Responsibility</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>SearchBar</code></td>
+        <td><code>mode: "landing" | "topbar"</code>, <code>onSubmit</code>, <code>defaultValue</code></td>
+        <td>Pill-shaped input. Handles submit on Enter. Animated transition between modes.</td>
+      </tr>
+      <tr>
+        <td><code>AnswerCard</code></td>
+        <td><code>text</code>, <code>isStreaming</code>, <code>citations</code></td>
+        <td>Renders answer in Instrument Serif. Parses and renders inline citation badges. Shows blinking cursor while streaming.</td>
+      </tr>
+      <tr>
+        <td><code>SourceCard</code></td>
+        <td><code>fileName</code>, <code>docType</code>, <code>lastModified</code>, <code>m365Url</code>, <code>citationNumber</code></td>
+        <td>File info card with doc_type badge, date in JetBrains Mono, and deep SharePoint link.</td>
+      </tr>
+      <tr>
+        <td><code>CitationPopover</code></td>
+        <td><code>citationNumber</code>, <code>fileName</code>, <code>excerpt</code>, <code>m365Url</code></td>
+        <td>Hover/focus popover showing source preview. Positioned dynamically.</td>
+      </tr>
+      <tr>
+        <td><code>ConfidenceBanner</code></td>
+        <td><code>confidence: "HIGH" | "LOW" | "NONE"</code>, <code>degraded: boolean</code></td>
+        <td>Renders colored banner(s) based on confidence tier and reranker status.</td>
+      </tr>
+      <tr>
+        <td><code>IntentChip</code></td>
+        <td><code>intent: string</code></td>
+        <td>Subtle pill showing detected query type.</td>
+      </tr>
+      <tr>
+        <td><code>FollowUpSuggestions</code></td>
+        <td><code>suggestions: string[]</code>, <code>onSelect</code></td>
+        <td>Clickable question chips that trigger new searches.</td>
+      </tr>
+      <tr>
+        <td><code>FeedbackButtons</code></td>
+        <td><code>conversationId</code>, <code>onFeedback</code></td>
+        <td>Thumbs up/down pair. Sends feedback to API.</td>
+      </tr>
+      <tr>
+        <td><code>HistoryList</code></td>
+        <td><code>entries</code>, <code>onLoadMore</code>, <code>hasMore</code></td>
+        <td>Day-grouped list with infinite scroll. Cursor-based pagination.</td>
+      </tr>
+      <tr>
+        <td><code>DarkModeToggle</code></td>
+        <td><code>isDark</code>, <code>onToggle</code></td>
+        <td>Sun/moon icon button. Persists preference to localStorage.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- 12.3.12 AI Slop Mitigation -->
+  <h3>AI Slop Mitigation</h3>
+
+  <p>Every design choice in this app is made to avoid the look and feel of generic AI-generated output. This is not cosmetic &mdash; it directly affects whether senior bankers trust and use the tool.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Anti-Slop Decision</th>
+        <th>Implementation</th>
+        <th>Why It Matters</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Serif font for answers</td>
+        <td>Instrument Serif for all answer body text</td>
+        <td>Serif text reads as "written" not "generated." Sans-serif AI output (the ChatGPT look) triggers skepticism in professional settings.</td>
+      </tr>
+      <tr>
+        <td>No AI labels</td>
+        <td>No "AI Answer," "Generated by AI," or robot icons anywhere</td>
+        <td>The user typed a question into a search tool. They know the answer is AI-generated. Labeling it insults their intelligence and undermines confidence in the output.</td>
+      </tr>
+      <tr>
+        <td>Citation transparency</td>
+        <td>Every claim linked to a numbered source. Sources shown as cards with one-click deep links.</td>
+        <td>Trust comes from verifiability, not from disclaimers. If every fact can be traced to a document, the user can verify anything they want to verify.</td>
+      </tr>
+      <tr>
+        <td>Clean typography</td>
+        <td>No emoji in answers. No raw markdown artifacts. Proper typographic quotes and dashes.</td>
+        <td>Emoji and markdown cruft are AI tells. Professional output uses proper typography.</td>
+      </tr>
+      <tr>
+        <td>Numbers in monospace</td>
+        <td>Financial figures and dates in JetBrains Mono</td>
+        <td>Monospace numbers are easier to scan in financial context and signal precision. Standard in IB deliverables.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ================================================================ -->
+  <!-- 12.4 What to Tell Claude Code -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">12.4</span> What to Tell Claude Code</h2>
+
+  <div class="claude-prompt">
+    <div class="prompt-label">What to Tell Claude Code &mdash; Prompt 1: Project Setup + Landing Page</div>
+    <div class="prompt-text">Create the BSearch web frontend in web/ using Vite + React + TypeScript. Initialize with: npm create vite@latest web -- --template react-ts. Install dependencies: react-router-dom, @azure/msal-browser, @azure/msal-react, docx.<br><br>Set up Google Fonts: Instrument Serif (answer text) and JetBrains Mono (numbers, dates, file names). System sans-serif stack for UI elements.<br><br>Create the landing page with three centered elements:<br>1. BSearch wordmark in large Instrument Serif text<br>2. Pill-shaped search bar (~600px wide, rounded, placeholder: "Ask anything about Berenson's documents...")<br>3. Five clickable example query chips below the search bar: "Where's the latest GovTech deck?", "Which firms did we reach out to for Govini?", "Find me a good situation overview slide for a banking deal", "What multiple did we use for [deal name]?", "Where do we stand on our active deals?"<br><br>Clicking an example chip should populate the search bar and fire the search. Add a small clock icon (history) and dark mode toggle in the top-right corner.<br><br>Configure Azure Static Web Apps auth in staticwebapp.config.json: Azure AD OIDC, all routes require authenticated role, navigation fallback to index.html.<br><br>Set up the routing: / for landing, /search for results, /history for history page.</div>
+  </div>
+
+  <div class="claude-prompt">
+    <div class="prompt-label">What to Tell Claude Code &mdash; Prompt 2: Results Page + Streaming</div>
+    <div class="prompt-text">Build the BSearch results page. Create a useSSEStream hook that connects to the FastAPI /api/search SSE endpoint. Handle these event types: metadata (confidence, degraded_reranker, deep_search, intent, conversation_id), token (append text word-by-word), sources (array of source objects), follow_ups (array of suggested questions), done, error.<br><br>Use a ref-based buffering approach for tokens: update a ref on every token, flush to React state on requestAnimationFrame to avoid re-render storms.<br><br>Build these components:<br>- AnswerCard: renders answer text in Instrument Serif with streaming cursor. Parse inline citations [1][2][3] and render them as clickable badges.<br>- CitationPopover: hover/focus popover showing source file name, excerpt (~100 chars), and "Open in SharePoint" link. Position dynamically (above/below based on viewport). Use aria-describedby for screen readers.<br>- SourceCard: below the answer. Shows file name, doc_type badge (colored pill), last modified date in JetBrains Mono, and "Open in SharePoint" button using m365_url. Ordered by citation number with a citation badge in top-left corner.<br>- ConfidenceBanner: HIGH = no banner. LOW = yellow/amber "Limited results — answer may be incomplete". NONE = red "No relevant results found". degraded_reranker = orange "Search quality temporarily reduced". Banners can stack (orange above yellow).<br>- IntentChip: subtle muted pill showing detected query type (file lookup, data extraction, multi-doc synthesis).<br>- FollowUpSuggestions: 2-3 clickable question chips below source cards. Clicking fires a new search.<br>- FeedbackButtons: thumbs up/down. POST to /api/feedback with conversation_id and rating. Button fills on click.<br>- Export to .docx button: use the docx npm package to generate a Word doc with the answer text in Instrument Serif and a Sources section. File name: "BSearch — {first 50 chars of query}.docx".<br><br>Add a Stop button while streaming that calls abort() on the AbortController. Replace with feedback buttons when streaming completes or is cancelled.<br><br>For deep_search queries, show "Searching across multiple documents..." instead of the standard cursor until tokens start arriving.</div>
+  </div>
+
+  <div class="claude-prompt">
+    <div class="prompt-label">What to Tell Claude Code &mdash; Prompt 3: Search Bar Transition, History, Dark Mode, Responsive Layout, Accessibility</div>
+    <div class="prompt-text">Build the remaining BSearch frontend features:<br><br>1. SearchBar component with two modes: "landing" (centered, ~600px) and "topbar" (sticky top, ~400px). Animate the transition with CSS (position, width, top) over ~300ms ease-out. The topbar version stays sticky while scrolling results.<br><br>2. History page with HistoryList component. Day-grouped entries (Today, Yesterday, March 23, etc.). Each entry shows query text and ~80 char answer preview. Infinite scroll using Cosmos DB cursor pagination — pass continuation token from previous response to load more. Click an entry to re-open the saved conversation (show cached answer, don't re-run search).<br><br>3. Dark mode: auto-detect system preference via prefers-color-scheme media query on first load. Manual toggle via sun/moon icon. Persist choice to localStorage. Implement with CSS custom properties on :root and data-theme="dark" on html element. Key colors: background #FFFFFF/#1A1A1A, answer text #2B2B2B/#E8E8E8, source card bg #F7F7F7/#2A2A2A, citation badge #E8EDF2/#3A4555, LOW banner #FFF3CD/#4A3F1F, NONE banner #F8D7DA/#4A1F1F, degraded banner #FFE0B2/#4A351F.<br><br>4. Responsive layout with CSS Grid: wide (&gt;1200px) = 3-column (history sidebar, content, source panel), medium (1024-1200px) = 2-column (content + source panel), narrow (&lt;1024px) = single column stacked. History sidebar shows recent 10-15 queries with "View all" link. Hidden at medium/narrow breakpoints.<br><br>5. Accessibility: ARIA landmarks (role=main on answer area, role=search on search bar, role=navigation on topbar, role=complementary on source panel). Full keyboard navigation — Tab through all interactive elements, Enter activates, Escape closes popovers. 44px minimum touch targets on mobile. aria-live="polite" region announces streaming start and completion. Citation popovers use aria-describedby.</div>
   </div>
 
   <!-- ================================================================ -->
-  <!-- 12.5 Failure Cascade Diagram -->
+  <!-- 12.5 How to Verify -->
   <!-- ================================================================ -->
-  <h2><span class="section-number">12.5</span> How Failures Cascade into Fallbacks</h2>
+  <h2><span class="section-number">12.5</span> How to Verify</h2>
 
-  <p>The diagram below shows the key decision points during a search query. At each stage, if the primary path fails, BSearch falls back to the next-best option rather than giving up.</p>
-
-  <pre class="mermaid">
-flowchart TD
-    A["User submits query"] --> B{"Voyage AI\nembedding"}
-    B -->|Success| C["Hybrid search\n(vector + BM25)"]
-    B -->|Timeout| D["BM25-only search\n(keyword matching)"]
-
-    C --> E{"Cohere\nrerank"}
-    D --> E
-
-    E -->|Success| F["Top results by\nrelevance score"]
-    E -->|Failure| G["Azure Search ranking\n(confidence capped LOW)"]
-
-    F --> H{"Neo4j\nentity lookup"}
-    G --> I["Orange banner:\nquality may be reduced"]
-    I --> H
-
-    H -->|Success| J["Alias expansion +\nentity context"]
-    H -->|Failure| K["Skip enrichment,\nuse results as-is"]
-
-    J --> L{"Claude\nsynthesis"}
-    K --> L
-
-    L -->|Success| M["AI-generated answer\nwith source cards"]
-    L -->|Failure| N["Raw source cards\n(no AI summary)"]
-
-    style B fill:#f9f4ee,stroke:#D4793A
-    style E fill:#f9f4ee,stroke:#D4793A
-    style H fill:#f9f4ee,stroke:#D4793A
-    style L fill:#f9f4ee,stroke:#D4793A
-    style D fill:#fdf6f0,stroke:#C4612A,stroke-dasharray: 5 5
-    style G fill:#fdf6f0,stroke:#C4612A,stroke-dasharray: 5 5
-    style K fill:#fdf6f0,stroke:#C4612A,stroke-dasharray: 5 5
-    style N fill:#fdf6f0,stroke:#C4612A,stroke-dasharray: 5 5
-    style M fill:#eef5eb,stroke:#2E7D5B
-    style I fill:#fef3e8,stroke:#D4793A
-  </pre>
-
-  <p>Notice the pattern: each diamond is a decision point where a service might fail. Each dashed box is a fallback. The system always reaches one of the two green/orange endpoints at the bottom &mdash; either a full AI answer or raw source cards. It never dead-ends.</p>
+  <div class="verify-checklist">
+    <div class="section-label">How to Verify</div>
+    <ol>
+      <li><strong>Landing page renders correctly.</strong> Open the dev server (<code>npm run dev</code>). Verify the BSearch wordmark appears centered in Instrument Serif, the pill search bar is present, and all 5 example query chips are visible below it. Click an example chip &mdash; verify it populates the search bar and navigates to the results page.</li>
+      <li><strong>Streaming answer works.</strong> Submit a query against the running FastAPI backend. Verify the answer appears word-by-word in Instrument Serif (not all at once). Verify the blinking cursor tracks the end of the text. Verify the cursor disappears and feedback buttons appear when streaming completes.</li>
+      <li><strong>Citations are interactive.</strong> Hover over a citation badge (e.g., <code>[1]</code>) in the answer text. Verify a popover appears showing the source file name and a text excerpt. Click "Open in SharePoint" in the popover &mdash; verify it opens the correct file. Verify popover dismisses on mouse-out and Escape.</li>
+      <li><strong>Source cards render correctly.</strong> Below the answer, verify source cards appear with: file name, doc_type badge (colored pill), last modified date in JetBrains Mono, and "Open in SharePoint" button. Click the button &mdash; verify it opens the file directly in SharePoint (not a folder listing).</li>
+      <li><strong>Confidence banners display correctly.</strong> Test with the backend returning different confidence levels. Verify: HIGH shows no banner, LOW shows a yellow/amber banner, NONE shows a red banner. Simulate reranker degradation &mdash; verify the orange banner appears. Verify both LOW + degraded banners can appear simultaneously.</li>
+      <li><strong>Dark mode works.</strong> Toggle the dark mode switch. Verify background, text, source cards, citation badges, and confidence banners all switch colors. Verify the toggle state persists after page refresh (check localStorage). Set your OS to dark mode, clear localStorage, reload &mdash; verify the app auto-detects dark mode.</li>
+      <li><strong>History page works.</strong> Navigate to the history page. Verify past conversations appear grouped by day (Today, Yesterday, specific dates). Scroll to the bottom &mdash; verify more entries load (infinite scroll). Click an entry &mdash; verify it re-opens the saved conversation without re-running the search.</li>
+      <li><strong>Responsive layout works.</strong> Resize the browser window. Verify: above 1200px, the 3-column layout appears with history sidebar. Between 1024&ndash;1200px, the sidebar disappears and you see 2 columns. Below 1024px, everything stacks into a single column. Verify the landing page stays centered at all widths.</li>
+      <li><strong>Mid-stream cancel works.</strong> Start a query, then click the Stop button while streaming. Verify the answer stops where it was, source cards for already-received citations remain visible, and feedback buttons appear.</li>
+      <li><strong>Accessibility basics.</strong> Tab through the landing page &mdash; verify focus moves through the search bar, example chips, history icon, and dark mode toggle. Tab through the results page &mdash; verify focus reaches citation badges, source cards, follow-up chips, and feedback buttons. Press Escape while a citation popover is open &mdash; verify it closes.</li>
+    </ol>
+  </div>
 
   <!-- ================================================================ -->
-  <!-- 12.6 Design Principles -->
+  <!-- 12.6 What Happens Next -->
   <!-- ================================================================ -->
-  <h2><span class="section-number">12.6</span> The Five Resilience Principles</h2>
+  <h2><span class="section-number">12.6</span> What Happens Next</h2>
 
-  <h3>1. No Silent Data Loss</h3>
-  <p>Every failure is either retried, handled by a fallback, or explicitly logged with an error. Nothing disappears into a void. If a file fails to index, that fact is recorded in Application Insights and the next delta sync will try again.</p>
-
-  <h3>2. Fail Fast on Configuration Errors</h3>
-  <p>If the embedding provider, API keys, or index connection strings are wrong, BSearch refuses to start. This is intentional. A misconfigured system that <em>appears</em> to work is far more dangerous than one that clearly says &ldquo;I cannot start &mdash; fix this first.&rdquo; The health check endpoint catches these issues before any user traffic arrives.</p>
-
-  <h3>3. Transparent Degradation</h3>
-  <p>When BSearch is running in a reduced mode &mdash; no reranker, BM25-only, no entity enrichment &mdash; it tells you. The orange and yellow banners exist specifically so you can calibrate your trust in the results. Hiding degradation would be worse than showing it.</p>
-
-  <h3>4. Self-Healing by Default</h3>
-  <p>Look at the &ldquo;Self-Healing?&rdquo; column in the tables above: the vast majority say <strong>Yes</strong>. Durable Functions retry failed downloads. Delta sync catches missed webhooks. The 6-hour summary cycle regenerates failed deal summaries. Most problems fix themselves within minutes to hours without any intervention.</p>
-
-  <h3>5. Bounded Degradation</h3>
-  <p>Even in the worst realistic scenario &mdash; Voyage AI is down, Cohere is down, Neo4j is unreachable &mdash; BSearch still returns results. They come from BM25 keyword matching with Azure Search&rsquo;s default ranking and no entity enrichment. That is a meaningfully worse experience than the full pipeline, but it still works. You still get relevant documents. The floor is never zero.</p>
+  <p>With the web frontend complete, every layer of the system has been built: infrastructure, parsers, search index, query pipeline, and user interface. Phase 6 brings them all together for integration testing, acceptance test validation, bulk ingestion of the full 550,000-document corpus, and go-live. The five acceptance test queries from Chapter 1 are the final exam.</p>
 
   <div class="key-takeaway">
     <div class="callout-title">Key Takeaway</div>
-    <p>BSearch is designed to bend, not break. The majority of failures are invisible and self-healing. The few that are visible are clearly communicated. And even in the worst case, the system returns results &mdash; just less refined ones. Every component has a fallback, and the fallback always produces something useful.</p>
+    <p>The web frontend is where four phases of backend engineering become a product. The critical design decisions are not about frameworks or component libraries &mdash; they are about trust. Instrument Serif instead of sans-serif. Citations instead of disclaimers. Source cards with one-click deep links instead of "trust me" labels. The interface earns credibility by making every claim verifiable, not by telling users to trust it.</p>
   </div>
 
   <nav class="chapter-nav bottom">
-    <a href="chapter-11.html">&larr; Previous</a>
+    <a href="chapter-11.html">&larr; Previous: Phase 4 &mdash; Query Pipeline &amp; Synthesis</a>
     <span class="nav-spacer">|</span>
     <a href="index.html">Contents</a>
     <span class="nav-spacer">|</span>
-    <a href="chapter-13.html">Next &rarr;</a>
+    <a href="chapter-13.html">Next: Phase 6 &mdash; Testing &amp; Go-Live &rarr;</a>
   </nav>
 </div>
+
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
 <script>mermaid.initialize({startOnLoad: true, theme: 'neutral'});</script>
 </body>

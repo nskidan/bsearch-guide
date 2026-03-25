@@ -685,6 +685,156 @@ tr:last-child td {
   }
 }
 
+/* ---------- Layer Badge ---------- */
+.layer-badge {
+  display: inline-block;
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: 0.2rem 0.6rem;
+  border-radius: 100px;
+  margin-left: 0.5rem;
+  vertical-align: middle;
+}
+
+.layer-badge.understanding {
+  color: #2E7D5B;
+  background: rgba(46, 125, 91, 0.1);
+  border: 1px solid rgba(46, 125, 91, 0.25);
+}
+
+.layer-badge.building {
+  color: #4A7FB5;
+  background: rgba(74, 127, 181, 0.1);
+  border: 1px solid rgba(74, 127, 181, 0.25);
+}
+
+.layer-badge.reference {
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+}
+
+/* ---------- Before You Start (Prerequisite Checklist) ---------- */
+.before-you-start {
+  background: var(--white);
+  border: 1px solid var(--border);
+  border-left: 4px solid #4A7FB5;
+  border-radius: 0 var(--radius-md) var(--radius-md) 0;
+  padding: 1.25rem 1.5rem;
+  margin: 1.5rem 0;
+}
+
+.before-you-start .section-label {
+  font-weight: 700;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #4A7FB5;
+  margin-bottom: 0.75rem;
+}
+
+.before-you-start ul {
+  list-style: none;
+  padding-left: 0;
+}
+
+.before-you-start li {
+  position: relative;
+  padding-left: 1.75rem;
+  margin-bottom: 0.5rem;
+}
+
+.before-you-start li::before {
+  content: "\2610";
+  position: absolute;
+  left: 0;
+  color: #4A7FB5;
+  font-size: 1.1em;
+}
+
+/* ---------- Claude Code Prompt Box ---------- */
+.claude-prompt {
+  background: var(--bg-code);
+  color: #E8DDD0;
+  border-radius: var(--radius-md);
+  padding: 1.25rem 1.5rem;
+  margin: 1.5rem 0;
+  box-shadow: var(--shadow-md);
+  border: 1px solid rgba(43, 33, 24, 0.15);
+  position: relative;
+}
+
+.claude-prompt .prompt-label {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--accent-light);
+  margin-bottom: 0.75rem;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.claude-prompt .prompt-text {
+  font-family: var(--font-body);
+  font-size: 0.92rem;
+  line-height: 1.65;
+  color: #E8DDD0;
+}
+
+.claude-prompt .prompt-text em {
+  color: var(--accent-light);
+  font-style: italic;
+}
+
+/* ---------- Verification Checklist ---------- */
+.verify-checklist {
+  background: rgba(91, 158, 75, 0.06);
+  border: 1px solid rgba(91, 158, 75, 0.2);
+  border-left: 4px solid #5B9E4B;
+  border-radius: 0 var(--radius-md) var(--radius-md) 0;
+  padding: 1.25rem 1.5rem;
+  margin: 1.5rem 0;
+}
+
+.verify-checklist .section-label {
+  font-weight: 700;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #5B9E4B;
+  margin-bottom: 0.75rem;
+}
+
+.verify-checklist ol {
+  padding-left: 1.5rem;
+}
+
+.verify-checklist li {
+  margin-bottom: 0.5rem;
+}
+
+.verify-checklist code {
+  font-size: 0.85em;
+}
+
+/* ---------- Build Section Wrapper ---------- */
+.build-section {
+  margin-top: 2.5rem;
+  padding-top: 1.5rem;
+  border-top: 2px solid var(--border);
+}
+
+.build-section > h2:first-child {
+  margin-top: 0;
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
 /* ---------- Print Styles ---------- */
 @media print {
   body {

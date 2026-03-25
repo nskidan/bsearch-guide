@@ -4,264 +4,562 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="light only">
-  <title>Chapter 6: Relevance & Quality Controls — BSearch Technical Guide</title>
+  <title>Chapter 6: How BSearch Understands Deals &amp; Relationships &mdash; BSearch Technical Guide</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
 <div class="page-wrapper">
+
   <nav class="chapter-nav">
-    <a href="chapter-05.html">&larr; Previous: Query Pipeline</a>
+    <a href="chapter-05.html">&larr; Previous: How Questions Get Answered</a>
     <span class="nav-spacer">|</span>
     <a href="index.html">Contents</a>
     <span class="nav-spacer">|</span>
-    <a href="chapter-07.html">Next: The Data Model &rarr;</a>
+    <a href="chapter-07.html">Next: When Things Go Wrong &rarr;</a>
   </nav>
+
   <div class="chapter-header">
     <div class="chapter-number">Chapter 6</div>
-    <h1>Relevance &amp; Quality Controls</h1>
-    <p class="chapter-subtitle">How BSearch decides whether results are good enough to show &mdash; and what it does when something goes wrong.</p>
+    <h1>How BSearch Understands Deals &amp; Relationships</h1>
+    <p class="chapter-subtitle">The Neo4j knowledge graph &mdash; what it is, why BSearch needs it, and what it stores.</p>
   </div>
 
-  <p>Every search system faces the same question: &ldquo;How confident are we in these results?&rdquo; In investment banking, you would never hand a client a valuation without sanity-checking the comps. BSearch applies the same discipline to every query. This chapter covers the guardrails that separate high-confidence answers from marginal ones, how the system monitors its own health, and what users see at each quality level.</p>
+  <!-- 6.1 Why a Knowledge Graph -->
+  <h2><span class="section-number">6.1</span> Why a Knowledge Graph</h2>
 
-  <!-- ================================================================ -->
-  <!-- 6.1 Relevance Gating -->
-  <!-- ================================================================ -->
-  <h2><span class="section-number">6.1</span> Relevance Gating</h2>
+  <p>A search index is good at one thing: finding documents that contain certain words or match a certain meaning. Ask it <em>"Find documents mentioning Acme Corp"</em> and it will deliver. But ask it <em>"Which deals had Acme Corp as an acquirer?"</em> and it is stuck. The search index knows that the words "Acme Corp" appear in a document &mdash; it does not know that Acme Corp was the <em>acquirer</em> in one deal and the <em>target</em> in another. That distinction lives in the relationships between things, not in the text itself.</p>
+
+  <p>This is the gap a knowledge graph fills. A knowledge graph stores two things:</p>
+
+  <ul>
+    <li><strong>Nodes</strong> &mdash; the things themselves (deals, companies, people, stage transitions).</li>
+    <li><strong>Relationships</strong> &mdash; the connections between those things (Company X is the target of Deal Y, Person Z advised on Deal Y).</li>
+  </ul>
 
   <div class="definition">
-    <p><span class="term">Relevance Gating</span> &mdash; A system of confidence tiers that determines how BSearch presents results based on how well they actually match your query. Think of it as a quality filter that prevents bad results from reaching you.</p>
+    <p><span class="term">Knowledge graph</span> &mdash; A database that stores information as a network of entities (nodes) and the connections between them (relationships). Unlike a spreadsheet or a traditional database table, a knowledge graph is designed for traversing connections &mdash; following a chain of relationships to answer questions that span multiple entities.</p>
   </div>
 
-  <p>After the reranker (Chapter 3, Section 3.5) scores each candidate chunk against your query, BSearch does not blindly pass everything to Claude for synthesis. Instead, it checks each chunk&rsquo;s <strong>rerank score</strong> &mdash; a number between 0 and 1 that represents how relevant Cohere&rsquo;s reranker thinks the chunk is to your query.</p>
+  <p>BSearch uses <strong>Neo4j Aura</strong>, a managed graph database, to maintain a knowledge graph of deals, companies, people, and their interconnections. This graph is the source of truth for entity intelligence &mdash; deal status, financial profiles, company roles, stage progression, and key contacts. It is what allows BSearch to answer questions that go beyond text matching and into the realm of structured reasoning.</p>
 
-  <h3>The three confidence tiers</h3>
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>Think of the knowledge graph as the mental model a senior banker carries around. A veteran MD does not just remember document titles &mdash; she knows that Acme Corp was the acquirer in the Widget deal, the target in the Gadget deal, and that John Smith from Evercore advised on both. She can answer <em>"What other deals has Evercore been on the other side of?"</em> without opening a single file. The knowledge graph gives BSearch that same kind of connected understanding.</p>
+  </div>
+
+  <p>The graph is not a replacement for the search index &mdash; the two work together. The search index finds relevant document chunks. The knowledge graph provides structured context about the entities mentioned in those chunks, enables financial filtering, and powers cross-deal queries. At query time, BSearch reads from both.</p>
+
+  <!-- 6.2 Node Types -->
+  <h2><span class="section-number">6.2</span> Node Types</h2>
+
+  <p>The knowledge graph is organized as a <strong>deal-centric star schema</strong> &mdash; deals sit at the center, and everything else connects to them. There are four types of nodes.</p>
+
+  <div class="definition">
+    <p><span class="term">Node</span> &mdash; An entity in the knowledge graph. Each node has a type (Deal, Company, Person, or StageEntry) and a set of properties (key-value pairs that describe it).</p>
+  </div>
+
+  <h3>Deal</h3>
+
+  <p>The hub entity. Every deal that BSearch has encountered gets a Deal node. A deal is identified by its <strong>folder path</strong> in SharePoint &mdash; all files within the same first-level subfolder of a deal root folder (such as <code>Banking - General/Project Atlas/</code>) belong to the same deal, regardless of how deeply nested they are.</p>
 
   <table>
     <thead>
       <tr>
-        <th>Tier</th>
-        <th>Rerank Score</th>
+        <th>Property</th>
+        <th>Description</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>deal_id</code></td>
+        <td>A hash of the folder path &mdash; the unique identifier for this deal.</td>
+      </tr>
+      <tr>
+        <td><code>canonical_name</code></td>
+        <td>The current "official" name for the deal, taken from the most recently modified file in the folder. Naturally converges to the real company name as deals progress past code names.</td>
+      </tr>
+      <tr>
+        <td><code>aliases</code></td>
+        <td>An array of every name variant ever used for this deal. Grows over time as new documents use new names. See Section 6.4.</td>
+      </tr>
+      <tr>
+        <td><code>folder_path</code></td>
+        <td>The SharePoint folder path that defines this deal.</td>
+      </tr>
+      <tr>
+        <td><code>deal_status</code></td>
+        <td>One of: <code>active</code>, <code>on_hold</code>, <code>dead</code>, or <code>closed</code>. Inferred automatically. See Section 6.6.</td>
+      </tr>
+      <tr>
+        <td><code>current_stage</code></td>
+        <td>The highest deal stage reached (origination through closing). See Section 6.5.</td>
+      </tr>
+      <tr>
+        <td><code>industries</code></td>
+        <td>Industry classifications for the deal (e.g., healthcare, technology).</td>
+      </tr>
+      <tr>
+        <td>Financial metrics</td>
+        <td><code>revenue</code>, <code>ebitda</code>, <code>ev</code>, <code>ev_ebitda</code>, <code>ev_revenue</code>, <code>offer_price</code>, <code>purchase_price</code>, <code>total_debt</code>, <code>equity_value</code>. See Section 6.7.</td>
+      </tr>
+      <tr>
+        <td><code>financials_meta</code></td>
+        <td>Provenance metadata for each financial metric &mdash; the reporting period, confidence level, and source file.</td>
+      </tr>
+      <tr>
+        <td><code>last_activity</code></td>
+        <td>Timestamp of the most recently modified file in the deal folder. Drives deal status inference.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Company</h3>
+
+  <p>A company involved in one or more deals &mdash; as a target, acquirer, advisor, or lender. Company nodes are deduplicated using a normalized name: the company name is lowercased and common suffixes (Inc., Corp., LLC, Ltd., &amp; Co., Group, Holdings) are stripped. This means "Goldman Sachs", "Goldman Sachs &amp; Co.", and "Goldman Sachs Group, Inc." all resolve to the same Company node.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Property</th>
+        <th>Description</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>canonical_name</code></td>
+        <td>The most recent name variant seen for this company.</td>
+      </tr>
+      <tr>
+        <td><code>normalized_name</code></td>
+        <td>The deduplication key &mdash; lowercase, suffix-stripped.</td>
+      </tr>
+      <tr>
+        <td><code>aliases</code></td>
+        <td>All name variants accumulated over time (same pattern as Deal aliases).</td>
+      </tr>
+      <tr>
+        <td><code>industries</code></td>
+        <td>Industry classifications associated with this company.</td>
+      </tr>
+      <tr>
+        <td><code>first_seen</code> / <code>last_seen</code></td>
+        <td>Timestamps tracking when this company first and last appeared in ingested documents.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Person</h3>
+
+  <p>A person mentioned across documents &mdash; executives, bankers, contacts. Person nodes are only created from <strong>structured sections</strong> of documents: signature blocks, management team sections, cover pages, and engagement letter parties. BSearch deliberately does not create Person nodes from narrative mentions (e.g., "as Mr. Smith noted in his remarks") because those produce too many false positives.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Property</th>
+        <th>Description</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>canonical_name</code></td>
+        <td>The most recent name variant seen.</td>
+      </tr>
+      <tr>
+        <td><code>normalized_name</code></td>
+        <td>The deduplication key.</td>
+      </tr>
+      <tr>
+        <td><code>aliases</code></td>
+        <td>All name variants.</td>
+      </tr>
+      <tr>
+        <td><code>titles</code></td>
+        <td>Professional titles observed (e.g., CEO, Managing Director, General Partner).</td>
+      </tr>
+      <tr>
+        <td><code>first_seen</code> / <code>last_seen</code></td>
+        <td>Timestamps tracking appearances.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>StageEntry</h3>
+
+  <p>A timestamped record of a deal reaching a particular stage. Unlike the other node types, StageEntry nodes are not standalone entities &mdash; they exist only in connection to a Deal node. A single deal can have multiple StageEntry nodes, one for each stage transition, creating a timeline of the deal's progression.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Property</th>
+        <th>Description</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>stage</code></td>
+        <td>One of: <code>origination</code>, <code>marketing</code>, <code>bidding</code>, <code>negotiation</code>, <code>diligence</code>, <code>closing</code>.</td>
+      </tr>
+      <tr>
+        <td><code>entered</code></td>
+        <td>The datetime when this stage was first evidenced (based on the document's modification date).</td>
+      </tr>
+      <tr>
+        <td><code>doc_type</code></td>
+        <td>The document type that triggered this stage entry (e.g., <code>ioi</code> for bidding).</td>
+      </tr>
+      <tr>
+        <td><code>source_file_id</code></td>
+        <td>The specific file that provided evidence for this stage transition.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="definition">
+    <p><span class="term">Deal-centric star schema</span> &mdash; A data model where Deal nodes sit at the center and all other entities (companies, people, stage entries) connect to deals through typed relationships. This makes deal-oriented queries fast and natural &mdash; you can start at any deal and immediately see its target, acquirers, advisors, stage history, and financials.</p>
+  </div>
+
+  <!-- Mermaid: Knowledge Graph Node Types and Relationships -->
+  <h3>The Knowledge Graph Structure</h3>
+
+  <pre class="mermaid">
+graph LR
+    subgraph "Node Types"
+        D["Deal<br/><small>name, aliases, status,<br/>financials, stage</small>"]
+        C1["Company<br/><small>target</small>"]
+        C2["Company<br/><small>acquirer</small>"]
+        C3["Company<br/><small>advisor</small>"]
+        P["Person<br/><small>name, title</small>"]
+        S1["StageEntry<br/><small>marketing</small>"]
+        S2["StageEntry<br/><small>bidding</small>"]
+        S3["StageEntry<br/><small>negotiation</small>"]
+    end
+
+    C1 -- "TARGET_OF" --> D
+    C2 -- "ACQUIRER_OF" --> D
+    C3 -- "ADVISOR_ON" --> D
+    P -- "APPEARED_IN" --> D
+    P -- "EXECUTIVE_AT" --> C1
+    D -- "REACHED_STAGE" --> S1
+    D -- "REACHED_STAGE" --> S2
+    D -- "REACHED_STAGE" --> S3
+  </pre>
+
+  <!-- 6.3 Relationship Types -->
+  <h2><span class="section-number">6.3</span> Relationship Types</h2>
+
+  <p>Relationships are the connections between nodes. Each relationship has a type that describes the nature of the connection, and every relationship carries a <code>source_file_ids</code> property &mdash; a list of the specific files that provided evidence for this connection. This provenance tracking is critical for cleanup when files are deleted or updated (see Section 6.8).</p>
+
+  <div class="definition">
+    <p><span class="term">Relationship (edge)</span> &mdash; A typed, directed connection between two nodes in the knowledge graph. For example, a TARGET_OF relationship connects a Company node to a Deal node, indicating that the company is the target in that deal. The direction matters &mdash; the Company points to the Deal, not the other way around.</p>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Relationship</th>
+        <th>From &rarr; To</th>
+        <th>What It Means</th>
+        <th>Example</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>TARGET_OF</code></td>
+        <td>Company &rarr; Deal</td>
+        <td>The company is the target (the company being sold) in this deal.</td>
+        <td>Acme Corp is the target of the Project Atlas deal.</td>
+      </tr>
+      <tr>
+        <td><code>POTENTIAL_ACQUIRER</code></td>
+        <td>Company &rarr; Deal</td>
+        <td>The company has expressed interest in acquiring the target. Tracks engagement level: <code>teaser_received</code>, <code>cim_received</code>, <code>ioi_submitted</code>, <code>loi_submitted</code>. Only upgrades, never downgrades.</td>
+        <td>Blackstone received the teaser for Project Atlas and later submitted an IOI.</td>
+      </tr>
+      <tr>
+        <td><code>ACQUIRER_OF</code></td>
+        <td>Company &rarr; Deal</td>
+        <td>The company won the deal and became the acquirer. When a deal closes, the winning company's POTENTIAL_ACQUIRER edge is promoted to ACQUIRER_OF.</td>
+        <td>Blackstone acquired Acme Corp in the Project Atlas deal.</td>
+      </tr>
+      <tr>
+        <td><code>ADVISOR_ON</code></td>
+        <td>Company &rarr; Deal</td>
+        <td>The company is an advisor on this deal. Includes a <code>side</code> property indicating whether the advisory is on the sell-side or buy-side.</td>
+        <td>Berenson &amp; Company is the sell-side advisor on Project Atlas.</td>
+      </tr>
+      <tr>
+        <td><code>LENDER_ON</code></td>
+        <td>Company &rarr; Deal</td>
+        <td>The company is providing financing for the deal.</td>
+        <td>JPMorgan is the lead lender on the Project Atlas acquisition financing.</td>
+      </tr>
+      <tr>
+        <td><code>EXECUTIVE_AT</code></td>
+        <td>Person &rarr; Company</td>
+        <td>The person holds (or held) a role at the company. Includes a <code>title</code> property.</td>
+        <td>Jane Doe is the CEO of Acme Corp.</td>
+      </tr>
+      <tr>
+        <td><code>APPEARED_IN</code></td>
+        <td>Person &rarr; Deal</td>
+        <td>The person appeared in documents related to this deal. Includes a <code>role</code> property describing their involvement.</td>
+        <td>John Smith (Managing Director at Evercore) appeared in the Project Atlas process letter.</td>
+      </tr>
+      <tr>
+        <td><code>REACHED_STAGE</code></td>
+        <td>Deal &rarr; StageEntry</td>
+        <td>The deal has evidence of reaching this stage. Multiple REACHED_STAGE edges per deal form a timeline.</td>
+        <td>Project Atlas reached the bidding stage when the first IOI was filed.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>These relationship types map directly to how bankers think about a deal. Every live deal has a target, a list of potential acquirers at various stages of engagement (received the teaser? submitted an IOI?), advisors on both sides, and lenders. The knowledge graph makes this structure explicit and queryable &mdash; so when someone asks <em>"Which PE firms have been active acquirers across our deals?"</em>, BSearch can traverse the POTENTIAL_ACQUIRER and ACQUIRER_OF edges across all Deal nodes and return a structured answer.</p>
+  </div>
+
+  <!-- 6.4 Deal Alias Accumulation -->
+  <h2><span class="section-number">6.4</span> Deal Alias Accumulation</h2>
+
+  <p>Deals almost never go by a single name. Early in a process, a deal is assigned a code name &mdash; "Project Atlas," "Project Catalyst," "Project Evergreen." As the deal progresses and confidentiality constraints relax, documents start using the real company name. By the time the deal closes, most people refer to it as "the Acme acquisition," and the code name is half-forgotten.</p>
+
+  <p>This creates a real search problem. A query for "Project Atlas" should find the deal even if the most recent 50 documents all call it "Acme Corp acquisition." Conversely, a query for "Acme Corp" should find the deal even if the earliest documents only use the code name.</p>
+
+  <p>BSearch solves this through <strong>alias accumulation</strong>. As BSearch ingests documents from a deal folder, it extracts the deal name from each document and appends any new variant to the Deal node's <code>aliases</code> array. This happens automatically &mdash; no manual mapping, no master list, no one needs to tell the system that "Project Atlas" and "Acme Corp acquisition" are the same deal.</p>
+
+  <p>Here is how the process works:</p>
+
+  <ol>
+    <li>A document is ingested from a deal folder (e.g., <code>Banking - General/Project Atlas/</code>).</li>
+    <li>The AI extracts a deal name from the document content (e.g., "Project Atlas" from an early teaser, or "Acme Corp" from a later CIM).</li>
+    <li>BSearch checks the Deal node in Neo4j. If the extracted name is not already in the <code>aliases</code> array, it appends it.</li>
+    <li>If this document is the most recently modified file in the folder, the <code>canonical_name</code> is updated to this name. This means the canonical name naturally converges to the "real" company name as deals progress.</li>
+    <li>All search index chunks for this deal are tagged with both the <code>canonical_name</code> (as <code>deal_name</code>) and a space-joined string of all aliases (as <code>deal_aliases</code>). A search for any known alias hits.</li>
+  </ol>
+
+  <p>The same pattern applies to <strong>company aliases</strong>. Company nodes accumulate all name variants through the same mechanism, with the normalized name (lowercase, suffix-stripped) serving as the deduplication key. A query for "GS" can expand to include "Goldman Sachs" and "Goldman Sachs &amp; Co." because all three are aliases on the same Company node.</p>
+
+  <p>When a deal's canonical name changes (because a newer file used a different name), the ingestion pipeline batch-updates the <code>deal_name</code> and <code>deal_aliases</code> fields on all existing chunks for that deal in the search index. This is a targeted update &mdash; only the metadata fields are patched, not the content &mdash; so it is fast and does not require re-parsing or re-embedding.</p>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>Everyone on the deal team naturally knows all the code names. If you have been working on Project Atlas for three months, you know it is the Acme deal, and if someone mentions either name you know what they are talking about. But a new analyst who joins the team only hears "Acme" &mdash; they would not know to search for "Project Atlas" to find the early-stage documents. The alias accumulation system gives BSearch the same institutional memory that the deal team has, so even a brand-new user can find everything by any name.</p>
+  </div>
+
+  <!-- 6.5 Deal Stage Inference -->
+  <h2><span class="section-number">6.5</span> Deal Stage Inference</h2>
+
+  <p>Investment banking deals progress through a well-defined sequence of stages: origination, marketing, bidding, negotiation, diligence, and closing. At each stage, specific types of documents are produced. BSearch exploits this regularity &mdash; it infers what stage a deal has reached based on the types of documents found in the deal folder.</p>
+
+  <p>This inference is <strong>deterministic</strong> (no AI involved). Each document type maps to a specific stage:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Document Type</th>
+        <th>Inferred Stage</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>NDA, Engagement Letter</td>
+        <td>Origination</td>
+      </tr>
+      <tr>
+        <td>Teaser, CIM, Management Presentation, Process Letter</td>
+        <td>Marketing</td>
+      </tr>
+      <tr>
+        <td>IOI (Indication of Interest)</td>
+        <td>Bidding</td>
+      </tr>
+      <tr>
+        <td>LOI (Letter of Intent)</td>
+        <td>Negotiation</td>
+      </tr>
+      <tr>
+        <td>Diligence Tracker</td>
+        <td>Diligence</td>
+      </tr>
+      <tr>
+        <td>Purchase Agreement</td>
+        <td>Closing</td>
+      </tr>
+      <tr>
+        <td>Model, Board Deck, Memo, Email, Other</td>
+        <td><em>No stage entry created</em> &mdash; these document types appear at multiple stages and do not indicate a specific transition.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>When BSearch ingests a document whose type maps to a stage, it creates a <strong>StageEntry node</strong> connected to the Deal via a REACHED_STAGE relationship. The StageEntry records the stage name, the timestamp (from the document's modification date), the document type that triggered it, and the source file ID.</p>
+
+  <p>A deal's <code>current_stage</code> is simply the <strong>highest stage reached</strong>, following the natural ordering: closing &gt; diligence &gt; negotiation &gt; bidding &gt; marketing &gt; origination. Stages only move forward &mdash; if a deal has reached bidding, discovering more marketing-stage documents does not move it backward.</p>
+
+  <p>Because StageEntry nodes are separate entities (not just a property on the Deal node), you can query stage history naturally. <em>"When did Project Atlas move to bidding?"</em> becomes a straightforward graph query: find the Deal node, follow its REACHED_STAGE edges, and return the StageEntry with <code>stage: "bidding"</code> along with its <code>entered</code> timestamp.</p>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>You can tell where a deal stands just by looking at what is in the data room. If you see only teasers and NDAs, the deal is in early stages. If IOIs are on file, the deal has moved to bidding. If there is a purchase agreement, someone signed. BSearch applies this same logic automatically &mdash; it reads the document types and infers the stage, just as an experienced banker would by scanning the folder structure.</p>
+  </div>
+
+  <!-- 6.6 Deal Status Inference -->
+  <h2><span class="section-number">6.6</span> Deal Status Inference</h2>
+
+  <p>Beyond knowing what stage a deal has reached, BSearch also infers whether a deal is <strong>currently active</strong> or not. This is driven by recent document activity &mdash; specifically, how recently files in the deal folder were modified.</p>
+
+  <p>Deal status inference is deterministic and follows four simple rules:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Condition</th>
+        <th>Status</th>
+        <th>What It Means</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>A purchase agreement document exists in the folder</td>
+        <td><code>closed</code></td>
+        <td>The deal has been completed. The presence of a signed purchase agreement is definitive.</td>
+      </tr>
+      <tr>
+        <td>Last file activity was more than 9 months ago (no purchase agreement)</td>
+        <td><code>dead</code></td>
+        <td>The deal appears to have fallen through. No one has touched any file in the folder for over 9 months.</td>
+      </tr>
+      <tr>
+        <td>Last file activity was 3 to 9 months ago (no purchase agreement)</td>
+        <td><code>on_hold</code></td>
+        <td>The deal is stalled but not definitively dead. Activity has dropped off but has not been gone long enough to call it dead.</td>
+      </tr>
+      <tr>
+        <td>Last file activity was within the past 3 months</td>
+        <td><code>active</code></td>
+        <td>The deal is actively being worked on. Recent document modifications confirm ongoing activity.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>Deal status is <strong>recomputed on every file ingestion</strong> for the affected deal. This means the status stays current &mdash; if a dormant deal suddenly sees new activity (someone opens the folder and starts updating models), it automatically transitions from <code>on_hold</code> or <code>dead</code> back to <code>active</code>.</p>
+
+  <p>Status inference enables powerful queries. <em>"What deals are currently active?"</em> filters on <code>deal_status = 'active'</code>. <em>"What's our pipeline?"</em> returns all active deals with their entity context. These queries run against Neo4j and return structured results &mdash; no document scanning required.</p>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>Every banker has an instinct for whether a deal is live or dead. If no one has touched the data room in six months and there is no purchase agreement, the deal probably fell through. If the team is churning out updated models and term sheets, the deal is active. BSearch applies the same heuristic, using file modification timestamps as a proxy for activity. It is not perfect &mdash; a deal could be active through phone calls with no new documents &mdash; but it is right far more often than it is wrong, and it requires zero manual input.</p>
+  </div>
+
+  <!-- 6.7 Financial Metrics on Deals -->
+  <h2><span class="section-number">6.7</span> Financial Metrics on Deals</h2>
+
+  <p>Deal nodes in the knowledge graph store key financial metrics: revenue, EBITDA, enterprise value (EV), EV/EBITDA multiple, EV/Revenue multiple, offer price, purchase price, total debt, and equity value. These are not manually entered &mdash; they are extracted automatically from documents during ingestion.</p>
+
+  <p>Financial extraction happens in the <strong>Tier 2</strong> extraction layer, which processes high-value chunks: table chunks with financial headers (columns labeled "Revenue," "EBITDA," "Enterprise Value"), IOI and LOI body sections, and model output tabs. The AI identifies the metric, its value, the reporting period, and a confidence level. Only high-confidence extractions are written to the Deal node &mdash; medium-confidence values are logged but not stored, preventing noisy or speculative numbers from polluting the graph.</p>
+
+  <div class="definition">
+    <p><span class="term">Tier 2 extraction</span> &mdash; A selective, targeted AI extraction step that runs only on high-value chunks (financial tables, IOI/LOI body sections, structured people sections). Unlike Tier 1, which runs on every document, Tier 2 fires only on chunks that are likely to contain deal-specific financial metrics or key personnel. A typical document triggers 0 to 3 Tier 2 calls.</p>
+  </div>
+
+  <p>Financial metrics are stored as <strong>flat numeric properties</strong> on the Deal node. This is a deliberate design choice &mdash; it enables direct range queries like "find all deals with EBITDA over $50M," which are fast and simple. Alongside each metric, a <code>financials_meta</code> property stores provenance: the reporting period, the confidence level, and the source file that provided the number.</p>
+
+  <h3>How Updates Work</h3>
+
+  <p>Deals evolve, and financial figures change. An early-stage teaser might quote preliminary revenue numbers, while a later-stage model has updated figures. BSearch handles this with a straightforward update rule:</p>
+
+  <ul>
+    <li><strong>Higher confidence replaces lower.</strong> A high-confidence extraction from a financial summary table overwrites a medium-confidence extraction from a narrative mention.</li>
+    <li><strong>Same confidence: more recent source wins.</strong> If both extractions have the same confidence, the one from the more recently modified document takes precedence.</li>
+  </ul>
+
+  <p>This means the Deal node's financial metrics naturally converge on the most reliable, most current numbers available &mdash; without anyone manually updating a spreadsheet.</p>
+
+  <h3>Financial Filtering at Query Time</h3>
+
+  <p>Storing financial metrics on Deal nodes enables a powerful query pattern: <em>"Show me deals with EBITDA over $50M."</em> When BSearch receives a query like this, it parses the financial constraint, queries Neo4j for matching deal IDs, and then passes those IDs as a filter to the search index. The search index returns only document chunks from those deals, and the AI synthesizes the answer from the filtered results.</p>
+
+  <p>If the financial filter is too restrictive (fewer than 3 results), BSearch falls back: it retries the search without the financial filter and adds a note to the AI's context explaining that not all results may match the stated financial criteria. This graceful degradation prevents empty results while maintaining transparency.</p>
+
+  <div class="callout ib-analogy">
+    <div class="callout-title">IB Analogy</div>
+    <p>Think of this as a live deal sheet that updates itself. Every time a new model, term sheet, or CIM comes in with updated financial figures, the deal sheet reflects the latest numbers &mdash; no one has to remember to update it. And when a senior banker asks <em>"Pull up all our deals with enterprise value over $200M,"</em> the answer is immediate because the numbers are already structured and queryable, not buried inside individual documents.</p>
+  </div>
+
+  <!-- 6.8 Graph Cleanup -->
+  <h2><span class="section-number">6.8</span> Graph Cleanup</h2>
+
+  <p>Documents change. Files are deleted, updated, or replaced. When that happens, the knowledge graph needs to reflect the change &mdash; otherwise, it would accumulate stale relationships and phantom entities that no longer have supporting evidence.</p>
+
+  <p>BSearch handles this through <strong>provenance-based cleanup</strong>. Every relationship edge in the knowledge graph carries a <code>source_file_ids</code> property &mdash; a list of every file that provided evidence for that relationship. When a file is deleted or updated, the cleanup process is straightforward:</p>
+
+  <ol>
+    <li><strong>Remove the file's ID</strong> from <code>source_file_ids</code> on all edges that reference it.</li>
+    <li><strong>Delete edges with no remaining evidence.</strong> If an edge's <code>source_file_ids</code> list is now empty, the relationship has no supporting documents left, so it is removed.</li>
+    <li><strong>Delete StageEntry nodes</strong> that were sourced from the deleted file.</li>
+    <li><strong>Recompute deal status</strong> for the affected deal, since the stage history may have changed.</li>
+  </ol>
+
+  <p>For file updates (a document is modified and re-ingested), the process is: cleanup first, then normal ingestion with the new content. This is an atomic delete-then-rewrite that ensures the graph always reflects the current state of the documents.</p>
+
+  <h3>Orphan Node Handling</h3>
+
+  <p>When edges are deleted, Company and Person nodes may become orphans &mdash; nodes with no remaining relationships. BSearch does <strong>not</strong> delete these immediately. A Company node that lost its last edge might gain new edges from a future document ingestion. Instead, a <strong>weekly cleanup job</strong> removes orphan nodes that have had no remaining edges and a <code>last_seen</code> timestamp older than 90 days. This strikes a balance between keeping the graph clean and avoiding premature deletion.</p>
+
+  <h3>Dual-Write Consistency</h3>
+
+  <p>BSearch stores entity data in two places: Neo4j (the source of truth for entities and relationships) and Azure AI Search (denormalized copies of entity fields on each document chunk, used for search-time filtering). Keeping these two systems consistent is important.</p>
+
+  <p>The write order is always <strong>Neo4j first, then Azure AI Search</strong>. If something goes wrong:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Failure Scenario</th>
         <th>What Happens</th>
       </tr>
     </thead>
     <tbody>
       <tr>
-        <td><strong>HIGH</strong></td>
-        <td>&ge;0.50</td>
-        <td>Strong match. Results go to Claude for normal synthesis. No banner shown to the user.</td>
+        <td>Neo4j write fails</td>
+        <td>Chunks are written to the search index without entity fields (deal status, industries, etc.). The file is queued for retry. On retry, Neo4j is written and the search index chunks are patched with the correct entity fields. Search still works in the interim &mdash; it just lacks entity filtering for those chunks.</td>
       </tr>
       <tr>
-        <td><strong>LOW</strong></td>
-        <td>0.15 &ndash; 0.50</td>
-        <td>Marginal match. Claude still synthesizes, but adds hedging language. A <strong>yellow banner</strong> warns the user.</td>
-      </tr>
-      <tr>
-        <td><strong>NONE</strong></td>
-        <td>&lt;0.15</td>
-        <td>No meaningful match. BSearch skips the Claude call entirely and shows a no-results message with suggestions.</td>
+        <td>Azure AI Search write fails</td>
+        <td>Neo4j has the entity data. The file is queued for retry. On retry, chunks are written to the search index with the correct entity fields from Neo4j. No data is lost.</td>
       </tr>
     </tbody>
   </table>
 
-  <p>In addition to the tier-level thresholds, there is a <strong>per-chunk floor of 0.10</strong>. Even within a HIGH-confidence result set, any individual chunk scoring below 0.10 gets dropped before synthesis. This prevents a single irrelevant chunk from polluting an otherwise strong answer.</p>
+  <p>This approach ensures that a failure in one system does not corrupt the other. The retry queue (stored in Cosmos DB with exponential backoff) ensures that temporary outages self-heal. Neo4j remains the authoritative source of entity truth, and the search index is always eventually consistent with it.</p>
 
   <div class="callout ib-analogy">
     <div class="callout-title">IB Analogy</div>
-    <p>Think of relevance gating like the quality controls on a comp set. If your comps are strong matches (same industry, similar size, recent transactions), you present them with confidence. If they are borderline (adjacent sector, different geography), you still show them but caveat heavily: &ldquo;these are directional only.&rdquo; And if the screen returned nothing relevant (wrong SIC code, no recent deals), you tell the MD there are no good comps rather than forcing a bad set into the book.</p>
+    <p>Think of graph cleanup like maintaining a deal log. When a potential acquirer drops out and you remove their IOI from the data room, you also update the buyer list. If someone later deletes the entire deal folder, you remove the deal from the pipeline tracker. The knowledge graph does this automatically &mdash; every deletion or update in the file system triggers a corresponding cleanup in the graph, so the two always stay in sync.</p>
   </div>
 
-  <div class="callout info">
-    <div class="callout-title">Threshold Calibration</div>
-    <p>The thresholds (0.50, 0.15, 0.10) are not arbitrary guesses. During Phase 6 testing, we run 30+ representative queries across different deal types and document categories, analyze the score distributions, and adjust the thresholds before shipping. Scores cluster differently depending on the type of content being searched, so calibration against real data is essential.</p>
-  </div>
+  <!-- Key Takeaway -->
+  <h2><span class="section-number">6.9</span> Why This Matters</h2>
 
-  <!-- ================================================================ -->
-  <!-- 6.2 Reranker Health Monitoring -->
-  <!-- ================================================================ -->
-  <h2><span class="section-number">6.2</span> Reranker Health Monitoring</h2>
+  <p>The knowledge graph is what transforms BSearch from a document search tool into a system that genuinely understands the deal world. Without it, BSearch could find documents that mention a company name &mdash; but it could not tell you whether that company was the target, the acquirer, or the advisor. It could not filter deals by EBITDA or show you which deals are active. It could not connect a code name to a real company name across hundreds of documents.</p>
 
-  <div class="definition">
-    <p><span class="term">Health Check</span> &mdash; A lightweight background task that periodically pings an external service to verify it is still responding. If it fails repeatedly, the system switches to a fallback mode.</p>
-  </div>
-
-  <p>The Cohere reranker is a third-party AI service. Like any external dependency, it can go down. BSearch does not wait for a user query to fail before discovering a problem &mdash; it proactively monitors reranker health with a background task that pings Cohere every 60 seconds.</p>
-
-  <h3>Failure detection and degraded mode</h3>
-
-  <p>If <strong>three or more consecutive health checks fail</strong>, BSearch marks the reranker as <strong>degraded</strong> and fires an alert to Application Insights (our monitoring platform). Here is what changes:</p>
-
-  <ul>
-    <li><strong>Skip rerank step</strong> &mdash; results come directly from hybrid search without the reranker&rsquo;s second pass.</li>
-    <li><strong>Reduce candidate count</strong> &mdash; top-k drops from 20 to 12. Without the reranker to filter noise, fewer candidates means less risk of irrelevant results slipping through.</li>
-    <li><strong>Cap confidence at LOW</strong> &mdash; even if results look strong, the system never assigns HIGH confidence without the reranker&rsquo;s validation.</li>
-    <li><strong>Orange banner</strong> &mdash; the user sees a distinct orange banner: <em>&ldquo;Search quality may be reduced &mdash; results are ranked without AI reranking. Verify key details against source documents.&rdquo;</em></li>
-  </ul>
-
-  <div class="callout warning">
-    <div class="callout-title">Orange vs. Yellow Banners</div>
-    <p>Orange (degraded reranker) and yellow (LOW confidence) are <strong>distinct signals</strong> that can appear simultaneously. Orange means the system itself is impaired &mdash; a health issue. Yellow means the results for this particular query are marginal. A user could see both if the reranker is down <em>and</em> the query returns borderline matches.</p>
-  </div>
-
-  <p>When the health checks start succeeding again, BSearch marks the reranker as <strong>healthy</strong> and fires a recovery event. Normal operation resumes automatically &mdash; no manual intervention required.</p>
-
-  <div class="callout ib-analogy">
-    <div class="callout-title">IB Analogy</div>
-    <p>This is like having a backup process when Bloomberg goes down. You can still price comps using yesterday&rsquo;s closing data and public filings, but you caveat everything: &ldquo;Bloomberg was unavailable &mdash; pricing is indicative only, verify before client delivery.&rdquo; The work continues, but with extra caution flags.</p>
-  </div>
-
-  <!-- ================================================================ -->
-  <!-- 6.3 Embedding Resilience -->
-  <!-- ================================================================ -->
-  <h2><span class="section-number">6.3</span> Embedding Resilience</h2>
-
-  <div class="definition">
-    <p><span class="term">LRU Cache</span> (Least Recently Used) &mdash; A memory store that keeps the most recently used items readily available. When it runs out of space, it discards the items that have not been accessed in the longest time.</p>
-  </div>
-
-  <p>The Voyage AI embedding service converts your query text into a 1,024-number vector (Chapter 3, Section 3.3). This is an external API call &mdash; and like any network call, it can be slow or fail. BSearch has two layers of protection:</p>
-
-  <h3>Layer 1: LRU cache (~1,000 entries)</h3>
-
-  <p>If you or a colleague searched for the same query recently, the embedding is already cached in memory. The cache lookup takes effectively 0ms, bypassing the Voyage API entirely. This helps with common queries (&ldquo;latest CIMs,&rdquo; &ldquo;engagement letters&rdquo;) and rapid-fire refinements of the same search.</p>
-
-  <h3>Layer 2: 500ms hard timeout with BM25 fallback</h3>
-
-  <p>If the Voyage API does not respond within 500 milliseconds, BSearch stops waiting and falls back to <strong>BM25-only search</strong> &mdash; keyword matching without the vector (semantic) component. This means the search loses its ability to match on meaning (e.g., &ldquo;trading multiple&rdquo; matching &ldquo;EV/EBITDA&rdquo;), but the synonym expansion and reranker steps still compensate for much of that loss.</p>
-
-  <div class="callout info">
-    <div class="callout-title">Not Surfaced to Users</div>
-    <p>Unlike the reranker degradation, embedding fallbacks are <strong>not shown to users</strong>. They are transient (per-query, not system-wide) and the quality impact is usually minor. However, they are logged, and if the fallback rate exceeds 10% of queries over a one-hour window, an Application Insights alert fires so we can investigate.</p>
-  </div>
-
-  <div class="callout ib-analogy">
-    <div class="callout-title">IB Analogy</div>
-    <p>Think of it like preparing a comp set. Normally you use CapIQ for both screening (keyword filters) and reading equity research (conceptual analysis). If CapIQ is being slow, you can still run the screen based on hard filters (industry, size, geography) while CapIQ catches up. You lose the conceptual layer temporarily, but the core screen still works.</p>
-  </div>
-
-  <!-- ================================================================ -->
-  <!-- 6.4 Near-Duplicate Deduplication -->
-  <!-- ================================================================ -->
-  <h2><span class="section-number">6.4</span> Near-Duplicate Deduplication</h2>
-
-  <p>Every IB professional has experienced this: you search for a deal summary and the top five results are &ldquo;Deal Summary v2,&rdquo; &ldquo;Deal Summary v3,&rdquo; &ldquo;Deal Summary v3 FINAL,&rdquo; &ldquo;Deal Summary v3 FINAL (2),&rdquo; and &ldquo;Deal Summary v3 FINAL - Copy.&rdquo; Five slots consumed by the same document. BSearch&rsquo;s deduplication system prevents this.</p>
-
-  <h3>How it works</h3>
-
-  <p>Deduplication runs in two phases during ingestion, before documents ever appear in search results:</p>
-
-  <ol>
-    <li><strong>Phase 1 &mdash; Filename normalization.</strong> Strip version markers (&ldquo;v2,&rdquo; &ldquo;v3&rdquo;), finality markers (&ldquo;FINAL,&rdquo; &ldquo;DRAFT&rdquo;), and copy markers (&ldquo;(2),&rdquo; &ldquo;Copy of&rdquo;). If two files reduce to the same normalized name, they are flagged as potential duplicates.</li>
-    <li><strong>Phase 2 &mdash; Cosine similarity check.</strong> Compare the first-chunk embeddings of the two files. If the cosine similarity is &ge;0.95 (nearly identical content), they are confirmed as duplicates.</li>
-  </ol>
-
-  <p>A <strong>same-folder constraint</strong> prevents false matches. Two files named &ldquo;Financial Summary&rdquo; in different deal folders are not duplicates &mdash; they are summaries for different deals. The system only groups files within the same folder.</p>
-
-  <p>Among duplicates, the <strong>most recently modified file</strong> is marked as the canonical version. All chunks from canonical files carry an <code>is_canonical</code> flag set to <code>true</code>, and search results filter on this flag. The filter adds zero latency to queries because it is evaluated at the index level, not after retrieval.</p>
-
-  <div class="callout ib-analogy">
-    <div class="callout-title">IB Analogy</div>
-    <p>This is exactly like the document management discipline a good deal team follows: when you save &ldquo;v4 FINAL,&rdquo; the earlier versions get moved to an archive subfolder so that anyone searching the active folder only finds the latest version. BSearch automates this curation at scale across 550,000 documents.</p>
-  </div>
-
-  <!-- ================================================================ -->
-  <!-- 6.5 Citation Format -->
-  <!-- ================================================================ -->
-  <h2><span class="section-number">6.5</span> Citation Format</h2>
-
-  <p>Every answer BSearch generates includes numbered citations so you can verify the source material. Each citation includes:</p>
-
-  <ul>
-    <li><strong>File name</strong> &mdash; the original document name.</li>
-    <li><strong>Folder path</strong> &mdash; which deal folder or shared drive location the document lives in.</li>
-    <li><strong>Document type</strong> (<code>doc_type</code>) &mdash; CIM, engagement letter, financial model, etc.</li>
-    <li><strong>&ldquo;Open in SharePoint &rarr;&rdquo;</strong> &mdash; a deep link via the <code>m365_url</code> field that opens the document directly in SharePoint. One click from answer to source.</li>
-  </ul>
-
-  <p>Citations appear in a <strong>Sources</strong> section at the end of each response, numbered to match inline references in the answer text. If Claude references a fact from source [2], you can scroll down and click through to verify it.</p>
-
-  <div class="callout ib-analogy">
-    <div class="callout-title">IB Analogy</div>
-    <p>Think of it like footnotes in an investor presentation. Every data point cites its source &mdash; &ldquo;Source: Company management, FY2024 audited financials&rdquo; &mdash; so the reader can trace any number back to its origin. BSearch does the same thing, but with clickable links that take you directly to the document.</p>
-  </div>
-
-  <!-- ================================================================ -->
-  <!-- 6.6 Confidence Communication -->
-  <!-- ================================================================ -->
-  <h2><span class="section-number">6.6</span> Confidence Communication</h2>
-
-  <p>All the quality machinery described above ultimately translates into a simple, clear experience for the user. Here is what you see in each scenario:</p>
-
-  <table>
-    <thead>
-      <tr>
-        <th>Scenario</th>
-        <th>What You See</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr>
-        <td><strong>HIGH confidence</strong></td>
-        <td>Normal response, no banner. The system is confident in its answer.</td>
-      </tr>
-      <tr>
-        <td><strong>LOW confidence</strong></td>
-        <td>Yellow banner: <em>&ldquo;Results may not fully answer your query.&rdquo;</em> Response includes hedging language.</td>
-      </tr>
-      <tr>
-        <td><strong>NONE &mdash; no results</strong></td>
-        <td>No-results message with suggested alternative queries. Claude is not called at all.</td>
-      </tr>
-      <tr>
-        <td><strong>Degraded reranker</strong></td>
-        <td>Orange banner: <em>&ldquo;Search quality may be reduced.&rdquo;</em> A system health issue, independent of query quality.</td>
-      </tr>
-      <tr>
-        <td><strong>Multi-document synthesis</strong></td>
-        <td><em>&ldquo;Searching across multiple documents...&rdquo;</em> indicator while the system works.</td>
-      </tr>
-    </tbody>
-  </table>
-
-  <p>The design principle is simple: <strong>never let the user mistake a low-confidence answer for a definitive one.</strong> In IB, the cost of acting on a wrong answer &mdash; a misquoted EBITDA, a wrong deal status &mdash; can be significant. These banners are the system&rsquo;s way of saying &ldquo;double-check this one.&rdquo;</p>
-
-  <!-- Confidence tier decision tree -->
-  <h3>Confidence Tier Decision Flow</h3>
-
-  <pre class="mermaid">
-flowchart TD
-    Q["Query submitted"] --> RR{"Reranker\navailable?"}
-    RR -- "No (degraded)" --> DEG["Show orange banner\nCap confidence at LOW\nReduce top-k to 12"]
-    RR -- "Yes (healthy)" --> SCORE{"Best rerank\nscore?"}
-    SCORE -- "&ge;0.50" --> HIGH["HIGH confidence\nNormal synthesis\nNo banner"]
-    SCORE -- "0.15 &ndash; 0.50" --> LOW["LOW confidence\nHedged synthesis\nYellow banner"]
-    SCORE -- "&lt;0.15" --> NONE["NONE\nSkip Claude call\nNo-results message"]
-    DEG --> SCORE2{"Best rerank\nscore\n(from hybrid)?"}
-    SCORE2 -- "&ge;0.15" --> LOW2["LOW confidence\nHedged synthesis\nOrange + yellow banners"]
-    SCORE2 -- "&lt;0.15" --> NONE2["NONE\nNo-results message\nOrange banner"]
-
-    style Q fill:#fff3e0,stroke:#D4793A
-    style HIGH fill:#e8f5e9,stroke:#2E7D5B
-    style LOW fill:#fffde7,stroke:#F9A825
-    style LOW2 fill:#fffde7,stroke:#F9A825
-    style NONE fill:#ffebee,stroke:#C4612A
-    style NONE2 fill:#ffebee,stroke:#C4612A
-    style DEG fill:#fff3e0,stroke:#E65100
-  </pre>
+  <p>The graph is also what makes BSearch's intelligence <strong>cumulative</strong>. Every document that gets ingested adds to the graph &mdash; new aliases, new relationships, updated financials, new stage evidence. The system gets smarter over time without any manual maintenance. That is the competitive moat over generic enterprise search tools: IB-specific entity understanding that encodes the tribal knowledge currently living in bankers' heads.</p>
 
   <div class="key-takeaway">
     <div class="callout-title">Key Takeaway</div>
-    <p>BSearch treats search quality as a first-class concern, not an afterthought. Every result is assigned a confidence tier, the reranker is continuously monitored, embedding failures have automatic fallbacks, and near-duplicates are suppressed before they clutter your results. The user always knows how much to trust a given answer &mdash; just as you would caveat a preliminary valuation differently than a final fairness opinion.</p>
+    <p>The Neo4j knowledge graph gives BSearch structured understanding of deals, companies, people, and their relationships &mdash; not just the ability to find documents that contain certain words. Aliases accumulate automatically so no name is ever lost. Stages and status are inferred from document types and activity. Financial metrics update themselves as new documents arrive. And provenance tracking ensures that when documents change, the graph stays clean. The result is a system that builds institutional memory the way a senior banker does &mdash; but never forgets and never leaves the firm.</p>
   </div>
 
   <nav class="chapter-nav bottom">
-    <a href="chapter-05.html">&larr; Previous</a>
+    <a href="chapter-05.html">&larr; Previous: How Questions Get Answered</a>
     <span class="nav-spacer">|</span>
     <a href="index.html">Contents</a>
     <span class="nav-spacer">|</span>
-    <a href="chapter-07.html">Next &rarr;</a>
+    <a href="chapter-07.html">Next: When Things Go Wrong &rarr;</a>
   </nav>
 </div>
+
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
 <script>mermaid.initialize({startOnLoad: true, theme: 'neutral'});</script>
 </body>

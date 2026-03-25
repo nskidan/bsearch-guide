@@ -4,417 +4,1004 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="light only">
-  <title>Chapter 10: Implementation Roadmap — BSearch Technical Guide</title>
+  <title>Chapter 10: Phase 3 &mdash; Search Index &amp; Ingestion Pipeline &mdash; BSearch Technical Guide</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
 <div class="page-wrapper">
+
   <nav class="chapter-nav">
-    <a href="chapter-09.html">&larr; Previous: Infrastructure &amp; Deployment</a>
+    <a href="chapter-09.html">&larr; Previous: Phase 2 &mdash; Document Parsers &amp; Chunking</a>
     <span class="nav-spacer">|</span>
     <a href="index.html">Contents</a>
     <span class="nav-spacer">|</span>
-    <a href="chapter-11.html">Next: Key Design Decisions &rarr;</a>
+    <a href="chapter-11.html">Next: Phase 4 &mdash; Query Pipeline &amp; Synthesis &rarr;</a>
   </nav>
+
   <div class="chapter-header">
     <div class="chapter-number">Chapter 10</div>
-    <h1>Implementation Roadmap</h1>
-    <p class="chapter-subtitle">The 6-phase build plan, acceptance tests, and what comes after v1.</p>
+    <h1>Phase 3 &mdash; Search Index &amp; Ingestion Pipeline</h1>
+    <p class="chapter-subtitle">The Azure AI Search index, the Durable Functions orchestrator that fills it, webhooks, delta sync, and near-duplicate detection.</p>
   </div>
 
-  <p>Building BSearch is not a single monolithic effort. It&rsquo;s a sequence of <strong>six phases</strong>, each producing a testable milestone &mdash; something you can run, poke at, and verify before moving on. This chapter lays out those phases, the acceptance tests that confirm the system works end-to-end, the features deliberately left out of v1, and the roadmap for what comes next.</p>
+  <!-- ================================================================ -->
+  <!-- 10.1 What You're Building -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">10.1</span> What You&rsquo;re Building</h2>
+
+  <p>This phase connects the parsers you built in Phase 2 to Azure AI Search and makes the index stay current as files change. You are building three things: the search index itself (the schema, vector configuration, and scoring profiles), the orchestrator that processes documents through the full pipeline (fetch, parse, chunk, embed, write), and the infrastructure that keeps the index in sync with SharePoint (webhooks, delta sync, and near-duplicate detection).</p>
+
+  <p>The orchestrator is the most complex piece. It uses Azure Durable Functions &mdash; a framework that lets you write multi-step workflows with built-in checkpointing and retry logic. A single orchestrator handles both the initial bulk load (all 550,000 documents) and ongoing incremental sync (individual file changes triggered by webhooks). Same code path, same retry behavior, same error handling.</p>
+
+  <p>By the end of this phase, you can ingest a batch of documents, query them in Azure AI Search, see their entities in Neo4j, and watch a file change in SharePoint automatically propagate through the pipeline into the index. Near-duplicate detection ensures that &ldquo;Deal Summary v3 FINAL (2).docx&rdquo; does not clutter search results alongside &ldquo;Deal Summary v3 FINAL.docx.&rdquo;</p>
+
+  <!-- ================================================================ -->
+  <!-- 10.2 Before You Start -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">10.2</span> Before You Start</h2>
+
+  <div class="before-you-start">
+    <div class="section-label">Prerequisites</div>
+    <ul>
+      <li>Azure AI Search (S1) provisioned via Phase 1 Bicep templates</li>
+      <li>Cosmos DB (serverless) provisioned via Phase 1 Bicep</li>
+      <li>Neo4j Aura instance provisioned (Free tier for dev, Pro for prod)</li>
+      <li>Phase 2 parsers working and tested &mdash; Word, Excel, PowerPoint, and PDF parsers produce correct chunks from real documents</li>
+      <li>Embedding provider abstraction implemented (Phase 2) &mdash; <code>EmbeddingProvider</code> interface, Voyage AI implementation, factory function</li>
+      <li>Graph API client working (Phase 1) &mdash; can authenticate and list files from SharePoint drives</li>
+    </ul>
+    <div class="section-label" style="margin-top: 1rem;">Decisions to Confirm</div>
+    <ul>
+      <li><strong>Dedup cosine threshold: 0.95</strong> &mdash; two documents must have first-chunk cosine similarity at or above this value to be considered duplicates. Too low and you merge genuinely different files; too high and you miss real duplicates. 0.95 is calibrated in Phase 6 against real data</li>
+      <li><strong>Recency boost parameters: 1.5x for documents modified within the last 30 days</strong> &mdash; this controls how much newer documents are favored in search results. The boost decays linearly from 1.5x at day 0 to 1.0x at day 30</li>
+    </ul>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- 10.3 The Spec -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">10.3</span> The Spec</h2>
+
+  <!-- -------------------------------- -->
+  <!-- Azure AI Search Index Schema -->
+  <!-- -------------------------------- -->
+  <h3>Azure AI Search Index Schema</h3>
+
+  <p>The index has 25+ fields organized into seven categories. Every chunk of every document gets all of these fields populated at ingestion time. The schema is designed for hybrid search (keyword + vector), entity-based filtering, and recency scoring &mdash; all at zero additional query-time cost.</p>
+
+  <h4>Core Fields</h4>
+  <table>
+    <thead>
+      <tr>
+        <th>Field</th>
+        <th>Type</th>
+        <th>Attributes</th>
+        <th>Purpose</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>chunk_id</code></td>
+        <td>Edm.String</td>
+        <td>key</td>
+        <td>Primary key. Deterministic: <code>{file_id}_{chunk_index}</code> for idempotent upserts</td>
+      </tr>
+      <tr>
+        <td><code>file_id</code></td>
+        <td>Edm.String</td>
+        <td>filterable</td>
+        <td>Graph API item ID. Used for atomic delete-all-chunks-by-file on updates</td>
+      </tr>
+      <tr>
+        <td><code>file_name</code></td>
+        <td>Edm.String</td>
+        <td>searchable, filterable</td>
+        <td>Original filename. BM25-searchable for file lookup queries</td>
+      </tr>
+      <tr>
+        <td><code>file_type</code></td>
+        <td>Edm.String</td>
+        <td>filterable</td>
+        <td>Extension: docx, xlsx, pptx, pdf</td>
+      </tr>
+      <tr>
+        <td><code>source_folder</code></td>
+        <td>Edm.String</td>
+        <td>filterable</td>
+        <td>Top-level SharePoint folder. Used for permission filtering at query time</td>
+      </tr>
+      <tr>
+        <td><code>m365_url</code></td>
+        <td>Edm.String</td>
+        <td>&mdash;</td>
+        <td>SharePoint deep link. Shown in source cards so users can open the original file</td>
+      </tr>
+      <tr>
+        <td><code>last_modified</code></td>
+        <td>Edm.DateTimeOffset</td>
+        <td>filterable, sortable</td>
+        <td>File last-modified timestamp. Drives the recency scoring profile</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h4>Content Fields</h4>
+  <table>
+    <thead>
+      <tr>
+        <th>Field</th>
+        <th>Type</th>
+        <th>Attributes</th>
+        <th>Purpose</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>content</code></td>
+        <td>Edm.String</td>
+        <td>searchable</td>
+        <td>The chunk text. BM25-indexed for keyword search</td>
+      </tr>
+      <tr>
+        <td><code>chunk_index</code></td>
+        <td>Edm.Int32</td>
+        <td>filterable, sortable</td>
+        <td>Position within the document (0-indexed). Used for ordering and sibling retrieval</td>
+      </tr>
+      <tr>
+        <td><code>chunk_type</code></td>
+        <td>Edm.String</td>
+        <td>filterable</td>
+        <td>One of: <code>content</code>, <code>table</code>, <code>doc_summary</code>, <code>deal_summary</code>. Controls which chunks are used for different query types</td>
+      </tr>
+      <tr>
+        <td><code>doc_section</code></td>
+        <td>Edm.String</td>
+        <td>&mdash;</td>
+        <td>Section heading context (e.g., &ldquo;Company Overview &gt; Financial Highlights&rdquo;)</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h4>Metadata &amp; Classification Fields</h4>
+  <table>
+    <thead>
+      <tr>
+        <th>Field</th>
+        <th>Type</th>
+        <th>Attributes</th>
+        <th>Purpose</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>doc_type</code></td>
+        <td>Edm.String</td>
+        <td>filterable</td>
+        <td>Document classification: <code>cim</code>, <code>teaser</code>, <code>model</code>, <code>engagement_letter</code>, <code>nda</code>, <code>management_presentation</code>, <code>diligence_tracker</code>, <code>board_deck</code>, <code>process_letter</code>, <code>ioi</code>, <code>loi</code>, <code>purchase_agreement</code>, <code>memo</code>, <code>other</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h4>Deal Context Fields</h4>
+  <table>
+    <thead>
+      <tr>
+        <th>Field</th>
+        <th>Type</th>
+        <th>Attributes</th>
+        <th>Purpose</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>deal_id</code></td>
+        <td>Edm.String</td>
+        <td>filterable</td>
+        <td>Deterministic hash of the deal subfolder path. Null for non-deal files</td>
+      </tr>
+      <tr>
+        <td><code>deal_name</code></td>
+        <td>Edm.String</td>
+        <td>filterable, searchable</td>
+        <td>Canonical deal name from Neo4j. Same for all chunks in the deal</td>
+      </tr>
+      <tr>
+        <td><code>deal_aliases</code></td>
+        <td>Edm.String</td>
+        <td>searchable</td>
+        <td>Space-separated name variants (code name + real name). BM25-searchable so &ldquo;Project Atlas&rdquo; finds &ldquo;Acme Corp&rdquo; chunks</td>
+      </tr>
+      <tr>
+        <td><code>deal_status</code></td>
+        <td>Edm.String</td>
+        <td>filterable</td>
+        <td>One of: <code>active</code>, <code>closed</code>, <code>on_hold</code>, <code>dead</code>. Inferred from deal activity recency</td>
+      </tr>
+      <tr>
+        <td><code>deal_stage</code></td>
+        <td>Edm.String</td>
+        <td>filterable</td>
+        <td>Inferred from doc_type: <code>origination</code>, <code>marketing</code>, <code>bidding</code>, <code>negotiation</code>, <code>diligence</code>, <code>closing</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h4>Entity Fields</h4>
+  <table>
+    <thead>
+      <tr>
+        <th>Field</th>
+        <th>Type</th>
+        <th>Attributes</th>
+        <th>Scope</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>companies</code></td>
+        <td>Collection(Edm.String)</td>
+        <td>filterable, searchable</td>
+        <td>Chunk-scoped &mdash; company names mentioned in this specific chunk (from NER)</td>
+      </tr>
+      <tr>
+        <td><code>company_roles</code></td>
+        <td>Collection(Edm.String)</td>
+        <td>filterable, searchable</td>
+        <td>Document-scoped &mdash; <code>&ldquo;advisor:Goldman Sachs&rdquo;</code> format. Same for all chunks in the document</td>
+      </tr>
+      <tr>
+        <td><code>people</code></td>
+        <td>Collection(Edm.String)</td>
+        <td>filterable, searchable</td>
+        <td>Chunk-scoped &mdash; person names mentioned in this specific chunk (from NER)</td>
+      </tr>
+      <tr>
+        <td><code>industries</code></td>
+        <td>Collection(Edm.String)</td>
+        <td>filterable, searchable</td>
+        <td>Deal-scoped &mdash; from Neo4j Deal node. Same for all chunks in the deal</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <div class="callout-title">Why Two Scopes for Entity Fields?</div>
+    <p><code>companies</code> and <code>people</code> vary per chunk &mdash; they tell you what entities are <em>mentioned in this specific passage</em>. This powers queries like &ldquo;which chunks mention Goldman?&rdquo; The deal-scoped fields (<code>company_roles</code>, <code>industries</code>, <code>deal_status</code>, <code>deal_stage</code>) are the same for every chunk in a deal &mdash; they power filter queries like &ldquo;chunks from deals where Goldman was advisor&rdquo; or &ldquo;chunks from healthcare deals.&rdquo;</p>
+  </div>
+
+  <h4>Dedup Fields</h4>
+  <table>
+    <thead>
+      <tr>
+        <th>Field</th>
+        <th>Type</th>
+        <th>Attributes</th>
+        <th>Purpose</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>duplicate_group_id</code></td>
+        <td>Edm.String</td>
+        <td>filterable, nullable</td>
+        <td>Shared identifier for all files in a confirmed duplicate cluster. Null if no duplicates</td>
+      </tr>
+      <tr>
+        <td><code>is_canonical</code></td>
+        <td>Edm.Boolean</td>
+        <td>filterable (default: true)</td>
+        <td>Only the most recent version in a duplicate cluster is <code>true</code>. All search queries filter on <code>is_canonical eq true</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h4>Embedding Provenance Fields</h4>
+  <table>
+    <thead>
+      <tr>
+        <th>Field</th>
+        <th>Type</th>
+        <th>Attributes</th>
+        <th>Purpose</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>embedding_model</code></td>
+        <td>Edm.String</td>
+        <td>filterable</td>
+        <td>Which model produced this vector, e.g., <code>&ldquo;voyage/voyage-context-3&rdquo;</code></td>
+      </tr>
+      <tr>
+        <td><code>embedding_dimensions</code></td>
+        <td>Edm.Int32</td>
+        <td>filterable</td>
+        <td>Vector dimension count (1024). Required for blue-green re-indexing</td>
+      </tr>
+      <tr>
+        <td><code>embedding_version</code></td>
+        <td>Edm.String</td>
+        <td>filterable</td>
+        <td>Config-driven tag (e.g., <code>&ldquo;v1&rdquo;</code>). Incremented on any model/provider/dimension change</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="definition">
+    <p><span class="term">Embedding provenance</span> &mdash; Metadata stamped on every chunk recording which embedding model produced its vector, at what dimensions, and under which version tag. These fields are never used in search scoring &mdash; they exist so the blue-green re-indexing orchestrator can identify stale chunks and so operators can monitor for mixed-model drift.</p>
+  </div>
+
+  <h4>Vector Search Configuration</h4>
+  <table>
+    <thead>
+      <tr>
+        <th>Setting</th>
+        <th>Value</th>
+        <th>Notes</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Algorithm</td>
+        <td>HNSW</td>
+        <td>Hierarchical Navigable Small World &mdash; the standard algorithm for approximate nearest-neighbor search. Fast at query time, builds the index incrementally</td>
+      </tr>
+      <tr>
+        <td>Dimensions</td>
+        <td>1024</td>
+        <td>Matches voyage-context-3 output. Parameterized in <code>create_index()</code> so blue-green re-indexing can create indexes with different dimensions</td>
+      </tr>
+      <tr>
+        <td>Distance metric</td>
+        <td>Cosine</td>
+        <td>Standard for text embeddings</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h4>Scoring Profile: <code>recency_boost</code></h4>
+
+  <p>A freshness function on the <code>last_modified</code> field that boosts recently modified documents in search results:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Parameter</th>
+        <th>Value</th>
+        <th>Effect</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Boost factor</td>
+        <td>1.5</td>
+        <td>Maximum multiplier applied to BM25 score for the freshest documents</td>
+      </tr>
+      <tr>
+        <td>Boosting duration</td>
+        <td>P30D (30 days)</td>
+        <td>Boost decays linearly from 1.5x at day 0 to 1.0x at day 30. Documents older than 30 days get no boost</td>
+      </tr>
+    </tbody>
+  </table>
 
   <div class="callout ib-analogy">
     <div class="callout-title">IB Analogy</div>
-    <p>Think of each phase like a workstream in a sell-side process. You don&rsquo;t try to do everything at once &mdash; you run the data room setup, then the marketing materials, then buyer outreach, then management presentations, then final bids. Each workstream has a deliverable that gates the next one. Same idea here.</p>
+    <p>The recency boost is like the instinct to check the most recently modified version of a model first. When someone asks &ldquo;Where&rsquo;s the latest GovTech deck?&rdquo;, the word &ldquo;latest&rdquo; is implicit in almost every IB file search. The scoring profile bakes that instinct into the ranking algorithm.</p>
   </div>
-
-  <!-- TIMELINE DIAGRAM -->
-  <h2><span class="section-number">10.1</span> Build Timeline</h2>
-
-  <p>Here&rsquo;s the full build sequence. Each phase has two time estimates: <strong>human time</strong> (how long you&rsquo;ll spend reviewing, testing, and making decisions) and <strong>Claude Code time</strong> (how long the AI takes to write the code). The human time is the bottleneck.</p>
-
-  <pre class="mermaid">
-gantt
-    title BSearch v1 Build Timeline
-    dateFormat  YYYY-MM-DD
-    axisFormat  %b %d
-
-    section Phase 1
-    Scaffold + Infra           :p1, 2026-03-24, 2d
-
-    section Phase 2
-    Parsers + Chunking         :p2, after p1, 5d
-
-    section Phase 3
-    Index + Ingestion          :p3, after p2, 5d
-
-    section Phase 4
-    Query Pipeline             :p4, after p3, 5d
-
-    section Phase 5
-    Web App                    :p5, after p4, 5d
-
-    section Phase 6
-    Integration + Acceptance   :p6, after p5, 3d
-  </pre>
-
-  <p>Total wall-clock time: <strong>~5&ndash;6 weeks</strong> of human effort. Total Claude Code generation time across all phases: roughly <strong>2.5 hours</strong>. The vast majority of your time is spent reviewing generated code, running tests, and making judgment calls &mdash; not writing code yourself.</p>
-
-  <!-- PHASE DEPENDENCY DIAGRAM -->
-  <h2><span class="section-number">10.2</span> Phase Dependencies</h2>
-
-  <p>Each phase builds on the output of the previous one. You can&rsquo;t build the query pipeline until the search index exists, and you can&rsquo;t build the web app until the API is running.</p>
-
-  <pre class="mermaid">
-flowchart LR
-    P1["Phase 1\nScaffold + Infra"] --> P2["Phase 2\nParsers + Chunking"]
-    P2 --> P3["Phase 3\nIndex + Ingestion"]
-    P3 --> P4["Phase 4\nQuery Pipeline"]
-    P4 --> P5["Phase 5\nWeb App"]
-    P5 --> P6["Phase 6\nIntegration +\nAcceptance"]
-
-    style P1 fill:#f5e6d3,stroke:#D4793A,color:#3B2F2F
-    style P2 fill:#f5e6d3,stroke:#D4793A,color:#3B2F2F
-    style P3 fill:#dbeafe,stroke:#4A7FB5,color:#3B2F2F
-    style P4 fill:#dbeafe,stroke:#4A7FB5,color:#3B2F2F
-    style P5 fill:#d4edda,stroke:#2E7D5B,color:#3B2F2F
-    style P6 fill:#d4edda,stroke:#2E7D5B,color:#3B2F2F
-  </pre>
 
   <hr>
 
-  <!-- THE 6 PHASES -->
-  <h2><span class="section-number">10.3</span> The 6 Phases</h2>
-
-  <!-- PHASE 1 -->
-  <h3>Phase 1: Project Scaffold + Infrastructure</h3>
-  <p><strong>Human: ~2 days &nbsp;|&nbsp; Claude Code: ~20 min</strong></p>
-
-  <p><strong>What gets built:</strong></p>
-  <ul>
-    <li><strong>Monorepo structure</strong> &mdash; the folder layout for the entire project, with separate directories for the API, web app, infrastructure templates, and shared code</li>
-    <li><strong>Bicep templates</strong> &mdash; infrastructure-as-code files that define every Azure resource (search index, function app, Cosmos DB, etc.) so environments can be provisioned with a single command</li>
-    <li><strong>Development environment</strong> &mdash; Python virtual environment, dependency management, linting rules</li>
-    <li><strong>Config system</strong> &mdash; centralized settings using Pydantic BaseSettings (a Python library that validates configuration values and loads them from environment variables)</li>
-    <li><strong>Data models</strong> &mdash; Python type definitions for documents, chunks, entities, and other core objects</li>
-    <li><strong>Graph API client</strong> &mdash; the module for talking to Microsoft&rsquo;s SharePoint API</li>
-    <li><strong>Neo4j Aura provisioning</strong> &mdash; setting up the hosted graph database instance</li>
-  </ul>
-
-  <p><strong>Testable output:</strong> Run <code>az deployment group create</code> and all Azure resources provision successfully. The project structure exists, dependencies install, and the config system loads settings.</p>
-
-  <p><strong>Key risks:</strong> Azure subscription permissions and quota limits. If your subscription doesn&rsquo;t have the right resource providers registered, provisioning will fail with obscure error messages.</p>
-
-  <!-- PHASE 2 -->
-  <h3>Phase 2: Format-Aware Parsers + Chunking</h3>
-  <p><strong>Human: ~1 week &nbsp;|&nbsp; Claude Code: ~30 min</strong></p>
-
-  <p><strong>What gets built:</strong></p>
-  <ul>
-    <li><strong>All 4 parsers</strong> &mdash; Word, Excel, PowerPoint, and PDF (see <a href="chapter-04.html">Chapter 4</a> for details on each)</li>
-    <li><strong>Table splitter</strong> &mdash; hierarchical row-group detection that finds smart split points in large financial tables</li>
-    <li><strong>Document summary generation</strong> &mdash; Haiku-powered summaries for long documents</li>
-    <li><strong>Deal summary generation</strong> &mdash; Haiku + Neo4j entity data to create deal-level overviews</li>
-    <li><strong>Metadata extraction</strong> &mdash; document type classification, deal identification, entity extraction</li>
-    <li><strong>Neo4j client + entity registry + graph cleanup</strong> &mdash; the code that writes entities to the knowledge graph and handles deduplication</li>
-    <li><strong>Embedding provider abstraction</strong> &mdash; a clean interface around the Voyage AI embedding model, designed so the provider can be swapped later without changing the rest of the code</li>
-  </ul>
-
-  <p><strong>Testable output:</strong> Feed a real CIM through the pipeline. Verify that chunks look right &mdash; narrative sections are properly bounded, tables split at logical row groups, slide chunks carry their titles. Inspect the Neo4j graph and see entities with correct relationships.</p>
-
-  <p><strong>Key risks:</strong> Edge cases in real documents. The parsers will work perfectly on clean test files and then encounter a 2018 CIM with nested tables inside text boxes inside grouped shapes. Budget time for iterating on real-world documents.</p>
-
-  <!-- PHASE 3 -->
-  <h3>Phase 3: Search Index + Ingestion Orchestrator</h3>
-  <p><strong>Human: ~1 week &nbsp;|&nbsp; Claude Code: ~30 min</strong></p>
-
-  <p><strong>What gets built:</strong></p>
-  <ul>
-    <li><strong>Azure AI Search index</strong> &mdash; the full schema with all fields, vector configuration, scoring profiles, and synonym maps</li>
-    <li><strong>Durable Functions orchestrator</strong> &mdash; the fan-out/fan-in workflow engine that processes batches of documents in parallel (fan out to parse each file, fan in to collect results and push to the index)</li>
-    <li><strong>Webhook receiver + subscription management</strong> &mdash; the endpoint that SharePoint calls when files change, plus the background job that keeps webhook subscriptions alive</li>
-    <li><strong>Delta sync with Cosmos DB tokens</strong> &mdash; the periodic catch-up mechanism that queries SharePoint for changes since the last known state</li>
-    <li><strong>Near-duplicate dedup</strong> &mdash; filename normalization + embedding similarity to catch &ldquo;v3 FINAL FINAL&rdquo; copies</li>
-    <li><strong>Blue-green re-indexing orchestrator</strong> &mdash; the ability to build a new index alongside the live one and swap them atomically, so re-indexing never causes downtime</li>
-  </ul>
+  <!-- -------------------------------- -->
+  <!-- Durable Functions Orchestrator -->
+  <!-- -------------------------------- -->
+  <h3>Durable Functions Orchestrator</h3>
 
   <div class="definition">
-    <span class="term">Fan-out/fan-in:</span> A pattern where a single job spawns many parallel sub-jobs (fan out) and then waits for all of them to finish before continuing (fan in). Like assigning 10 analysts to each comp a different company, then collecting all the comp sheets to build the final page.
+    <p><span class="term">Azure Durable Functions</span> &mdash; A framework for writing multi-step, long-running workflows in Azure Functions. It provides automatic checkpointing (if the process crashes at step 4 of 7, it resumes at step 4, not step 1), fan-out/fan-in parallelism (process 50 files simultaneously, then collect all results), and retry policies with exponential backoff.</p>
   </div>
 
-  <p><strong>Testable output:</strong> Ingest 100 real documents. Query Azure AI Search directly and see results with correct metadata, embeddings, and entity fields.</p>
+  <p>The orchestrator is the central pipeline that takes a list of file changes (from webhooks, delta sync, or manual bulk trigger) and processes each file through the full ingestion chain. The same orchestrator handles both the initial bulk load of 550,000 documents and ongoing incremental updates from a single file change.</p>
 
-  <p><strong>Key risks:</strong> Webhook reliability and Graph API rate limits. Microsoft throttles API calls per tenant, and webhook notifications can arrive out of order or be delayed. The delta sync fallback exists precisely because webhooks alone aren&rsquo;t 100% reliable.</p>
+  <h4>Activity Chain (per file)</h4>
 
-  <!-- PHASE 4 -->
-  <h3>Phase 4: Query Pipeline</h3>
-  <p><strong>Human: ~1 week &nbsp;|&nbsp; Claude Code: ~30 min</strong></p>
+  <p>Each file flows through this sequence of activity functions. Durable Functions checkpoints after each step &mdash; if any step fails, the orchestrator retries that step with exponential backoff rather than restarting the entire file.</p>
 
-  <p><strong>What gets built:</strong></p>
-  <ul>
-    <li><strong>FastAPI app with SSE endpoint</strong> &mdash; the API server that receives search queries and streams answers back in real time (SSE = Server-Sent Events, the technology that lets the answer appear word by word)</li>
-    <li><strong>Query classifier</strong> &mdash; regex patterns + Haiku to determine query type (file lookup, data extraction, precedent search, or multi-doc synthesis)</li>
-    <li><strong>Query expander</strong> &mdash; static synonyms + Haiku + Neo4j aliases to broaden queries (so &ldquo;multiple&rdquo; also searches for &ldquo;EV/EBITDA&rdquo;)</li>
-    <li><strong>Search client</strong> &mdash; hybrid search (keyword + vector) with entity-based filters</li>
-    <li><strong>Reranker + health monitoring</strong> &mdash; the cross-encoder model that re-scores results for relevance, with automatic fallback if the reranker service degrades</li>
-    <li><strong>Claude synthesis</strong> &mdash; three prompt strategies tailored to different query types</li>
-    <li><strong>Auth</strong> &mdash; Azure AD token validation and SharePoint folder-level permission checks</li>
-  </ul>
+  <ol>
+    <li><strong>Fetch file</strong> &mdash; Download from SharePoint via Graph API</li>
+    <li><strong>Parse</strong> &mdash; Format-aware parser (Word, Excel, PPT, or PDF via Azure Document Intelligence)</li>
+    <li><strong>Extract metadata</strong> &mdash; Determine <code>doc_type</code>, compute <code>deal_id</code> from folder path, extract per-file <code>deal_name</code>, run Tier 1 entity extraction (companies, roles, industry, deal stage)</li>
+    <li><strong>Write to Neo4j</strong> &mdash; MERGE Deal node (aliases, canonical_name, industries), MERGE Company nodes, MERGE relationship edges with <code>source_file_id</code> provenance, update deal status, create StageEntry if applicable</li>
+    <li><strong>Chunk</strong> &mdash; Split into content, table, and slide chunks using Phase 2 chunking logic. Generate doc summary if chunk count is above threshold</li>
+    <li><strong>Entity extraction (per chunk)</strong> &mdash; Tier 3 NER on every chunk (company/person mentions). Tier 2 Haiku extraction on high-value chunks only (financial tables, structured people sections, IOI/LOI body)</li>
+    <li><strong>Embed</strong> &mdash; All chunks (including summary) embedded via Voyage AI <code>voyage-context-3</code> with full document text as context. Stamp embedding provenance metadata from provider instance</li>
+    <li><strong>Check dedup</strong> &mdash; Run near-duplicate detection, update canonical flags across the cluster</li>
+    <li><strong>Write to Azure AI Search</strong> &mdash; Upsert all chunks with complete field population</li>
+    <li><strong>Queue deal summary update</strong> &mdash; If file has a <code>deal_id</code>, queue a debounced deal summary regeneration</li>
+  </ol>
 
-  <p><strong>Testable output:</strong> Ask a question via the API. Get a streaming answer with citations that link back to specific chunks and source documents.</p>
+  <h4>Fan-Out/Fan-In for Bulk Ingestion</h4>
 
-  <p><strong>Key risks:</strong> Latency. The query pipeline chains multiple API calls (classify, expand, search, rerank, synthesize), and each adds latency. If any step is slow, the user stares at a blank screen. Time-to-first-token (how quickly the first word of the answer appears) is the critical metric.</p>
+  <div class="definition">
+    <p><span class="term">Fan-out/fan-in</span> &mdash; A pattern where a single job spawns many parallel sub-jobs (fan out) and then waits for all of them to finish before continuing (fan in). Like assigning 10 analysts to each comp a different company, then collecting all the comp sheets to build the final page.</p>
+  </div>
 
-  <!-- PHASE 5 -->
-  <h3>Phase 5: Web App</h3>
-  <p><strong>Human: ~1 week &nbsp;|&nbsp; Claude Code: ~30 min</strong></p>
-
-  <p><strong>What gets built:</strong></p>
-  <ul>
-    <li><strong>Vite + React SPA</strong> &mdash; a single-page web application using modern JavaScript tooling</li>
-    <li><strong>Search bar &rarr; SSE stream &rarr; progressive markdown rendering</strong> &mdash; the user types a question, the answer streams in word by word, and formatting (bold, bullet points, tables) renders as it arrives</li>
-    <li><strong>Confidence banners</strong> &mdash; yellow banner for LOW confidence answers, orange banner when the reranker is degraded</li>
-    <li><strong>Deep search indicator</strong> &mdash; visual feedback for multi-document queries that take longer to process</li>
-    <li><strong>Source cards with SharePoint deep links</strong> &mdash; clickable citations that open the source document directly in SharePoint</li>
-    <li><strong>Conversation history</strong> &mdash; past searches are saved and browsable</li>
-    <li><strong>Azure AD auth via Static Web Apps</strong> &mdash; single sign-on using the same firm credentials everyone already has</li>
-  </ul>
-
-  <p><strong>Testable output:</strong> Open a browser, navigate to the app, search for something, and see a streaming answer with citations and source links. Click a source card and land on the right file in SharePoint.</p>
-
-  <p><strong>Key risks:</strong> SSE streaming edge cases in browsers. Some corporate proxy configurations can buffer SSE streams, making the &ldquo;word by word&rdquo; effect appear as a delayed dump. Worth testing from the actual office network early.</p>
-
-  <!-- PHASE 6 -->
-  <h3>Phase 6: Integration + Acceptance Testing</h3>
-  <p><strong>Human: ~3 days &nbsp;|&nbsp; Claude Code: ~20 min</strong></p>
-
-  <p><strong>What gets built:</strong></p>
-  <ul>
-    <li><strong>Full Azure deployment</strong> &mdash; deploy everything to production infrastructure</li>
-    <li><strong>Relevance gate calibration</strong> &mdash; run 30+ queries, analyze score distributions, and set the thresholds that determine when BSearch says &ldquo;I don&rsquo;t know&rdquo; vs. returning low-confidence results</li>
-    <li><strong>BM25 boost weight calibration</strong> &mdash; tune how much keyword match scores are weighted vs. vector similarity scores</li>
-    <li><strong>5 acceptance test queries</strong> &mdash; the final validation suite (detailed below)</li>
-    <li><strong>Scale-up to full document set</strong> &mdash; index all ~550,000 documents and verify performance at scale</li>
-  </ul>
-
-  <p><strong>Testable output:</strong> All 5 acceptance queries return correct answers. The system handles the full 550K document corpus without performance degradation.</p>
-
-  <p><strong>Key risks:</strong> Threshold calibration is empirical, not theoretical. You have to look at real score distributions across dozens of queries to find the right cutoffs. This is more art than science &mdash; expect a few iterations.</p>
-
-  <hr>
-
-  <!-- ACCEPTANCE TESTS -->
-  <h2><span class="section-number">10.4</span> The 5 Acceptance Test Queries</h2>
-
-  <p>These five queries are the final exam. Each one exercises a different capability, and together they validate that the entire system &mdash; from ingestion to synthesis &mdash; works correctly. If all five return good answers, v1 is ready to ship.</p>
+  <p>The orchestrator processes files in batches. Configurable concurrency caps prevent overwhelming external APIs:</p>
 
   <table>
     <thead>
       <tr>
-        <th>#</th>
-        <th>Query</th>
-        <th>Type</th>
-        <th>Expected Result</th>
-        <th>What It Validates</th>
+        <th>Mode</th>
+        <th>Max Concurrent Files</th>
+        <th>Use Case</th>
       </tr>
     </thead>
     <tbody>
       <tr>
-        <td><strong>1</strong></td>
-        <td>&ldquo;Where&rsquo;s the latest GovTech deck?&rdquo;</td>
-        <td>File lookup</td>
-        <td>Latest version with SharePoint link</td>
-        <td>Regex fast path, BM25 on file_name, recency boost</td>
+        <td>Bulk ingestion</td>
+        <td>50</td>
+        <td>Initial load of all 550K documents. Conservative to avoid Graph API throttling</td>
       </tr>
       <tr>
-        <td><strong>2</strong></td>
-        <td>&ldquo;Which firms did we reach out to for Govini?&rdquo;</td>
-        <td>Data extraction</td>
-        <td>Firm names with source citations</td>
-        <td>Entity extraction, precise synthesis</td>
+        <td>Delta sync</td>
+        <td>200</td>
+        <td>Processing a batch of changed files. Higher concurrency because batches are smaller</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h4>File Update and Deletion</h4>
+
+  <p>When a file is updated or deleted, the orchestrator runs a three-step cleanup before (re-)ingesting:</p>
+
+  <ol>
+    <li><code>dedup.handle_file_deletion(file_id)</code> &mdash; remove from duplicate cluster, promote next-most-recent if deleted file was canonical</li>
+    <li><code>graph_cleanup.cleanup_file_from_graph(file_id, deal_id)</code> &mdash; remove <code>source_file_id</code> from Neo4j edges, delete edges with no remaining provenance, delete StageEntry nodes from this file, recompute deal status</li>
+    <li><code>indexer.delete_by_file_id(file_id)</code> &mdash; atomically delete all chunks for this file from Azure AI Search</li>
+  </ol>
+
+  <p>For updates, the normal ingestion pipeline then runs on the new file content.</p>
+
+  <h4>Rate Limiting</h4>
+
+  <p>Three layers prevent external API overload during bulk operations:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Layer</th>
+        <th>Mechanism</th>
+        <th>Limits</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Orchestrator batch size</td>
+        <td>Durable Functions fan-out batch</td>
+        <td>50 concurrent files (bulk), 200 (delta)</td>
       </tr>
       <tr>
-        <td><strong>3</strong></td>
-        <td>&ldquo;Find me a good situation overview slide&rdquo;</td>
-        <td>Precedent search</td>
-        <td>Slide-level result from historical deck</td>
-        <td>Slide chunking, cross-deal search</td>
+        <td>Per-provider semaphores</td>
+        <td><code>asyncio.Semaphore</code> per API</td>
+        <td>Haiku: 80, Voyage AI: 50, Graph API: 20, Cohere: 20</td>
       </tr>
       <tr>
-        <td><strong>4</strong></td>
-        <td>&ldquo;What multiple did we use for [deal]?&rdquo;</td>
-        <td>Data extraction</td>
-        <td>EV/EBITDA value from model/summary</td>
-        <td>Synonym expansion (&ldquo;multiple&rdquo; &rarr; &ldquo;EV/EBITDA&rdquo;)</td>
+        <td>Adaptive backpressure</td>
+        <td>429 rate monitoring</td>
+        <td>If 429 rate exceeds 5% over 1 minute: halve that provider&rsquo;s semaphore. Restore after 5 minutes of zero 429s</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <hr>
+
+  <!-- -------------------------------- -->
+  <!-- Dual-Write Neo4j + Search -->
+  <!-- -------------------------------- -->
+  <h3>Neo4j Dual-Write</h3>
+
+  <p>Every file ingestion writes to two data stores: Neo4j (entity relationships) and Azure AI Search (document chunks). The write order matters for consistency.</p>
+
+  <div class="callout info">
+    <div class="callout-title">Write Order: Neo4j First, Then Search</div>
+    <p>Neo4j is the source of truth for entity data. Chunks in Azure AI Search carry denormalized copies of entity fields (<code>deal_name</code>, <code>companies</code>, <code>industries</code>, etc.) copied from Neo4j at ingestion time. Writing Neo4j first ensures entity fields on chunks are always current.</p>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Failure Scenario</th>
+        <th>Recovery</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Neo4j write fails</td>
+        <td>Write chunks to Azure AI Search <em>without</em> entity fields. Queue file in Cosmos DB <code>retry_queue</code> with exponential backoff (1min, 5min, 30min, 2hr). On retry: write to Neo4j, then patch chunk entity fields in Search. After 5 failures: alert + manual intervention</td>
       </tr>
       <tr>
-        <td><strong>5</strong></td>
-        <td>&ldquo;Where do we stand on active deals?&rdquo;</td>
-        <td>Multi-doc synthesis</td>
-        <td>Deal-by-deal overview with citations</td>
-        <td>Deal summaries, extended thinking, deep search UX</td>
+        <td>Azure AI Search write fails</td>
+        <td>Neo4j already has entity data. Queue chunk for retry. On retry: write chunks with entity fields populated from Neo4j</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <hr>
+
+  <!-- -------------------------------- -->
+  <!-- Voyage AI Embedding -->
+  <!-- -------------------------------- -->
+  <h3>Voyage AI Embedding</h3>
+
+  <p>BSearch uses <strong>voyage-context-3</strong> at <strong>1024 dimensions</strong> for all embeddings. The defining feature of this model is contextual embedding: each chunk is embedded alongside the full document text, so the model understands what the chunk means in context rather than treating it as an isolated fragment.</p>
+
+  <div class="definition">
+    <p><span class="term">Contextual embeddings</span> &mdash; An embedding approach where each chunk is embedded with awareness of its surrounding document. A chunk saying &ldquo;Revenue grew 15%&rdquo; gets a different vector depending on whether the full document is an Acme Corp CIM or a general market report. This solves the fundamental chunking problem where isolated chunks lose meaning.</p>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Setting</th>
+        <th>Value</th>
+        <th>Notes</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Model</td>
+        <td><code>voyage-context-3</code></td>
+        <td>+14.24% chunk retrieval improvement over OpenAI text-embedding-3-large</td>
+      </tr>
+      <tr>
+        <td>Dimensions</td>
+        <td>1024</td>
+        <td>Scalable to 2048 via MRL. 32K token context window</td>
+      </tr>
+      <tr>
+        <td>Ingestion</td>
+        <td>Batch embed with document context</td>
+        <td>Groups chunks by file, passes full document text. No cache, no timeout &mdash; retries handled by Durable Functions</td>
+      </tr>
+      <tr>
+        <td>Query</td>
+        <td>Single query embed with LRU cache</td>
+        <td>~1000 entries, version-prefixed keys for automatic invalidation on model change. 500ms hard timeout, BM25-only fallback on failure</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h4>Provider Abstraction Layer</h4>
+
+  <p>All embedding calls go through an abstract <code>EmbeddingProvider</code> interface. The interface accepts a <code>document_context</code> parameter &mdash; contextual models use it, standard models ignore it. A factory function reads the <code>EMBEDDING_PROVIDER</code> environment variable and returns the correct implementation. This means switching to a different embedding model is a config change + re-index, not a code rewrite.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Interface Method</th>
+        <th>Signature</th>
+        <th>Used By</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>embed_chunks</code></td>
+        <td><code>(chunks, document_context?, input_type?) &rarr; list[list[float]]</code></td>
+        <td>Ingestion pipeline</td>
+      </tr>
+      <tr>
+        <td><code>embed_query</code></td>
+        <td><code>(query) &rarr; list[float]</code></td>
+        <td>Query pipeline (with LRU cache)</td>
+      </tr>
+      <tr>
+        <td><code>model_name</code></td>
+        <td>property &rarr; <code>str</code></td>
+        <td>Embedding provenance metadata, e.g., <code>&ldquo;voyage/voyage-context-3&rdquo;</code></td>
+      </tr>
+      <tr>
+        <td><code>dimensions</code></td>
+        <td>property &rarr; <code>int</code></td>
+        <td>Embedding provenance metadata, vector search config</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <hr>
+
+  <!-- -------------------------------- -->
+  <!-- Near-Duplicate Detection -->
+  <!-- -------------------------------- -->
+  <h3>Near-Duplicate Detection</h3>
+
+  <p>IB folders routinely contain files like &ldquo;Deal Summary v3 FINAL.docx&rdquo;, &ldquo;Deal Summary v3 FINAL (2).docx&rdquo;, and &ldquo;Deal Summary v3 FINAL revised.docx&rdquo; &mdash; different file IDs with nearly identical content. Without dedup, search results are cluttered with near-identical chunks that push genuinely different content out of the top results.</p>
+
+  <p>Detection happens in two phases at ingestion time. Zero cost at query time &mdash; search queries simply add <code>is_canonical eq true</code> as a filter predicate.</p>
+
+  <h4>Phase 1: Filename Normalization + Clustering</h4>
+
+  <p>Normalize filenames by stripping IB version noise, then group by <code>(normalized_name, source_folder)</code>. If a group has more than one file, it is a candidate duplicate cluster.</p>
+
+  <p>Normalization rules, applied in order:</p>
+  <ol>
+    <li>Lowercase</li>
+    <li>Remove file extension</li>
+    <li>Strip version patterns: <code>v\d+</code>, <code>version\s*\d+</code></li>
+    <li>Strip finality markers: <code>final</code>, <code>revised</code>, <code>draft</code>, <code>clean</code>, <code>markup</code>, <code>redline</code></li>
+    <li>Strip copy markers: <code>\(\d+\)</code>, <code>copy\s*\d*</code>, <code>- copy</code></li>
+    <li>Strip trailing numbers after separator: <code>[_\-\s]\d+$</code></li>
+    <li>Collapse whitespace/underscores/hyphens to single space</li>
+    <li>Trim</li>
+  </ol>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Original Filename</th>
+        <th>Normalized</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>Deal Summary v3 FINAL.docx</code></td>
+        <td><code>deal summary</code></td>
+      </tr>
+      <tr>
+        <td><code>Deal Summary v3 FINAL (2).docx</code></td>
+        <td><code>deal summary</code></td>
+      </tr>
+      <tr>
+        <td><code>Deal Summary v3 FINAL revised.docx</code></td>
+        <td><code>deal summary</code></td>
+      </tr>
+      <tr>
+        <td><code>Catalyst CIM Draft 2.pdf</code></td>
+        <td><code>catalyst cim</code></td>
+      </tr>
+      <tr>
+        <td><code>LBO Model - Clean.xlsx</code></td>
+        <td><code>lbo model</code></td>
       </tr>
     </tbody>
   </table>
 
   <div class="callout info">
-    <div class="callout-title">Why These 5?</div>
-    <p>Each query maps to a real pattern of how bankers search for information. Query 1 is the most common (&ldquo;where&rsquo;s that file?&rdquo;). Query 5 is the most demanding (&ldquo;synthesize across multiple deals&rdquo;). Together they cover the full spectrum from simple file retrieval to complex multi-document analysis, and they exercise every major subsystem: the regex classifier, keyword search, vector search, entity extraction, synonym expansion, the reranker, and Claude synthesis.</p>
+    <div class="callout-title">Same-Folder Constraint</div>
+    <p>Only files in the same <code>source_folder</code> are compared. This prevents false matches between intentionally different versions &mdash; a buyer model in one deal folder and a seller model in another, or a template in Templates and a filled-out version in Active Deals.</p>
   </div>
 
-  <hr>
+  <h4>Phase 2: Cosine Similarity Verification</h4>
 
-  <!-- NOT IN V1 -->
-  <h2><span class="section-number">10.5</span> What&rsquo;s NOT in v1</h2>
-
-  <p>Scope discipline matters. These features were considered and deliberately deferred. Each one has a clear rationale for why it&rsquo;s not worth the complexity in the initial release.</p>
+  <p>For each candidate cluster (files with the same normalized name and folder), compare first-chunk embeddings via cosine similarity. These embeddings are already computed during ingestion &mdash; no additional Voyage AI calls.</p>
 
   <table>
     <thead>
       <tr>
-        <th>Item</th>
-        <th>Rationale</th>
+        <th>Cosine Similarity</th>
+        <th>Result</th>
       </tr>
     </thead>
     <tbody>
       <tr>
-        <td>Email ingestion</td>
-        <td>File search alone solves the core pain points. Emails add significant parsing complexity (threads, attachments, forwarding chains) for lower marginal value.</td>
+        <td>&ge; 0.95 (configurable)</td>
+        <td>Confirmed duplicate &mdash; files are added to the cluster</td>
       </tr>
       <tr>
-        <td>Teams bot (@BSearch)</td>
-        <td>The web app is the primary interface for v1. A Teams bot is a nice-to-have, not a must-have.</td>
-      </tr>
-      <tr>
-        <td>Claude Vision (image/chart OCR)</td>
-        <td>Text content covers the vast majority of IB document types. Charts and images are rarely the thing people search for.</td>
-      </tr>
-      <tr>
-        <td>Excel model summaries</td>
-        <td>Basic sheet-level chunking first. Deep model comprehension is a v2 feature.</td>
-      </tr>
-      <tr>
-        <td>Full nightly reconciliation</td>
-        <td>Webhooks + delta sync cover most cases. A full reconciliation job (comparing every file in SharePoint against every entry in the index) is an insurance policy, not a launch requirement.</td>
-      </tr>
-      <tr>
-        <td>Multi-tenant / external users</td>
-        <td>BSearch is an internal firm tool. No need for tenant isolation or external access controls.</td>
-      </tr>
-      <tr>
-        <td>Mobile-optimized UI</td>
-        <td>Desktop-first for IB workflows. Bankers search for documents at their desks, not on their phones.</td>
-      </tr>
-      <tr>
-        <td>CI/CD pipeline</td>
-        <td>Set up after v1 ships. Manual deployment is fine for a single-developer project during initial development.</td>
-      </tr>
-      <tr>
-        <td>Rate limiting</td>
-        <td>18 trusted internal users. No risk of abuse or overload at this scale.</td>
+        <td>&lt; 0.95</td>
+        <td>Genuinely different files despite similar names &mdash; not grouped</td>
       </tr>
     </tbody>
   </table>
+
+  <p>This handles the case where &ldquo;Deal Summary v3&rdquo; has a completely rewritten executive summary compared to &ldquo;Deal Summary v2&rdquo; &mdash; similar name but different content.</p>
+
+  <h4>Canonical Selection</h4>
+
+  <ul>
+    <li>Most recent <code>last_modified</code> is canonical (<code>is_canonical: true</code>)</li>
+    <li>All other files in the cluster are non-canonical (<code>is_canonical: false</code>)</li>
+    <li>On tie: largest file by byte count (more complete version)</li>
+    <li>All files in a cluster share the same <code>duplicate_group_id</code> &mdash; a deterministic SHA-256 hash of <code>(normalized_name, source_folder)</code></li>
+    <li>Non-canonical chunks remain indexed for re-evaluation but are excluded from all search queries</li>
+  </ul>
+
+  <h4>When Dedup Runs</h4>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Trigger</th>
+        <th>Action</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>New file ingested</td>
+        <td>Check if <code>(normalized_name, source_folder)</code> matches existing files. If yes, run cosine similarity on first chunks. Update cluster membership and canonical flags</td>
+      </tr>
+      <tr>
+        <td>File updated</td>
+        <td>Re-run dedup for the file&rsquo;s cluster. Updated file may become new canonical if it has the newest <code>last_modified</code></td>
+      </tr>
+      <tr>
+        <td>File deleted</td>
+        <td>Remove from cluster. If deleted file was canonical, promote next-most-recent. If cluster drops to 1 file, dissolve cluster (<code>duplicate_group_id = null</code>, <code>is_canonical = true</code>)</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h4>Cluster State in Cosmos DB</h4>
+
+  <p>Duplicate cluster state is stored in the <code>duplicate_clusters</code> container (partition key: <code>source_folder</code>). Each document stores the normalized name, source folder, and a list of member files with their <code>file_id</code>, <code>last_modified</code>, first-chunk embedding, and <code>is_canonical</code> flag.</p>
+
+  <p>Concurrent file ingestions racing on the same cluster are handled via optimistic concurrency &mdash; all Cosmos DB writes use ETags. On a 409 Conflict, the orchestrator does a read-merge-retry with a maximum of 3 attempts. Durable Functions retry covers persistent failures beyond 3 attempts.</p>
+
+  <div class="callout info">
+    <div class="callout-title">Known Limitation</div>
+    <p>Dedup uses first-chunk embedding similarity only. Files with different first chunks but identical subsequent content will not be detected. This is an acceptable tradeoff &mdash; filename clustering catches the 90%+ case, and the threshold is calibrated against real data in Phase 6. If false-negative rates prove significant, multi-chunk comparison is a v2 extension.</p>
+  </div>
+
+  <hr>
+
+  <!-- -------------------------------- -->
+  <!-- Webhook Receiver -->
+  <!-- -------------------------------- -->
+  <h3>Webhook Receiver</h3>
+
+  <p>Webhooks are the primary sync mechanism for keeping the index current with SharePoint. When a file is created, updated, or deleted, Microsoft&rsquo;s Graph API sends a notification to BSearch within 30&ndash;120 seconds. This reduces index staleness from hours (timer-based polling) to minutes.</p>
+
+  <h4>How It Works</h4>
+
+  <ol>
+    <li><strong>Subscription creation.</strong> On deploy, BSearch creates one webhook subscription per monitored SharePoint drive via the Graph API. Each subscription specifies the notification URL (<code>/api/webhooks/graph</code>), a random <code>clientState</code> secret, and an expiration time (~2.95 days max).</li>
+    <li><strong>Validation handshake.</strong> When creating a subscription, Graph sends a GET request with a <code>validationToken</code>. The webhook receiver echoes it back as plain text with a 200 response. This proves BSearch controls the endpoint.</li>
+    <li><strong>Change notification.</strong> When a file changes, Graph sends a POST with the resource path and the <code>clientState</code>. The receiver validates <code>clientState</code> against the stored value in Cosmos DB, responds with 202 immediately, and starts the Durable Functions delta sync orchestrator for the affected drive.</li>
+  </ol>
 
   <div class="callout tip">
-    <div class="callout-title">The Scope Rule</div>
-    <p>Every feature that&rsquo;s &ldquo;not in v1&rdquo; could be added in v2 without rearchitecting the system. The design accounts for these future capabilities &mdash; but building them before the core search experience works would be premature optimization.</p>
+    <div class="callout-title">The 3-Second Rule</div>
+    <p>The webhook receiver must respond to Graph API within 3 seconds. If it takes longer, Graph will retry (up to 4 times), and if it persistently times out, Graph disables the subscription. This is why the receiver does no inline processing &mdash; it validates, responds 202, and enqueues the work.</p>
   </div>
 
-  <hr>
-
-  <!-- V2+ ROADMAP -->
-  <h2><span class="section-number">10.6</span> v2+ Roadmap</h2>
-
-  <p>Once v1 is live and the team is using it daily, these are the highest-value additions &mdash; roughly in priority order:</p>
-
-  <ul>
-    <li><strong>Full nightly reconciliation job</strong> &mdash; a scheduled sweep that compares every file in SharePoint against the search index, catching anything webhooks and delta sync missed. The ultimate safety net.</li>
-    <li><strong>Adaptive model routing</strong> &mdash; use Haiku for simple queries (file lookups, quick extractions) and Sonnet or Opus for complex ones (multi-doc synthesis, nuanced analysis). Saves cost on easy questions, improves quality on hard ones.</li>
-    <li><strong>User feedback (thumbs up/down)</strong> &mdash; let users rate answers so you can identify weak spots and track improvement over time.</li>
-    <li><strong>Multi-query vector embedding</strong> &mdash; embed the user&rsquo;s query as multiple vectors (one per sub-question) instead of a single vector, improving recall for complex queries.</li>
-    <li><strong>Sibling chunk retrieval</strong> &mdash; when a chunk matches a query, also retrieve the chunks immediately before and after it in the original document. This provides more context to the synthesis step without increasing the initial chunk size.</li>
-    <li><strong>Additional embedding providers + migration tooling</strong> &mdash; the ability to swap in a better embedding model when one becomes available, plus describe-then-embed for charts (generate a text description of a chart, then embed that description).</li>
-    <li><strong>Two-pass extraction for multi-doc synthesis</strong> &mdash; first pass extracts key facts from each source document, second pass synthesizes across all extracted facts. Better for questions that span many documents.</li>
-    <li><strong>Deal summary active injection at query time</strong> &mdash; when a query mentions a specific deal, automatically include that deal&rsquo;s summary in the context even if it didn&rsquo;t rank highly in search results. Guarantees the synthesis has baseline deal context.</li>
-  </ul>
-
-  <hr>
-
-  <!-- EFFORT SUMMARY -->
-  <h2><span class="section-number">10.7</span> Estimated Effort Summary</h2>
+  <h4>Subscription Lifecycle</h4>
 
   <table>
     <thead>
       <tr>
-        <th>Phase</th>
-        <th>Human Time</th>
-        <th>Claude Code Time</th>
+        <th>Event</th>
+        <th>Action</th>
       </tr>
     </thead>
     <tbody>
       <tr>
-        <td>1. Scaffold + Infra</td>
-        <td>~2 days</td>
-        <td>~20 min</td>
+        <td>Deploy</td>
+        <td>Create subscriptions for all monitored drives (HTTP trigger for bulk creation)</td>
       </tr>
       <tr>
-        <td>2. Parsers + Chunking</td>
-        <td>~1 week</td>
-        <td>~30 min</td>
+        <td>Every 12 hours</td>
+        <td>Timer trigger checks expiration. Renew subscriptions with &lt;24 hours remaining via Graph API PATCH</td>
       </tr>
       <tr>
-        <td>3. Index + Ingestion</td>
-        <td>~1 week</td>
-        <td>~30 min</td>
+        <td>Renewal failure</td>
+        <td>Log alert. Delta sync timer covers until resolved</td>
       </tr>
       <tr>
-        <td>4. Query Pipeline</td>
-        <td>~1 week</td>
-        <td>~30 min</td>
+        <td>Redeployment (new URL)</td>
+        <td>Delete old subscriptions, create new ones</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>Subscription state is stored in Cosmos DB: <code>{ subscription_id, drive_id, expiration, notification_url, client_state }</code>.</p>
+
+  <hr>
+
+  <!-- -------------------------------- -->
+  <!-- Delta Sync Timer -->
+  <!-- -------------------------------- -->
+  <h3>Delta Sync Timer</h3>
+
+  <p>Delta sync is the fallback mechanism that catches anything webhooks miss &mdash; expired subscriptions, network blips, notifications that arrived while the Functions host was recycling. It runs on a timer trigger every 12&ndash;24 hours and uses the exact same delta query + orchestrator pipeline as webhook-triggered sync.</p>
+
+  <h4>How Delta Queries Work</h4>
+
+  <ol>
+    <li>Graph API provides a <code>/drives/{id}/root/delta</code> endpoint that returns all changes since a stored token</li>
+    <li>BSearch stores the delta token in Cosmos DB (partition key: <code>drive_id</code>)</li>
+    <li>On each run, BSearch sends the stored token to Graph, receives a list of created/updated/deleted files, and processes them through the orchestrator</li>
+    <li>Graph returns a new delta token, which BSearch stores for next time</li>
+  </ol>
+
+  <p>The delta token is shared between webhook-triggered sync and timer-triggered sync. Both paths read the same token from Cosmos DB, process changes, and store the updated token. This means a webhook-triggered sync at 2pm and a timer-triggered sync at 3pm will not duplicate work &mdash; the timer run picks up only changes that happened after the webhook run.</p>
+
+  <hr>
+
+  <!-- -------------------------------- -->
+  <!-- Cosmos DB Collections -->
+  <!-- -------------------------------- -->
+  <h3>Cosmos DB Collections</h3>
+
+  <p>Phase 3 uses five Cosmos DB containers for pipeline state management:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Container</th>
+        <th>Partition Key</th>
+        <th>Purpose</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>sync_tokens</code></td>
+        <td><code>drive_id</code></td>
+        <td>Delta query tokens for each monitored drive. Shared between webhook and timer paths</td>
       </tr>
       <tr>
-        <td>5. Web App</td>
-        <td>~1 week</td>
-        <td>~30 min</td>
+        <td><code>webhook_subscriptions</code></td>
+        <td><code>drive_id</code></td>
+        <td>Graph API subscription state: subscription ID, expiration, clientState, notification URL</td>
       </tr>
       <tr>
-        <td>6. Integration + Acceptance</td>
-        <td>~3 days</td>
-        <td>~20 min</td>
+        <td><code>retry_queue</code></td>
+        <td><code>deal_id</code></td>
+        <td>Failed items queued for retry with exponential backoff. Used when Neo4j or Search writes fail</td>
       </tr>
       <tr>
-        <td><strong>Total</strong></td>
-        <td><strong>~5&ndash;6 weeks</strong></td>
-        <td><strong>~2.5 hours</strong></td>
+        <td><code>duplicate_clusters</code></td>
+        <td><code>source_folder</code></td>
+        <td>Dedup cluster membership, canonical flags, first-chunk embeddings. ETag-based optimistic concurrency</td>
+      </tr>
+      <tr>
+        <td><code>deal_summary_pending</code></td>
+        <td><code>deal_id</code></td>
+        <td>Debounce tracking for deal summary regeneration. Upserts <code>last_file_change_ts</code> on each file change. Timer processes entries where <code>last_file_change_ts &lt; now - 5min</code></td>
       </tr>
     </tbody>
   </table>
 
   <div class="callout info">
-    <div class="callout-title">Why the Human Time Is So Much Longer</div>
-    <p>Claude Code generates code fast. But building a production system isn&rsquo;t just code generation. You need to review every file it produces, test against real documents, debug edge cases, make design decisions, configure Azure resources, and iterate on search quality. The human time is where judgment lives &mdash; the Claude Code time is where keystrokes live.</p>
+    <div class="callout-title">Why Cosmos DB for Debouncing?</div>
+    <p>Deal summary regeneration is debounced &mdash; if 10 files in the same deal change within 5 minutes, the summary is regenerated once, not 10 times. The debounce state lives in Cosmos DB rather than in-memory because Azure Functions workers can recycle at any time. In-memory timers would be lost on recycle; Cosmos DB survives it.</p>
   </div>
 
   <hr>
 
-  <!-- KEY TAKEAWAY -->
-  <div class="key-takeaway">
-    <div class="callout-title">Key Takeaway</div>
-    <p>BSearch is built in six phases over ~5&ndash;6 weeks, each producing a testable milestone. The phases are strictly sequential &mdash; each one depends on the previous one&rsquo;s output. Five acceptance test queries validate the complete system from file lookup to multi-document synthesis. The v1 scope is deliberately narrow: solve the core search problem for 18 internal users first, then layer on email ingestion, model routing, and advanced features in v2.</p>
+  <!-- -------------------------------- -->
+  <!-- Files to Create -->
+  <!-- -------------------------------- -->
+  <h3>Files to Create</h3>
+
+  <pre><code>src/ingestion/
+&boxVR;&boxH;&boxH; orchestrator.py       # Durable Functions orchestrator (fan-out/fan-in)
+&boxVR;&boxH;&boxH; activities.py         # Individual activities: download, parse, embed, index
+&boxVR;&boxH;&boxH; indexer.py            # Azure AI Search client: create index, upsert/delete chunks
+&boxVR;&boxH;&boxH; delta_sync.py         # Delta query logic: get changes since last token, process
+&boxVR;&boxH;&boxH; dedup.py              # Near-duplicate file detection + canonical selection
+&boxVR;&boxH;&boxH; webhooks.py           # Webhook receiver (validation + notification handler)
+&boxVR;&boxH;&boxH; subscriptions.py      # Subscription CRUD (create, renew, delete, list from Cosmos)
+&boxVR;&boxH;&boxH; rate_limiter.py       # Per-provider rate limiting + adaptive backpressure
+&boxUR;&boxH;&boxH; triggers.py           # Timer triggers (delta sync, subscription renewal),
+                          #   webhook HTTP trigger, bulk start endpoint
+
+tests/
+&boxVR;&boxH;&boxH; test_indexer.py
+&boxVR;&boxH;&boxH; test_orchestrator.py
+&boxVR;&boxH;&boxH; test_delta_sync.py
+&boxVR;&boxH;&boxH; test_dedup.py
+&boxVR;&boxH;&boxH; test_webhooks.py
+&boxVR;&boxH;&boxH; test_subscriptions.py
+&boxUR;&boxH;&boxH; test_rate_limiter.py</code></pre>
+
+  <!-- ================================================================ -->
+  <!-- 10.4 What to Tell Claude Code -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">10.4</span> What to Tell Claude Code</h2>
+
+  <p>Three prompts, in order. Each builds on the output of the previous one.</p>
+
+  <div class="claude-prompt">
+    <div class="prompt-label">Prompt 1 &mdash; Search Index Schema</div>
+    <p class="prompt-text">&ldquo;Create the Azure AI Search index schema for BSearch with these fields: <em>chunk_id</em> (string, key), <em>file_id</em> (string, filterable), <em>content</em> (string, searchable), <em>content_vector</em> (Collection(Single), 1024 dimensions, HNSW algorithm), <em>source_folder</em> (string, filterable), <em>file_name</em> (string, searchable + filterable), <em>file_type</em> (string, filterable), <em>chunk_type</em> (string, filterable), <em>doc_type</em> (string, filterable), <em>deal_id</em> (string, filterable), <em>deal_name</em> (string, filterable + searchable), <em>deal_aliases</em> (string, searchable), <em>companies</em> (Collection(string), filterable + searchable), <em>company_roles</em> (Collection(string), filterable + searchable), <em>people</em> (Collection(string), filterable + searchable), <em>industries</em> (Collection(string), filterable + searchable), <em>deal_stage</em> (string, filterable), <em>deal_status</em> (string, filterable), <em>m365_url</em> (string), <em>doc_section</em> (string), <em>chunk_index</em> (int, filterable + sortable), <em>last_modified</em> (DateTimeOffset, filterable + sortable), <em>duplicate_group_id</em> (string, filterable, nullable), <em>is_canonical</em> (boolean, filterable, default true), <em>embedding_model</em> (string, filterable), <em>embedding_dimensions</em> (int, filterable), <em>embedding_version</em> (string, filterable). Add a scoring profile called &lsquo;recency_boost&rsquo; with a freshness function on <em>last_modified</em> (1.5x boost, P30D duration). Set up the vector search configuration for 1024-dimension HNSW. Parameterize <em>create_index(index_name, vector_dimensions)</em> so blue-green re-indexing can create indexes with different dimensions. Include <em>upsert_chunks</em>, <em>delete_by_file_id</em>, <em>bulk_update_deal_fields</em>, and <em>read_all_chunks</em> methods.&rdquo;</p>
   </div>
 
-  <p>Next, we&rsquo;ll step back from the implementation sequence and examine the <em>reasoning</em> behind BSearch&rsquo;s most important design choices &mdash; the <a href="chapter-11.html">key design decisions</a>.</p>
+  <div class="claude-prompt">
+    <div class="prompt-label">Prompt 2 &mdash; Ingestion Orchestrator + Webhooks + Delta Sync</div>
+    <p class="prompt-text">&ldquo;Build the Durable Functions ingestion orchestrator. The orchestrator should: receive a list of file changes from webhooks or delta sync, fan out to activity functions (fetch &rarr; parse &rarr; extract metadata &rarr; write to Neo4j &rarr; chunk &rarr; per-chunk entity extraction &rarr; embed with Voyage AI contextual embeddings &rarr; check dedup &rarr; write to Azure AI Search), with checkpointing and retry logic (exponential backoff). On file update/delete: run cleanup first (dedup removal, graph cleanup, Search delete), then re-ingest. Create the webhook receiver HTTP trigger at <em>/api/webhooks/graph</em> with <em>clientState</em> validation &mdash; echo <em>validationToken</em> on GET, validate and respond 202 on POST, then start delta sync orchestrator. Create the delta sync timer trigger (every 12h) that queries Graph API delta endpoint with stored Cosmos DB tokens. Create subscription management (create, renew every 12h, delete). Implement three-layer rate limiting: orchestrator concurrency cap (50 bulk / 200 delta), per-provider asyncio semaphores (Haiku 80, Voyage 50, Graph 20), and adaptive backpressure (halve on 5% 429 rate, restore after 5min clean). Write Neo4j first, then Search. If Neo4j fails, write chunks without entity fields and queue retry. If Search fails, queue retry.&rdquo;</p>
+  </div>
+
+  <div class="claude-prompt">
+    <div class="prompt-label">Prompt 3 &mdash; Near-Duplicate Detection</div>
+    <p class="prompt-text">&ldquo;Implement near-duplicate detection. Phase 1: normalize filenames (strip version markers like <em>_v2</em>, <em>FINAL</em>, <em>(2)</em>, <em>revised</em>, <em>draft</em>, <em>clean</em>), group by <em>(normalized_name, source_folder)</em> &mdash; same-folder constraint prevents cross-deal false positives. Phase 2: compare first-chunk embeddings via cosine similarity &mdash; at or above 0.95 means confirmed duplicate. Mark most recent <em>last_modified</em> as canonical. Store cluster state in Cosmos DB <em>duplicate_clusters</em> container (partition key: <em>source_folder</em>), using ETags for optimistic concurrency (read-merge-retry on 409 Conflict, max 3 attempts). Re-evaluate on file create/update/delete. On file deletion from cluster: promote next-most-recent to canonical. On cluster dropping to 1 file: dissolve cluster. <em>compute_group_id</em> should be a deterministic SHA-256 hash of <em>(normalized_name, source_folder)</em> truncated to 16 chars.&rdquo;</p>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- 10.5 How to Verify -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">10.5</span> How to Verify</h2>
+
+  <div class="verify-checklist">
+    <div class="section-label">Verification Checklist</div>
+    <ol>
+      <li><strong>Index creation.</strong> Run <code>create_index()</code> &mdash; verify the index appears in Azure portal with all 25+ fields, HNSW vector configuration at 1024 dimensions, and the <code>recency_boost</code> scoring profile.</li>
+      <li><strong>Bulk ingestion.</strong> Ingest ~100 test documents through the pipeline. Query Azure AI Search directly and verify all documents appear with correct metadata &mdash; <code>file_name</code>, <code>doc_type</code>, <code>deal_id</code>, <code>chunk_type</code>, <code>source_folder</code>, and entity fields all populated.</li>
+      <li><strong>Neo4j graph.</strong> Check Neo4j for Deal and Company nodes. Verify relationship edges (TARGET_OF, ADVISOR_ON, etc.) have correct <code>source_file_ids</code> provenance. Verify <code>canonical_name</code> on Deal nodes matches the most recently modified file&rsquo;s deal name.</li>
+      <li><strong>Near-duplicate detection.</strong> Upload two similar files with different names (e.g., &ldquo;Deal Summary v3 FINAL.docx&rdquo; and &ldquo;Deal Summary v3 FINAL (2).docx&rdquo;) to the same folder. Verify dedup detects them as duplicates: both should have the same <code>duplicate_group_id</code>, and only the most recent should have <code>is_canonical = true</code>.</li>
+      <li><strong>Webhook sync.</strong> Upload a file to SharePoint. Verify it appears in the Azure AI Search index within 2 minutes. Check that the webhook receiver logged the notification and started the delta sync orchestrator.</li>
+      <li><strong>Cosmos DB state.</strong> Verify <code>sync_tokens</code> contains a delta token for each monitored drive. Verify <code>webhook_subscriptions</code> contains an active subscription for each drive with a valid expiration.</li>
+      <li><strong>File update.</strong> Modify an already-indexed file in SharePoint. Verify old chunks are deleted and new chunks appear with updated content. Verify Neo4j edges are cleaned up and re-created.</li>
+      <li><strong>File deletion.</strong> Delete a file from SharePoint. Verify all its chunks are removed from Azure AI Search, its edges are cleaned from Neo4j, and any duplicate cluster membership is updated.</li>
+      <li><strong>Embedding provenance.</strong> Query chunks in Azure AI Search and verify <code>embedding_model</code>, <code>embedding_dimensions</code>, and <code>embedding_version</code> are all populated correctly.</li>
+    </ol>
+  </div>
+
+  <hr>
+
+  <!-- ================================================================ -->
+  <!-- Key Risks -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">10.6</span> Key Risks</h2>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Risk</th>
+        <th>Impact</th>
+        <th>Mitigation</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Graph API rate limiting</td>
+        <td>Bulk ingestion slows or fails with 429 errors</td>
+        <td>Three-layer rate limiting (concurrency cap, per-provider semaphores, adaptive backpressure). Conservative default: 20 concurrent Graph API calls</td>
+      </tr>
+      <tr>
+        <td>Webhook reliability</td>
+        <td>Missed file changes leave the index stale</td>
+        <td>Delta sync timer (every 12&ndash;24h) as fallback. Webhook subscription renewal every 12h. Same delta query pipeline handles both paths</td>
+      </tr>
+      <tr>
+        <td>Webhook notifications out of order</td>
+        <td>File could be processed before a predecessor change</td>
+        <td>Delta queries are inherently ordered by change sequence. The orchestrator processes the complete delta, not individual notifications</td>
+      </tr>
+      <tr>
+        <td>Neo4j + Search consistency</td>
+        <td>Entity data in Neo4j could disagree with denormalized fields in Search</td>
+        <td>Write Neo4j first. Queue retries in Cosmos DB with exponential backoff. Eventually consistent within retry window</td>
+      </tr>
+      <tr>
+        <td>Dedup false positives</td>
+        <td>Genuinely different files marked as duplicates</td>
+        <td>Two-phase detection (name clustering + embedding similarity). Same-folder constraint. Cosine threshold calibrated in Phase 6</td>
+      </tr>
+      <tr>
+        <td>Bulk ingestion duration</td>
+        <td>Initial load of 550K documents takes 18&ndash;36 hours</td>
+        <td>Durable Functions checkpointing allows resume after failure. Do not enable webhooks until bulk load completes</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ================================================================ -->
+  <!-- Key Takeaway -->
+  <!-- ================================================================ -->
+  <div class="key-takeaway">
+    <div class="callout-title">Key Takeaway</div>
+    <p>Phase 3 connects the parsers to the search index and makes it stay current. The Durable Functions orchestrator is the single code path for both bulk ingestion and incremental sync. Webhooks provide near-real-time updates; delta sync is the safety net. Near-duplicate detection keeps search results clean without any query-time cost. By the end of this phase, you can ingest documents, search for them, and watch file changes propagate automatically.</p>
+  </div>
 
   <nav class="chapter-nav bottom">
-    <a href="chapter-09.html">&larr; Previous</a>
+    <a href="chapter-09.html">&larr; Previous: Phase 2 &mdash; Document Parsers &amp; Chunking</a>
     <span class="nav-spacer">|</span>
     <a href="index.html">Contents</a>
     <span class="nav-spacer">|</span>
-    <a href="chapter-11.html">Next &rarr;</a>
+    <a href="chapter-11.html">Next: Phase 4 &mdash; Query Pipeline &amp; Synthesis &rarr;</a>
   </nav>
 </div>
+
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
 <script>mermaid.initialize({startOnLoad: true, theme: 'neutral'});</script>
 </body>

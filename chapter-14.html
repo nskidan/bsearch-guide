@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light only">
+  <title>Chapter 14: Design Decisions &mdash; BSearch Technical Guide</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="page-wrapper">
+
+  <nav class="chapter-nav">
+    <a href="chapter-13.html">&larr; Previous: Phase 6 &mdash; Testing &amp; Go-Live</a>
+    <span class="nav-spacer">|</span>
+    <a href="index.html">Contents</a>
+    <span class="nav-spacer">|</span>
+    <a href="chapter-15.html">Next: Glossary &rarr;</a>
+  </nav>
+
+  <div class="chapter-header">
+    <div class="chapter-number">Chapter 14</div>
+    <h1>Design Decisions</h1>
+    <p class="chapter-subtitle">All 18 architecture decisions, why each was made, what was considered instead, and when to revisit.</p>
+  </div>
+
+  <p>Every system is the sum of its design decisions. This chapter documents all 18 architecture decisions that shape BSearch &mdash; not just what was chosen, but why, what the alternatives were, and under what conditions each decision should be reconsidered. Decisions are grouped into four categories: Infrastructure, Search Quality, Resilience, and AI Models.</p>
+
+  <!-- ============================================================ -->
+  <!-- 14.1 Infrastructure -->
+  <!-- ============================================================ -->
+  <h2><span class="section-number">14.1</span> Infrastructure</h2>
+
+  <p>These decisions cover how BSearch is built, deployed, and organized &mdash; the plumbing that everything else runs on.</p>
+
+  <!-- Decision 1 -->
+  <details class="decision-card">
+    <summary>#1 &mdash; Bulk Ingestion via Durable Functions</summary>
+    <p><strong>Chosen:</strong> Azure Durable Functions with the orchestrator pattern &mdash; fan-out/fan-in parallelism, automatic checkpointing, and a single codepath shared by both bulk ingestion and ongoing webhook-triggered sync.</p>
+    <p><strong>Why:</strong> Processing 550,000 documents is a long-running, failure-prone job. Durable Functions give us automatic checkpointing (if the job crashes at document 300,000, it picks up where it left off instead of starting over), fan-out/fan-in parallelism (process thousands of documents concurrently across activity functions), and a single orchestrator codepath that works for both the initial bulk load and the ongoing webhook-triggered updates. This means we are not maintaining two separate ingestion pipelines that could drift out of sync.</p>
+    <p><strong>Considered instead:</strong> A custom queue-based worker (e.g., Azure Queue Storage + Functions) would work but requires building checkpointing, retry, and parallelism logic from scratch. Azure Data Factory was considered but is overkill for a document processing pipeline and harder to customize for format-aware parsing. A simple sequential script would take days to run and has no recovery mechanism.</p>
+    <p><strong>When to revisit:</strong> If ingestion throughput needs exceed what Durable Functions can handle (unlikely at 550K docs), or if Azure introduces a managed document processing pipeline that handles format-aware parsing natively.</p>
+    <div class="decision-meta">Category: Infrastructure</div>
+  </details>
+
+  <!-- Decision 2 -->
+  <details class="decision-card">
+    <summary>#2 &mdash; State Persistence: Cosmos DB + Neo4j Aura</summary>
+    <p><strong>Chosen:</strong> Cosmos DB (serverless) for operational state &mdash; conversations, delta sync tokens, webhook subscriptions, retry queue, duplicate clusters, deal summary pending flags, and feedback. Neo4j Aura for entity intelligence &mdash; deals, companies, people, relationships, financials, and stage history. Cosmos scales to zero (~$0 at 18 users); Neo4j Free tier for dev, ~$65/mo Pro for production.</p>
+    <p><strong>Why:</strong> BSearch has two fundamentally different data needs. Operational state (sync tokens, retry queues, webhook subscriptions) is simple key-value data that fits naturally in a document database &mdash; Cosmos DB's serverless tier means we pay essentially nothing at our scale. Entity intelligence (which companies are involved in which deals, who advises whom, how deals progress through stages) is inherently graph-shaped &mdash; a relational database would require complex JOIN chains to answer questions like "which advisors have worked on healthcare deals above $50M EBITDA." Neo4j makes these queries natural and fast with Cypher.</p>
+    <p><strong>Considered instead:</strong> Using Cosmos DB for everything (including entity data) would simplify the stack to one database, but relationship traversal in a document database requires application-level graph logic that is slow and fragile. Using only Neo4j for everything would force us to use a graph database for simple key-value lookups, which is wasteful. PostgreSQL with a graph extension was considered but does not match Neo4j's query expressiveness for multi-hop relationship traversals.</p>
+    <p><strong>When to revisit:</strong> If the entity graph becomes simple enough that it can be flattened into Cosmos documents without losing query capability, or if Azure Cosmos DB adds native graph traversal that matches Neo4j's Cypher expressiveness. Also revisit if the Neo4j ~$65/mo cost becomes a concern relative to the value the knowledge graph provides.</p>
+    <div class="decision-meta">Category: Infrastructure</div>
+  </details>
+
+  <!-- Decision 3 -->
+  <details class="decision-card">
+    <summary>#3 &mdash; Frontend: Vite + React SPA on Azure Static Web Apps</summary>
+    <p><strong>Chosen:</strong> Vite + React single-page application, deployed to Azure Static Web Apps. Built-in Azure AD authentication, CDN-served globally, zero server operations.</p>
+    <p><strong>Why:</strong> The frontend is a search interface with streaming responses &mdash; a natural fit for a single-page app. Azure Static Web Apps provides free hosting with built-in Azure AD authentication (no custom auth code needed), automatic CDN distribution, and zero server management. Vite gives fast builds and hot module replacement during development. React is the most widely supported frontend framework, making it easy to find examples and libraries for SSE streaming, markdown rendering, and similar needs.</p>
+    <p><strong>Considered instead:</strong> A server-rendered approach (Next.js, FastAPI templates) would add server-side complexity for a UI that is fundamentally client-driven (streaming responses, interactive search). A vanilla HTML/JS approach would work at this scale but makes component reuse and state management harder as the UI grows. Vue or Svelte were considered but React has the largest ecosystem for the specific libraries needed (SSE streaming, source card components).</p>
+    <p><strong>When to revisit:</strong> If the frontend needs server-side rendering for SEO or performance reasons (unlikely for an internal tool), or if the team strongly prefers a different framework. Also revisit if Azure Static Web Apps introduces limitations that block needed features.</p>
+    <div class="decision-meta">Category: Infrastructure</div>
+  </details>
+
+  <!-- Decision 4 -->
+  <details class="decision-card">
+    <summary>#4 &mdash; FastAPI on Azure App Service B2</summary>
+    <p><strong>Chosen:</strong> FastAPI deployed on Azure App Service B2 tier (~$26/month) &mdash; dual-core, 3.5GB RAM, always-on with no cold start, built-in Python runtime, and Easy Auth for Azure AD token validation.</p>
+    <p><strong>Why:</strong> The search API needs to be always available with no cold start delay &mdash; cold starts would blow the 3-second TTFT target. The B2 tier provides two CPU cores, which is necessary because a single core gets tight when handling 3&ndash;4 concurrent SSE streaming connections (each holds a thread for the duration of the Claude response). At $26/month, B2 is cheap enough for 18 users while giving comfortable headroom. FastAPI is the natural choice for a Python async API with SSE streaming support.</p>
+    <p><strong>Considered instead:</strong> Azure Functions (consumption plan) would be cheaper at near-zero traffic but has cold starts of 5&ndash;15 seconds, which destroys the user experience. App Service B1 (single core, ~$13/mo) was considered but a single core is too tight for concurrent SSE streams. A container-based deployment (Azure Container Apps, AKS) adds operational complexity with no benefit at this scale. Django/Flask were considered but FastAPI's native async and SSE support make it the better fit.</p>
+    <p><strong>When to revisit:</strong> If the user count grows significantly beyond 18 and concurrent SSE streams regularly exceed what two cores can handle (monitor CPU utilization). If costs need further reduction and cold start tolerance increases. If Azure introduces a serverless option with sub-second cold starts.</p>
+    <div class="decision-meta">Category: Infrastructure</div>
+  </details>
+
+  <!-- Decision 8 -->
+  <details class="decision-card">
+    <summary>#8 &mdash; Project Structure: Monorepo</summary>
+    <p><strong>Chosen:</strong> A single monorepo with one <code>pyproject.toml</code>, shared Python code via imports, and <code>web/</code> as a separate Node project for the React frontend.</p>
+    <p><strong>Why:</strong> BSearch has three components that share significant code &mdash; the FastAPI search API, the Durable Functions ingestion pipeline, and shared modules (config, models, Graph API client, health checks). A monorepo lets these components import shared code directly without publishing internal packages. It also means one PR, one CI pipeline, and atomic changes across components (e.g., changing a Pydantic model that both the API and ingestion use). The <code>web/</code> directory is a separate Node project because the frontend has its own build toolchain, but it lives in the same repo for coordinated deployments.</p>
+    <p><strong>Considered instead:</strong> Separate repos per component (API, ingestion, frontend) would require publishing shared code as an internal package, adding CI complexity and version coordination overhead. For a two-person project with tightly coupled components, this overhead is not justified. A multi-package Python workspace (e.g., using <code>uv</code> workspaces) was considered but adds tooling complexity without clear benefit at this scale.</p>
+    <p><strong>When to revisit:</strong> If the team grows large enough that separate components need independent release cycles, or if the ingestion pipeline and API diverge significantly enough that shared code becomes a coupling liability rather than a benefit.</p>
+    <div class="decision-meta">Category: Infrastructure</div>
+  </details>
+
+  <!-- Decision 18 -->
+  <details class="decision-card">
+    <summary>#18 &mdash; Config Organization: Three-Tier Split</summary>
+    <p><strong>Chosen:</strong> A three-tier configuration split that reduces the Pydantic <code>Settings</code> class from ~40 keys to ~25 keys. <strong>Tier 1:</strong> algorithm-design values (BM25 boost weights, chunk thresholds, thinking budget) defined as <code>UPPER_SNAKE_CASE</code> constants in the module that uses them. <strong>Tier 2:</strong> values whose source of truth is external infrastructure (TTFT targets live in documentation, timer intervals live in Azure Functions CRON expressions, alert thresholds live in Application Insights rules) &mdash; removed from app config entirely. <strong>Tier 3:</strong> everything else goes in <code>Settings</code> with sensible defaults &mdash; connection strings (required, no defaults), embedding pipeline config, relevance tuning thresholds, timeouts, and operational resilience knobs.</p>
+    <p><strong>Why:</strong> A flat config class with 40+ keys becomes hard to reason about &mdash; which values can be safely changed in production? Which ones require a code change to be meaningful? The three-tier principle is simple: if changing a value requires also changing code or prompts, it belongs next to that code as a constant (Tier 1). If a value is defined in external infrastructure (a CRON expression, an alert rule), duplicating it in app config creates a consistency risk (Tier 2). Everything else is genuine runtime config (Tier 3). This keeps the Settings class focused on values that operators might actually tune in production.</p>
+    <p><strong>Considered instead:</strong> A single flat Settings class with all ~40 keys is simpler to discover (everything in one place) but makes it unclear which values are safe to change without code changes. A YAML/JSON config file was considered but adds a file to manage and parse, with no clear benefit over environment variables for ~25 keys. A hierarchical Settings class with nested Pydantic models was considered but adds complexity without reducing the key count.</p>
+    <p><strong>When to revisit:</strong> If the key count grows back above ~35 and becomes unwieldy again. If the team finds that Tier 1 constants are being changed frequently enough that they should be runtime-configurable. If a configuration management system (Azure App Configuration, HashiCorp Vault) is adopted that changes how config is distributed.</p>
+    <div class="decision-meta">Category: Infrastructure</div>
+  </details>
+
+  <!-- ============================================================ -->
+  <!-- 14.2 Search Quality -->
+  <!-- ============================================================ -->
+  <h2><span class="section-number">14.2</span> Search Quality</h2>
+
+  <p>These decisions directly affect how well BSearch finds the right content and produces accurate answers.</p>
+
+  <!-- Decision 5 -->
+  <details class="decision-card">
+    <summary>#5 &mdash; Embedding Model: voyage-context-3 at 1024 Dimensions</summary>
+    <p><strong>Chosen:</strong> Voyage AI's <code>voyage-context-3</code> model at 1024 dimensions. Contextual embeddings (each chunk is embedded with awareness of its full document context), scalable to 2048 dimensions via Matryoshka Representation Learning (MRL). 32K token context window. +14.24% chunk retrieval improvement over OpenAI's best embedding model.</p>
+    <p><strong>Why:</strong> The fundamental problem with chunking is that isolated chunks lose meaning &mdash; a chunk that says "revenue grew 15% year-over-year" means nothing without knowing which company and which deal it refers to. Contextual embeddings solve this by embedding each chunk with awareness of the surrounding document, so the vector captures not just the chunk's text but its meaning in context. The 14% retrieval improvement over OpenAI is significant &mdash; it means more relevant chunks in the top-5 after reranking, which directly translates to better Claude answers. The 1024-dimension vectors keep storage costs and search latency reasonable while MRL allows scaling to 2048 dimensions later if needed.</p>
+    <p><strong>Considered instead:</strong> OpenAI <code>text-embedding-3-large</code> is the most popular choice but does not support contextual embeddings and benchmarks 14% lower on chunk retrieval. Cohere <code>embed-v3</code> was considered but also lacks contextual embedding support. <code>voyage-4-large</code> is a drop-in fallback if <code>voyage-context-3</code> has availability issues &mdash; same API, no pipeline changes, but without the contextual advantage.</p>
+    <p><strong>When to revisit:</strong> When a new embedding model demonstrates meaningfully better retrieval quality on IB-style documents (benchmark against the 5 acceptance test queries). When Voyage AI pricing changes make it uncompetitive. When OpenAI or another provider ships contextual embeddings that close the gap. The embedding provider abstraction layer (Decision #16) makes switching straightforward.</p>
+    <div class="decision-meta">Category: Search Quality</div>
+  </details>
+
+  <!-- Decision 9 -->
+  <details class="decision-card">
+    <summary>#9 &mdash; Relevance Gating: Three-Tier Confidence Gate</summary>
+    <p><strong>Chosen:</strong> A three-tier confidence gate based on Cohere reranker scores. <strong>HIGH</strong> (score &ge;0.50): full synthesis, confident tone. <strong>LOW</strong> (score 0.15&ndash;0.50): synthesis with hedging language, yellow banner warning the user that results may not fully answer the query. <strong>NONE</strong> (score &lt;0.15): skip the Claude call entirely, show a "no relevant results" message. Per-chunk floor at 0.10 &mdash; individual chunks below this score are dropped even if the aggregate qualifies. Thresholds configurable via environment variables.</p>
+    <p><strong>Why:</strong> Without a confidence gate, BSearch would call Claude on every query regardless of whether the retrieved chunks are relevant &mdash; leading to hallucinated answers when the index does not contain the information. The three tiers give the right user experience for each situation: confident answers when retrieval is strong, hedged answers when retrieval is marginal (so the user knows to verify), and an honest "I don't know" when retrieval fails. Skipping Claude on NONE also saves money and latency on queries that would produce bad answers anyway.</p>
+    <p><strong>Considered instead:</strong> A binary gate (answer or don't) was considered but loses the valuable middle ground &mdash; many real queries produce marginal results that are still useful with appropriate caveats. A single threshold without tiers would force a choice between being too aggressive (hallucinating on bad results) or too conservative (refusing to answer on marginal results). Letting Claude self-assess confidence was considered but the model tends to produce confident-sounding answers even from weak context.</p>
+    <p><strong>When to revisit:</strong> After launching with real user queries &mdash; the threshold values (0.50, 0.15, 0.10) are initial defaults based on typical Cohere score distributions, not calibrated against this corpus. Run 30+ queries across all query types on the full 550K document set during acceptance testing and analyze which score ranges correspond to correct vs. irrelevant results. Re-evaluate quarterly as the document corpus grows.</p>
+    <div class="decision-meta">Category: Search Quality</div>
+  </details>
+
+  <!-- Decision 10 -->
+  <details class="decision-card">
+    <summary>#10 &mdash; Query Classification: Regex Fast Path + Haiku Fallback</summary>
+    <p><strong>Chosen:</strong> A two-tier classification approach. <strong>Tier 1:</strong> regex patterns that fire only on unambiguous file lookups (query contains a filename with extension, or a locator verb plus a document name with no content-question words). Takes &lt;5ms. <strong>Tier 2:</strong> Haiku classification for everything else (~150ms), run in parallel with query embedding so it adds ~0ms to the critical path. 500ms timeout with fallback to <code>data_extraction</code> (the safe default). Cost: ~$0.10&ndash;0.40/day at 50&ndash;200 queries.</p>
+    <p><strong>Why:</strong> Different query types need fundamentally different retrieval strategies &mdash; a file lookup needs BM25 on filenames with top-1 return, while a multi-doc synthesis needs broad retrieval with deal summaries. Regex handles the easy cases instantly (saving 150ms and a Haiku call), while Haiku handles the nuanced classification that regex cannot (distinguishing "what's the Acme EBITDA?" from "summarize our healthcare pipeline"). Running Haiku in parallel with embedding means the classification adds zero effective latency on the critical path.</p>
+    <p><strong>Considered instead:</strong> Regex-only classification was considered but cannot reliably distinguish data extraction from multi-doc synthesis (the difference is semantic, not structural). Haiku-only classification was considered but wastes 150ms and API cost on queries that are obviously file lookups. A fine-tuned local classifier was considered but adds training data maintenance and model deployment complexity for a problem that Haiku solves well at negligible cost.</p>
+    <p><strong>When to revisit:</strong> If classification errors cause noticeable quality issues (wrong retrieval strategy applied). If Haiku latency or cost increases significantly. If query volume grows to a point where the Haiku cost (~$0.10&ndash;0.40/day) becomes material. If a high-quality local classification model becomes available that eliminates the API dependency.</p>
+    <div class="decision-meta">Category: Search Quality</div>
+  </details>
+
+  <!-- Decision 11 -->
+  <details class="decision-card">
+    <summary>#11 &mdash; Query Expansion: Static IB Synonyms + Combined Haiku Expansion</summary>
+    <p><strong>Chosen:</strong> Two-layer expansion with zero added latency. <strong>Layer 1:</strong> a curated JSON synonym dictionary (<code>ib_synonyms.json</code>) loaded at startup, mapping IB terms to their synonyms (e.g., "multiple" maps to "EV/EBITDA", "EV/Revenue", "trading multiple"). Applied to BM25 at query time in ~0ms. Editable without redeployment. <strong>Layer 2:</strong> Haiku returns 2&ndash;3 search term reformulations alongside its classification response (same API call, same parallel execution, ~0ms added). Expansion terms enrich BM25 only; vector search uses the original query embedding. The Cohere reranker scores against the original query, filtering out any noise from expansion.</p>
+    <p><strong>Why:</strong> IB terminology is highly domain-specific and inconsistent. "Multiple," "comp," "valuation," "EV/EBITDA," and "trading comps" all refer to related concepts but will not match each other in keyword search. Without expansion, a significant percentage of real queries silently fail to retrieve relevant documents. The static synonym map handles known IB vocabulary instantly, while Haiku handles context-dependent expansions the static map cannot (e.g., "what did we pay" expanding to "purchase price," "enterprise value"). Crucially, the reranker acts as a noise filter &mdash; it scores against the original query, so expansion can be aggressive without risking false positives reaching Claude.</p>
+    <p><strong>Considered instead:</strong> No expansion (relying on vector search alone for semantic matching) was considered but vector search has gaps on domain-specific abbreviations and jargon that even good embedding models miss. A database-backed synonym service was considered but adds latency and infrastructure for what is effectively a static dictionary. Expanding vector search queries (not just BM25) was considered but would require re-embedding expanded terms, adding latency for marginal benefit since the original embedding already captures semantic meaning.</p>
+    <p><strong>When to revisit:</strong> If the synonym map grows unwieldy (&gt;200 entries) and maintenance becomes a burden. If Haiku expansion proves redundant with the static map (measure overlap between Layer 1 and Layer 2 hits). If a better embedding model (Decision #5) closes the keyword-matching gap enough to make BM25 expansion unnecessary.</p>
+    <div class="decision-meta">Category: Search Quality</div>
+  </details>
+
+  <!-- Decision 13 -->
+  <details class="decision-card">
+    <summary>#13 &mdash; Chunking Quality: Hierarchical Row-Group Splitting + Haiku Doc Summaries</summary>
+    <p><strong>Chosen:</strong> Two mechanisms working together. <strong>Large table splitting:</strong> tables exceeding 1,500 tokens are split at structural boundaries detected from formatting signals (indent level changes, bold headers, Total/Subtotal rows, blank separators) rather than at arbitrary row counts. Flat tables with no detectable structure fall back to ~25&ndash;30 row chunks. <strong>Document summaries:</strong> for documents producing 4 or more chunks, Haiku generates a ~200-token summary indexed as <code>chunk_type: "doc_summary"</code>. This summary acts as a semantic bridge connecting distant sections of the same document.</p>
+    <p><strong>Why:</strong> IB documents have two chunking challenges that generic approaches fail on. First, financial tables encode hierarchy through formatting (indent levels, bold category headers, subtotal rows) &mdash; splitting mid-category produces chunks that are meaningless in isolation ("Raw Materials: $12M, $14M, $15M" without the parent "COGS" category). Structural splitting preserves logical groups. Second, long documents (CIMs, board decks) have semantically related content spread across distant sections &mdash; company description on page 5 references financial metrics on page 30. The doc summary chunk bridges these sections in vector space, so a query like "Acme's revenue growth story" can surface both narrative and numbers.</p>
+    <p><strong>Considered instead:</strong> Fixed-size row splitting (every 25 rows) was considered but breaks logical groups in hierarchical tables, producing chunks that lack context. Overlap-based splitting (repeating rows across chunks) was considered but wastes token budget on repeated content. For document summaries, the alternative was no bridging mechanism at all &mdash; relying on vector search to independently surface the right chunks from each section. This works for simple queries but fails on questions that require connecting information across sections.</p>
+    <p><strong>When to revisit:</strong> If the hierarchical splitting heuristics produce poor results on specific table formats (monitor which tables fall back to fixed-size splitting and why). If doc summaries are displacing more useful content chunks from the top-5 reranked results more often than they help (measure via user feedback). When sibling chunk retrieval is implemented in v2, doc summaries may become less critical for bridging.</p>
+    <div class="decision-meta">Category: Search Quality</div>
+  </details>
+
+  <!-- Decision 15 -->
+  <details class="decision-card">
+    <summary>#15 &mdash; Near-Duplicate Dedup: Filename Normalization + Embedding Cosine Similarity</summary>
+    <p><strong>Chosen:</strong> Two-phase detection at ingestion time. <strong>Phase 1:</strong> normalize filenames by stripping version markers ("v3"), finality markers ("FINAL", "revised", "draft"), copy markers ("(2)"), and other noise, then group by (normalized name, source folder). Same-folder constraint prevents false positives across deal folders. <strong>Phase 2:</strong> for candidate clusters, compare first-chunk embeddings via cosine similarity (&ge;0.95 = confirmed duplicate). Most recent <code>last_modified</code> is canonical; all others are filtered from search results via <code>is_canonical eq true</code>. Zero query-time latency impact.</p>
+    <p><strong>Why:</strong> IB folders routinely contain "Deal Summary v3 FINAL.docx", "Deal Summary v3 FINAL (2).docx", and "Deal Summary v3 FINAL revised.docx" &mdash; different file IDs with nearly identical content. Without dedup, search returns multiple near-identical chunks that clutter the top-5 results and push genuinely different content out. The two-phase approach catches the common case cheaply (filename normalization handles 90%+ of duplicates) and uses embedding similarity as a confirmation check (preventing false positives where similarly named files have genuinely different content). The same-folder constraint is critical &mdash; it prevents matching a buyer's model against a seller's model that happen to share a similar name in different deal folders.</p>
+    <p><strong>Considered instead:</strong> Content hashing (MD5/SHA of full file) was considered but misses near-duplicates where only minor edits were made (a fixed typo, an added paragraph). Pairwise content comparison across all files was considered but is computationally infeasible at 550K documents. No dedup (relying on the reranker to prefer one version) was considered but the reranker does not know that two chunks are from duplicate files &mdash; it would rank them both highly, wasting two of the five result slots on essentially the same content.</p>
+    <p><strong>When to revisit:</strong> If users report duplicate results that the current approach misses (files with completely different names but identical content &mdash; a known gap). If the 0.95 cosine similarity threshold needs recalibration after an embedding model change (the blue-green re-indexing process includes a threshold calibration step). If the cluster count grows large enough that Cosmos DB storage or query performance becomes a concern.</p>
+    <div class="decision-meta">Category: Search Quality</div>
+  </details>
+
+  <!-- Decision 16 -->
+  <details class="decision-card">
+    <summary>#16 &mdash; Embedding Portability: Provider Abstraction + Blue-Green Re-Indexing</summary>
+    <p><strong>Chosen:</strong> An abstract <code>EmbeddingProvider</code> interface that all embedding calls (ingestion and query-time) go through. A factory function reads the <code>EMBEDDING_PROVIDER</code> environment variable and returns the concrete implementation. Three provenance metadata fields per chunk (<code>embedding_model</code>, <code>embedding_dimensions</code>, <code>embedding_version</code>) track which model produced each vector. On provider switch: create a parallel index with new dimensions, run a background Durable Functions re-indexing orchestrator, validate, flip <code>ACTIVE_INDEX_NAME</code>, delete the old index after 48 hours. Zero downtime, zero query impact during transition.</p>
+    <p><strong>Why:</strong> The embedding model landscape is evolving rapidly &mdash; better models emerge regularly, and we expect to switch providers multiple times over BSearch's lifetime. Without an abstraction layer, each switch would require code changes throughout the ingestion and query pipelines. Without blue-green re-indexing, switching would mean either downtime or mixed-model vectors in the same index (cosine similarity between vectors from different models is meaningless). The 48-hour rollback window means a bad model switch can be reverted by flipping a single config value.</p>
+    <p><strong>Considered instead:</strong> In-place rolling re-indexing (re-embedding chunks gradually within the same index) was considered but Azure AI Search cannot coherently query mixed-model vectors &mdash; queries during the transition would get unpredictable results. Hardcoding to Voyage AI (no abstraction) was considered but would make future model switches expensive. A third-party embedding orchestration service was considered but adds a dependency for something that a simple factory pattern handles well.</p>
+    <p><strong>When to revisit:</strong> If the re-indexing time for 2.2M chunks (~1&ndash;2 hours) becomes unacceptable as the corpus grows. If Azure AI Search introduces native multi-model vector support. If the abstraction layer adds friction to using provider-specific features (e.g., a new provider offers a capability that does not fit the abstract interface).</p>
+    <div class="decision-meta">Category: Search Quality</div>
+  </details>
+
+  <!-- Decision 17 -->
+  <details class="decision-card">
+    <summary>#17 &mdash; Multi-Doc Synthesis: Tiered Chain-of-Thought + Deal Summaries</summary>
+    <p><strong>Chosen:</strong> Three mechanisms for multi-document queries. <strong>Structured chain-of-thought:</strong> multi-doc queries use Claude's extended thinking (~2,000 token budget) with a structured extraction-then-synthesis prompt &mdash; Claude first extracts facts from each chunk in its thinking, then synthesizes a coherent answer. Single Claude call, no added latency versus a naive single-pass. <strong>Deal summaries:</strong> Haiku-generated ~400-token deal-level summaries (pre-computed, refreshed on file changes and every 6 hours) that reduce cross-deal reasoning burden at query time. <strong>Relaxed TTFT:</strong> 5-second TTFT target for multi-doc synthesis (vs. 3 seconds for other types), with a "Searching across multiple documents..." frontend indicator.</p>
+    <p><strong>Why:</strong> Pipeline-level queries ("where do we stand on active deals?") are the hardest thing BSearch does &mdash; they require reasoning across chunks from dozens of documents and multiple deals. Without structured thinking, Claude tends to produce disorganized answers that miss deals or conflate information. The thinking budget gives Claude space to systematically extract and organize facts before writing. Pre-computed deal summaries shift most of the cross-deal reasoning to ingestion time &mdash; when a user asks about the healthcare pipeline, Claude gets pre-digested deal cards instead of raw heterogeneous chunks. The relaxed TTFT target acknowledges that complex queries take longer, and the frontend indicator sets the right expectation.</p>
+    <p><strong>Considered instead:</strong> Two-pass extraction (Haiku screens and extracts from each chunk, then Sonnet synthesizes from Haiku's output) was the main alternative. It would produce better structured input for Sonnet but adds ~500&ndash;800ms of latency for the Haiku pass, pushing total TTFT close to the 5-second target on bad days. Deferred to v2 if single-pass quality proves insufficient. No deal summaries (forcing Claude to reason across raw chunks at query time) was considered but produces worse answers on pipeline queries and is more expensive per query (larger context windows).</p>
+    <p><strong>When to revisit:</strong> If single-pass synthesis quality on multi-doc queries is noticeably worse than expected (user feedback and manual evaluation). If two-pass extraction becomes feasible due to faster Haiku models or relaxed TTFT targets. If deal summary staleness causes problems (summaries can be up to 6 hours behind the latest document changes between refresh cycles).</p>
+    <div class="decision-meta">Category: Search Quality</div>
+  </details>
+
+  <!-- ============================================================ -->
+  <!-- 14.3 Resilience -->
+  <!-- ============================================================ -->
+  <h2><span class="section-number">14.3</span> Resilience</h2>
+
+  <p>These decisions govern how BSearch behaves when external dependencies fail or degrade &mdash; the difference between a system that breaks silently and one that degrades transparently.</p>
+
+  <!-- Decision 6 -->
+  <details class="decision-card">
+    <summary>#6 &mdash; Webhook Reliability: Graph API Webhooks + Delta Sync Timer Fallback</summary>
+    <p><strong>Chosen:</strong> Microsoft Graph API webhooks as the primary sync mechanism for near-real-time updates (~30&ndash;120 seconds after a file change). Delta sync timer (every 12&ndash;24 hours) as a fallback for missed webhooks. Both trigger the same delta query + orchestrator pipeline. Webhook subscriptions stored in Cosmos DB, renewed via timer trigger every 12 hours (subscriptions expire after ~3 days).</p>
+    <p><strong>Why:</strong> Users expect recently changed files to appear in search results within minutes, not hours. Webhooks provide this near-real-time sync. But webhooks are inherently unreliable &mdash; Microsoft can drop notifications, subscriptions can expire, and the webhook endpoint can be temporarily unreachable. The delta sync timer catches anything webhooks miss, ensuring the index never drifts more than 12&ndash;24 hours behind reality. Using the same pipeline for both triggers means there is no code divergence between the two sync paths &mdash; they share delta tokens, dedup logic, and the full ingestion orchestrator.</p>
+    <p><strong>Considered instead:</strong> Polling-only (delta queries every N minutes) was considered but provides worse freshness at higher API cost &mdash; frequent polling wastes Graph API calls when nothing has changed, while infrequent polling means stale results. Webhooks-only (no timer fallback) was considered but is too risky &mdash; a missed webhook with no safety net means the file never gets re-indexed until the next bulk run. Microsoft Graph change notifications via Event Hubs were considered but add infrastructure complexity for a small-scale system.</p>
+    <p><strong>When to revisit:</strong> If webhook reliability proves high enough that the delta sync timer can be extended to every 48+ hours (reducing Graph API usage). If Microsoft introduces a more reliable notification mechanism. If the 30&ndash;120 second webhook latency is too slow for user expectations (could add a manual "refresh" button for specific folders).</p>
+    <div class="decision-meta">Category: Resilience</div>
+  </details>
+
+  <!-- Decision 12 -->
+  <details class="decision-card">
+    <summary>#12 &mdash; Reranker Degradation: Health Check + Forced LOW Confidence + Orange Banner</summary>
+    <p><strong>Chosen:</strong> A proactive health check that pings Cohere rerank every 60 seconds with a minimal test payload. On failure: skip reranking, reduce retrieval depth from top-20 to top-12, cap confidence at LOW (never HIGH &mdash; forces hedging language in Claude's response), include <code>degraded_reranker: true</code> in the SSE stream, and render a distinct orange banner in the frontend telling the user that results are ranked without AI reranking. Application Insights alert on 3 or more consecutive failures. No secondary reranker in v1.</p>
+    <p><strong>Why:</strong> The Cohere reranker is the quality bottleneck &mdash; it is the difference between Claude synthesizing from the 5 best chunks versus mediocre ones. Silent degradation is unacceptable in investment banking. A subtly wrong answer in a client deliverable is worse than a flagged one. The forced LOW confidence cap ensures that even when the reranker is down, Claude never produces a confident-sounding answer from potentially poor results &mdash; the hedging language and orange banner make the quality reduction visible to the user. Reducing to top-12 prevents extra noise from reaching Claude without the reranker to filter it.</p>
+    <p><strong>Considered instead:</strong> A secondary cross-encoder reranker as a fallback was considered but adds operational complexity (another model to deploy, monitor, and pay for) that is not justified for 50&ndash;200 queries per day. Silently using Azure Search native ranking without telling the user was considered but violates the transparency principle &mdash; users need to know when to double-check results against source documents. Failing the query entirely when the reranker is down was considered but is too aggressive for a transient issue &mdash; Azure Search's hybrid ranking is serviceable, just not as precise.</p>
+    <p><strong>When to revisit:</strong> If Cohere reliability is consistently poor (reranker degraded more than 1% of the time). If query volume increases enough to justify the cost and complexity of a secondary reranker. If a local cross-encoder model becomes fast and accurate enough to serve as a zero-infrastructure fallback.</p>
+    <div class="decision-meta">Category: Resilience</div>
+  </details>
+
+  <!-- Decision 14 -->
+  <details class="decision-card">
+    <summary>#14 &mdash; Embedding Latency: LRU Cache + 500ms Timeout + BM25-Only Fallback</summary>
+    <p><strong>Chosen:</strong> Three-layer resilience for query-time embedding. <strong>LRU cache:</strong> in-memory cache of ~1,000 query-to-embedding mappings, checked before every Voyage AI call (~0ms on hit, ~32MB memory footprint). <strong>Hard timeout:</strong> 500ms timeout on the Voyage AI embedding API &mdash; if embedding takes longer, proceed without it. <strong>BM25-only fallback:</strong> on timeout or API error, search proceeds with BM25 keyword matching only (no vector search), with static synonym expansion and Haiku expansion enriching the BM25 terms. Cohere reranker compensates for lost semantic matching. File lookup queries (regex fast path) skip embedding entirely &mdash; BM25 on filenames is sufficient.</p>
+    <p><strong>Why:</strong> Voyage AI query embedding is a parallel leg of the critical path. Typical latency is 100&ndash;300ms, but spikes to 500ms+ happen due to rate limiting, network jitter, or API degradation. Without a timeout, a slow embedding call could blow the 3-second TTFT target. The LRU cache exploits the fact that 18 users asking similar questions will repeat query patterns ("latest [deal] deck," "what's [deal]'s EBITDA") &mdash; even a 10&ndash;15% cache hit rate meaningfully reduces p95 embedding latency. The BM25-only fallback is not surfaced to users (unlike reranker degradation) because it is transient (per-query, not systemic) and BM25 + synonym expansion + reranker still produces reasonable results.</p>
+    <p><strong>Considered instead:</strong> No timeout (waiting for Voyage AI regardless) was considered but would cause TTFT spikes that destroy user trust. A longer timeout (1,000ms) was considered but leaves only ~750ms of margin before hitting the 3-second TTFT target on p99. A shared Redis cache (instead of in-memory LRU) was considered but adds infrastructure for 18 users who share a single App Service instance &mdash; in-process memory is simpler and faster. Surfacing embedding fallback to users (like the reranker orange banner) was considered but would cause unnecessary alarm for a transient condition that still produces acceptable results.</p>
+    <p><strong>When to revisit:</strong> If the embedding fallback rate exceeds 10% over any 1-hour window (Application Insights alert fires), which indicates sustained Voyage AI degradation rather than transient spikes. If the cache hit rate is consistently below 5% (the cache is not providing value and the memory could be used elsewhere). If the App Service scales to multiple instances, where each instance warms its own cache independently &mdash; at that point, a shared cache might be worth the complexity.</p>
+    <div class="decision-meta">Category: Resilience</div>
+  </details>
+
+  <!-- ============================================================ -->
+  <!-- 14.4 AI Models -->
+  <!-- ============================================================ -->
+  <h2><span class="section-number">14.4</span> AI Models</h2>
+
+  <p>This decision covers which AI models BSearch uses and why &mdash; the most visible cost and quality trade-off in the system.</p>
+
+  <!-- Decision 7 -->
+  <details class="decision-card">
+    <summary>#7 &mdash; Claude Model Selection: Sonnet 4.6 for Synthesis, Haiku 4.5 for Classification</summary>
+    <p><strong>Chosen:</strong> Anthropic Claude Sonnet 4.6 for user-facing query synthesis (~$11/month at 50&ndash;200 queries/day). Anthropic Claude Haiku 4.5 for fast background tasks: query classification, query expansion, ingestion-time entity extraction, document summaries, and deal summaries. Both models are configurable via environment variables.</p>
+    <p><strong>Why:</strong> Synthesis quality is the product &mdash; the user sees Claude's answer, and it needs to be accurate, well-organized, and properly cited. Sonnet 4.6 delivers the reasoning quality needed for multi-document synthesis and precise data extraction. But using Sonnet for every background task would be wasteful &mdash; classification does not need deep reasoning, it needs speed. Haiku 4.5 runs in ~150ms at a fraction of Sonnet's cost, making it ideal for the many small tasks that happen per query (classification, expansion) and per document (entity extraction, summaries). The two-model split keeps monthly AI costs at roughly $11 for synthesis plus pennies for classification, totaling well under $15/month for the AI layer.</p>
+    <p><strong>Considered instead:</strong> Using Sonnet for everything was considered but would roughly triple AI costs and add 200&ndash;400ms of latency to classification (Sonnet is slower than Haiku for simple tasks). Using Haiku for everything including synthesis was considered but Haiku's reasoning quality is noticeably weaker on multi-document questions &mdash; it produces less organized answers, misses cross-document connections, and sometimes hallucinates citations. OpenAI GPT-4o was considered for synthesis but Claude produces better structured answers for document-based Q&A in our testing. Using a local model (e.g., Llama) for classification was considered but adds GPU infrastructure for a task that Haiku handles at ~$0.10&ndash;0.40/day.</p>
+    <p><strong>When to revisit:</strong> When Anthropic releases new model versions (expected regularly) &mdash; evaluate whether a newer Haiku can handle synthesis tasks or whether a newer Sonnet justifies the upgrade. If synthesis costs grow beyond $20/month (query volume increase or model pricing change). If a competitor model demonstrates meaningfully better IB document synthesis quality. If Haiku classification accuracy drops on real queries (monitor via classification override rate in feedback).</p>
+    <div class="decision-meta">Category: AI Models</div>
+  </details>
+
+  <!-- ============================================================ -->
+  <!-- Key Takeaway -->
+  <!-- ============================================================ -->
+  <div class="key-takeaway">
+    <div class="callout-title">Key Takeaway</div>
+    <p>These 18 decisions are not permanent. Each one was made for specific reasons under specific constraints &mdash; 18 users, 550K documents, sub-$500/month budget, and a priority on answer quality over raw scale. Every decision includes the conditions under which it should be reconsidered. When those conditions change, the decision should change too. The system is designed to make most of these changes cheap: embedding models can be swapped via the abstraction layer, confidence thresholds are environment variables, AI models are configurable, and the monorepo structure means changes propagate atomically.</p>
+  </div>
+
+  <nav class="chapter-nav bottom">
+    <a href="chapter-13.html">&larr; Previous: Phase 6 &mdash; Testing &amp; Go-Live</a>
+    <span class="nav-spacer">|</span>
+    <a href="index.html">Contents</a>
+    <span class="nav-spacer">|</span>
+    <a href="chapter-15.html">Next: Glossary &rarr;</a>
+  </nav>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad: true, theme: 'neutral'});</script>
+</body>
+</html>

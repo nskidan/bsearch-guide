@@ -4,178 +4,454 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="light only">
-  <title>Chapter 8: Authentication &amp; Permissions &mdash; BSearch Technical Guide</title>
+  <title>Chapter 8: Phase 1 &mdash; Project Setup &amp; Infrastructure &mdash; BSearch Technical Guide</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
 <div class="page-wrapper">
+
   <nav class="chapter-nav">
-    <a href="chapter-07.html">&larr; Previous: Data Model</a>
+    <a href="chapter-07.html">&larr; Previous: When Things Go Wrong</a>
     <span class="nav-spacer">|</span>
     <a href="index.html">Contents</a>
     <span class="nav-spacer">|</span>
-    <a href="chapter-09.html">Next: Infrastructure &amp; Deployment &rarr;</a>
+    <a href="chapter-09.html">Next: Phase 2 &mdash; Document Parsers &amp; Chunking &rarr;</a>
   </nav>
+
   <div class="chapter-header">
     <div class="chapter-number">Chapter 8</div>
-    <h1>Authentication &amp; Permissions</h1>
-    <p class="chapter-subtitle">Who can log in, what they can see, and how the system enforces it.</p>
-  </div>
-
-  <p>BSearch holds deal documents across five SharePoint folders, some of which contain highly sensitive information. The system needs to answer two questions on every request: <em>who are you?</em> and <em>what are you allowed to see?</em> This chapter explains how both of those questions are answered &mdash; without requiring anyone at the firm to create a new username or remember another password.</p>
-
-  <!-- ================================================================ -->
-  <!-- 8.1 Azure AD / Entra ID -->
-  <!-- ================================================================ -->
-  <h2><span class="section-number">8.1</span> Azure AD / Entra ID</h2>
-
-  <div class="definition">
-    <p><span class="term">Azure Active Directory (Azure AD)</span>, recently rebranded to <span class="term">Microsoft Entra ID</span> &mdash; Microsoft&rsquo;s identity system. It is the service that manages everyone&rsquo;s Microsoft account at Berenson &mdash; the same account you use for Outlook, Teams, and SharePoint.</p>
-  </div>
-
-  <p>Everyone at the firm already has an Azure AD account. BSearch piggybacks on that existing identity instead of creating its own user database. This means:</p>
-
-  <ul>
-    <li><strong>No new passwords.</strong> You sign in with the same Microsoft credentials you already use every day.</li>
-    <li><strong>Single sign-on (SSO).</strong> If you are already logged into Outlook or Teams, BSearch recognizes you automatically &mdash; no second login prompt.</li>
-    <li><strong>Centralized management.</strong> When IT disables someone&rsquo;s Microsoft account (e.g., they leave the firm), they lose BSearch access instantly. No separate offboarding step.</li>
-  </ul>
-
-  <div class="callout ib-analogy">
-    <div class="callout-title">IB Analogy</div>
-    <p>Think of Azure AD as the firm&rsquo;s building security badge. Your badge gets you into the lobby, your floor, and the conference rooms you are authorized for. BSearch is like a new room in the building &mdash; it does not issue its own badges; it reads the same badge you already carry.</p>
+    <h1>Phase 1 &mdash; Project Setup &amp; Infrastructure</h1>
+    <p class="chapter-subtitle">The foundation: project structure, configuration, and Azure resources. Nothing user-facing yet, but everything else builds on this.</p>
   </div>
 
   <!-- ================================================================ -->
-  <!-- 8.2 How Login Works -->
+  <!-- 8.1 What You're Building -->
   <!-- ================================================================ -->
-  <h2><span class="section-number">8.2</span> How Login Works</h2>
+  <h2><span class="section-number">8.1</span> What You're Building</h2>
 
-  <div class="definition">
-    <p><span class="term">OpenID Connect (OIDC)</span> &mdash; An industry-standard protocol for authentication. It is the mechanism that lets one application (BSearch) delegate the &ldquo;who are you?&rdquo; question to another service (Microsoft). You have used OIDC every time you click &ldquo;Sign in with Google&rdquo; or &ldquo;Sign in with Microsoft&rdquo; on a website.</p>
-  </div>
+  <p>This phase creates the foundation that every other phase depends on. You are setting up three things: the code structure (a monorepo where all Python code and infrastructure templates live together), the configuration system (how the application reads API keys, connection strings, and tuning parameters), and the Azure infrastructure (the cloud resources that will host everything).</p>
 
-  <div class="definition">
-    <p><span class="term">JWT (JSON Web Token)</span> &mdash; A small, digitally signed data packet that proves who you are. After you log in, Microsoft hands BSearch a JWT &mdash; think of it as a tamper-proof digital ID card with your name, email, and group memberships stamped on it.</p>
-  </div>
+  <p>Nothing in this phase is user-facing. There is no web app, no search, no document parsing. What you get at the end is a working project skeleton where <code>import src.shared.config</code> loads configuration without errors, and an Azure resource group containing all the services BSearch needs &mdash; search, compute, database, monitoring, and secrets management. Every subsequent phase plugs into this foundation.</p>
 
-  <p>Here is the login flow, step by step:</p>
-
-  <ol>
-    <li>You open BSearch in your browser and click <strong>&ldquo;Sign in with Microsoft.&rdquo;</strong></li>
-    <li>Your browser redirects to Microsoft&rsquo;s login page (the same one you see for Outlook). Azure Static Web Apps handles this automatically via its built-in <code>.auth/login/aad</code> endpoint.</li>
-    <li>You enter your Microsoft credentials (or, if you are already signed in, this step is skipped entirely &mdash; that is SSO in action).</li>
-    <li>Microsoft verifies your identity and redirects you back to BSearch with a <strong>JWT token</strong> attached.</li>
-    <li>On every subsequent request (every search, every page load), the BSearch API receives that token and validates it &mdash; checking that it was genuinely issued by Microsoft, that it has not expired, and that it has not been tampered with.</li>
-  </ol>
-
-  <p>If the token is expired or invalid, the API returns a <strong>401 Unauthorized</strong> response, and BSearch redirects you back to the Microsoft login page to re-authenticate. In practice, tokens last long enough that you rarely see this &mdash; it happens silently in the background.</p>
-
-  <div class="callout ib-analogy">
-    <div class="callout-title">IB Analogy</div>
-    <p>The JWT is like a signed engagement letter. It states who the parties are (you and BSearch), it has an expiration date, and it is signed by a trusted authority (Microsoft). If someone forges one or it expires, the deal (your session) does not proceed until a new one is executed.</p>
-  </div>
+  <p>Think of it like setting up the office before the first day of work: desks, phones, internet, security badges, and building access. Nobody is doing deals yet, but without this infrastructure in place, nothing else can start.</p>
 
   <!-- ================================================================ -->
-  <!-- 8.3 Folder Permission Model -->
+  <!-- 8.2 Before You Start -->
   <!-- ================================================================ -->
-  <h2><span class="section-number">8.3</span> Folder Permission Model</h2>
+  <h2><span class="section-number">8.2</span> Before You Start</h2>
 
-  <p>BSearch indexes documents from five top-level SharePoint folders. Not everyone at the firm should see every folder. The permission model is simple and deliberate: <strong>access is all-or-nothing per folder.</strong> If you can see a folder, you can see every document in it. If you cannot, none of those documents will appear in your search results.</p>
-
-  <p>A configuration file maps each folder to one or more Azure AD security groups:</p>
-
-  <pre><code>{
-  "Active Deals": ["group-id-1", "group-id-2"],
-  "Closed Deals": ["group-id-1"],
-  "Pipeline": ["group-id-3"],
-  "Templates": ["all"],
-  "Admin": ["group-id-4"]
-}</code></pre>
-
-  <p>Reading this configuration: &ldquo;Active Deals&rdquo; is accessible to members of two AD groups. &ldquo;Templates&rdquo; is accessible to everyone (<code>"all"</code>). &ldquo;Admin&rdquo; is restricted to a single group.</p>
-
-  <p>There is no sub-file permissioning in v1. The system does not check whether you have access to a specific document within a folder &mdash; it checks whether you have access to the folder itself. With only 5 folders and 18 users, this level of granularity is sufficient.</p>
+  <div class="before-you-start">
+    <div class="section-label">Before You Start</div>
+    <ul>
+      <li><strong>Create an Azure subscription</strong> (or confirm you have access to one). This is the billing account that all Azure resources will live under. If you already have one for other Berenson infrastructure, you can use the same subscription.</li>
+      <li><strong>Create an Azure AD app registration</strong> with three permissions:
+        <ul>
+          <li><strong>Sites.Read.All</strong> &mdash; lets BSearch see the list of SharePoint sites and their folder structure. Without this, BSearch cannot discover where documents live.</li>
+          <li><strong>Files.Read.All</strong> &mdash; lets BSearch download and read the actual files (Word, Excel, PowerPoint, PDF) from SharePoint and OneDrive. This is read-only &mdash; BSearch cannot modify or delete anything.</li>
+          <li><strong>User.Read.All</strong> &mdash; lets BSearch look up which security groups each user belongs to. This is how the permission system works: when you search, BSearch checks your group memberships to determine which folders you can see.</li>
+        </ul>
+        All three are <em>application permissions</em> (not delegated), which means they require an Azure AD administrator to click "Grant admin consent" after you add them. These are read-only permissions &mdash; BSearch cannot change anything in your M365 tenant.
+      </li>
+      <li><strong>Create a Neo4j Aura account</strong> at <code>neo4j.io</code>. The Free tier is sufficient for development (~200K nodes, 400K relationships &mdash; enough for ~100 deals). You will upgrade to Pro (~$65/month) for production. After creating an instance, save the connection URI, username, and password.</li>
+      <li><strong>Get API keys</strong> for three external services:
+        <ul>
+          <li><strong>Anthropic</strong> &mdash; for Claude (the AI that reads documents and writes answers). You need an API key from <code>console.anthropic.com</code>.</li>
+          <li><strong>Voyage AI</strong> &mdash; for embeddings (converting text into numbers that capture meaning, which is how semantic search works). API key from <code>dash.voyageai.com</code>.</li>
+          <li><strong>Cohere</strong> &mdash; for reranking (re-scoring search results by relevance before Claude reads them). API key from <code>dashboard.cohere.com</code>.</li>
+        </ul>
+      </li>
+      <li><strong>Create a GitHub repository</strong> for the project. This is where all code and infrastructure templates will live.</li>
+    </ul>
+  </div>
 
   <div class="callout info">
-    <div class="callout-title">Why not file-level permissions?</div>
-    <p>SharePoint supports fine-grained, file-level permissions, but syncing those permissions into the search index adds significant complexity (see Section 8.6). For a team of 18 people with 5 clearly separated folders, folder-level access is the right trade-off: simple to implement, simple to audit, and simple to explain.</p>
+    <div class="callout-title">Keep those credentials safe</div>
+    <p>You will collect roughly a dozen API keys and connection strings during this phase. Do not put any of them in code files. They will all go into Azure Key Vault (the cloud-based secrets manager), and the application will read them from there at runtime. For local development, they go in a <code>.env</code> file that is listed in <code>.gitignore</code> so it never gets committed.</p>
   </div>
 
   <!-- ================================================================ -->
-  <!-- 8.4 Query-Time Enforcement -->
+  <!-- 8.3 The Spec -->
   <!-- ================================================================ -->
-  <h2><span class="section-number">8.4</span> Query-Time Enforcement</h2>
+  <h2><span class="section-number">8.3</span> The Spec</h2>
 
-  <p>The permission model above would be meaningless if it were only enforced in the user interface. Someone could bypass the front-end and hit the API directly. That is why permissions are enforced <strong>at the database level</strong>, on every single search query.</p>
+  <p>This section is the technical specification for Claude Code. It contains exact file names, field types, and configuration details.</p>
 
-  <p>Here is what happens every time you search:</p>
+  <!-- 8.3.1 Monorepo Structure -->
+  <h3>Monorepo Structure</h3>
 
-  <ol>
-    <li><strong>Resolve the user.</strong> The API reads your JWT to determine who you are.</li>
-    <li><strong>Look up group memberships.</strong> The system checks which Azure AD security groups you belong to.</li>
-    <li><strong>Determine permitted folders.</strong> Using the configuration from Section 8.3, the system identifies which of the 5 folders your groups grant access to.</li>
-    <li><strong>Add a filter to the search query.</strong> Before the query is sent to Azure AI Search, a filter is appended: <code>source_folder IN ["Active Deals", "Templates", ...]</code>. This filter runs inside the search engine itself.</li>
-  </ol>
+  <p>BSearch is a monorepo &mdash; one repository containing all Python code (shared utilities, ingestion pipeline, search API), the React frontend, infrastructure templates, and tests. A single <code>pyproject.toml</code> at the root defines all Python dependencies.</p>
 
-  <p>The critical point: <strong>unauthorized documents never leave the search index.</strong> They are filtered out before the results are scored, before they reach the reranker, and before Claude ever sees them. There is no moment where a restricted document is &ldquo;fetched and then hidden&rdquo; &mdash; it is never fetched in the first place.</p>
+  <pre><code>bsearch/
+├── src/
+│   ├── __init__.py
+│   ├── shared/
+│   │   ├── __init__.py
+│   │   ├── config.py          # Pydantic BaseSettings (~25 keys)
+│   │   ├── models.py          # Pydantic models: Chunk, SearchResult, etc.
+│   │   ├── health.py          # ServiceHealthChecker base class
+│   │   └── ms_graph_client.py # Microsoft Graph API client
+│   ├── ingestion/
+│   │   └── __init__.py
+│   └── api/
+│       └── __init__.py
+├── web/                        # React SPA (created in Phase 5)
+├── infra/
+│   ├── main.bicep             # Composes all modules
+│   ├── modules/
+│   │   ├── search.bicep       # Azure AI Search + index schema
+│   │   ├── functions.bicep    # Azure Durable Functions
+│   │   ├── appservice.bicep   # App Service for FastAPI
+│   │   ├── cosmos.bicep       # Cosmos DB serverless
+│   │   ├── staticwebapp.bicep # Static Web Apps
+│   │   ├── keyvault.bicep     # Key Vault + secrets
+│   │   └── appinsights.bicep  # Application Insights + Log Analytics
+│   └── parameters/
+│       ├── dev.bicepparam
+│       └── prod.bicepparam
+├── tests/
+│   ├── conftest.py            # Shared fixtures
+│   ├── fixtures/              # Sample .docx, .xlsx, .pptx, .pdf files
+│   └── __init__.py
+├── pyproject.toml
+├── DESIGN.md
+└── CLAUDE.md</code></pre>
 
-  <p>Group membership lookups are cached to avoid calling Microsoft&rsquo;s API on every search. The cache is invalidated when group memberships change (e.g., someone joins or leaves a deal team).</p>
+  <h3>Python Dependencies (<code>pyproject.toml</code>)</h3>
 
-  <div class="callout ib-analogy">
-    <div class="callout-title">IB Analogy</div>
-    <p>This is like an information wall (Chinese wall). When you are restricted from a deal, the compliance team does not just hide the folder from your desktop &mdash; the documents are walled off at the server level so you cannot access them through any channel. BSearch&rsquo;s query-time filtering works the same way: the wall is enforced at the data layer, not the UI layer.</p>
+  <p>The project uses a single <code>pyproject.toml</code> at the root. Key dependencies:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Category</th>
+        <th>Packages</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>API framework</td>
+        <td><code>fastapi</code>, <code>uvicorn</code></td>
+      </tr>
+      <tr>
+        <td>Azure services</td>
+        <td><code>azure-functions</code>, <code>azure-functions-durable</code>, <code>azure-cosmos</code>, <code>azure-search-documents</code>, <code>azure-identity</code>, <code>azure-ai-formrecognizer</code></td>
+      </tr>
+      <tr>
+        <td>Document parsers</td>
+        <td><code>python-docx</code>, <code>openpyxl</code>, <code>python-pptx</code></td>
+      </tr>
+      <tr>
+        <td>AI / ML</td>
+        <td><code>voyageai</code>, <code>cohere</code>, <code>anthropic</code></td>
+      </tr>
+      <tr>
+        <td>Config &amp; data</td>
+        <td><code>pydantic-settings</code>, <code>neo4j</code></td>
+      </tr>
+      <tr>
+        <td>Dev / test</td>
+        <td><code>pytest</code>, <code>testcontainers-python</code> (Neo4j integration tests)</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- 8.3.2 Config System -->
+  <h3>Configuration System (<code>src/shared/config.py</code>)</h3>
+
+  <p>Configuration follows a three-tier approach (Architecture Decision #18) to keep the Settings class focused and manageable (~25 keys instead of ~40):</p>
+
+  <h4>Tier 1 &mdash; Module-Level Constants</h4>
+
+  <p>Algorithm-design values that only change alongside code or prompt changes. Defined as <code>UPPER_SNAKE_CASE</code> constants at the top of the module that uses them. <strong>Not in the Settings class.</strong></p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Constant</th>
+        <th>Value</th>
+        <th>Owning Module</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>BM25_ORIGINAL_BOOST</code></td>
+        <td><code>3.0</code></td>
+        <td><code>query_expander.py</code></td>
+      </tr>
+      <tr>
+        <td><code>BM25_EXPANSION_BOOST</code></td>
+        <td><code>1.5</code></td>
+        <td><code>query_expander.py</code></td>
+      </tr>
+      <tr>
+        <td><code>IB_SYNONYMS_PATH</code></td>
+        <td><code>"src/shared/ib_synonyms.json"</code></td>
+        <td><code>query_expander.py</code></td>
+      </tr>
+      <tr>
+        <td><code>FLAT_TABLE_SPLIT_ROWS</code></td>
+        <td><code>25</code></td>
+        <td><code>table_splitter.py</code></td>
+      </tr>
+      <tr>
+        <td><code>DOC_SUMMARY_MIN_CHUNKS</code></td>
+        <td><code>4</code></td>
+        <td><code>doc_summary.py</code></td>
+      </tr>
+      <tr>
+        <td><code>DOC_SUMMARY_MAX_TOKENS</code></td>
+        <td><code>200</code></td>
+        <td><code>doc_summary.py</code></td>
+      </tr>
+      <tr>
+        <td><code>DOC_SUMMARY_CONTENT_PREVIEW_TOKENS</code></td>
+        <td><code>2000</code></td>
+        <td><code>doc_summary.py</code></td>
+      </tr>
+      <tr>
+        <td><code>DEAL_SUMMARY_MIN_DOCS</code></td>
+        <td><code>3</code></td>
+        <td><code>deal_summary.py</code></td>
+      </tr>
+      <tr>
+        <td><code>DEAL_SUMMARY_MAX_TOKENS</code></td>
+        <td><code>400</code></td>
+        <td><code>deal_summary.py</code></td>
+      </tr>
+      <tr>
+        <td><code>MULTI_DOC_THINKING_BUDGET_TOKENS</code></td>
+        <td><code>2000</code></td>
+        <td><code>synthesizer.py</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>The principle: if changing a value requires also changing code or prompts to be meaningful, it belongs here &mdash; not in Settings.</p>
+
+  <h4>Tier 2 &mdash; Removed Entirely</h4>
+
+  <p>Values whose source of truth is external infrastructure. These do not appear in the Python codebase at all:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Value</th>
+        <th>Where It Lives Instead</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>TTFT targets (3s / 5s)</td>
+        <td>Documentation and SLA definitions only (<code>DESIGN.md</code>)</td>
+      </tr>
+      <tr>
+        <td>Deal summary refresh interval (6h)</td>
+        <td>Azure Functions CRON expression in <code>triggers.py</code></td>
+      </tr>
+      <tr>
+        <td>Embedding fallback alert rate (10%)</td>
+        <td>Application Insights alert rule (defined in Bicep)</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h4>Tier 3 &mdash; Settings Class (~25 Keys)</h4>
+
+  <p>The Pydantic <code>BaseSettings</code> class. Connection strings are required (no defaults &mdash; the app fails fast if they are missing). Everything else has sensible defaults that can be overridden via environment variables.</p>
+
+  <pre><code>class Settings(BaseSettings):
+    # --- Infrastructure (required, no defaults) ---
+    azure_search_endpoint: str
+    azure_search_admin_key: str
+    cosmos_connection_string: str
+    voyage_api_key: str
+    cohere_api_key: str
+    anthropic_api_key: str
+    graph_client_id: str
+    graph_client_secret: str
+    graph_tenant_id: str
+    neo4j_uri: str
+    neo4j_username: str
+    neo4j_password: str
+
+    # --- Embedding Pipeline ---
+    embedding_provider: str = "voyage"
+    embedding_model: str = "voyage-context-3"
+    embedding_dimensions: int = 1024
+    embedding_version: str = "v1"
+    active_index_name: str = "bsearch-v1"
+
+    # --- Relevance Tuning ---
+    min_rerank_score: float = 0.10
+    low_confidence_threshold: float = 0.50
+    no_results_threshold: float = 0.15
+    dedup_cosine_threshold: float = 0.95
+
+    # --- Timeouts ---
+    classifier_timeout_ms: int = 500
+    embedding_timeout_ms: int = 500
+
+    # --- Resilience ---
+    reranker_degraded_top_k: int = 12
+    reranker_health_check_interval_s: int = 60
+    reranker_health_check_timeout_ms: int = 2000
+    reranker_consecutive_failures_alert: int = 3
+    embedding_health_check_interval_s: int = 60
+    embedding_health_check_timeout_ms: int = 500
+    neo4j_health_check_interval_s: int = 60
+    neo4j_health_check_timeout_ms: int = 2000
+    neo4j_health_check_failure_threshold: int = 3
+    embedding_cache_max_size: int = 1000
+    max_table_chunk_tokens: int = 1500
+    deal_summary_debounce_minutes: int = 5
+
+    # --- Operational Flags ---
+    reindex_in_progress: bool = False
+    reindex_target_index: str | None = None</code></pre>
+
+  <div class="callout info">
+    <div class="callout-title">Why 12 required fields with no defaults?</div>
+    <p>The 12 infrastructure fields (connection strings, API keys, credentials) have no default values on purpose. If any one of them is missing, Pydantic raises a <code>ValidationError</code> at startup rather than letting the app start in a broken state. This is called "fail fast" &mdash; it is much better to get a clear error message on startup than to discover 30 minutes later that your API key is missing when someone tries to search.</p>
   </div>
 
-  <!-- ================================================================ -->
-  <!-- 8.5 App Registration -->
-  <!-- ================================================================ -->
-  <h2><span class="section-number">8.5</span> App Registration</h2>
+  <!-- 8.3.3 Bicep Templates -->
+  <h3>Azure Infrastructure (Bicep Templates)</h3>
 
-  <div class="definition">
-    <p><span class="term">App Registration</span> &mdash; A configuration in Azure AD that defines what an application is allowed to do. It is how Microsoft knows that BSearch is a legitimate application and what data it can access.</p>
-  </div>
+  <p>All Azure resources are defined as Bicep templates in <code>infra/</code>. A top-level <code>main.bicep</code> composes individual module files. Parameter files (<code>dev.bicepparam</code> and <code>prod.bicepparam</code>) define environment-specific values like SKU tiers and resource names.</p>
 
-  <p>BSearch needs to read files from SharePoint during the ingestion pipeline (when it pulls documents into the search index). To do this, it uses <strong>application-level permissions</strong> granted through the Graph API:</p>
+  <table>
+    <thead>
+      <tr>
+        <th>Module</th>
+        <th>Azure Service</th>
+        <th>SKU / Tier</th>
+        <th>Purpose</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>search.bicep</code></td>
+        <td>Azure AI Search</td>
+        <td>S1</td>
+        <td>Hybrid index (vector + BM25) for 550K docs, ~2.2M chunks</td>
+      </tr>
+      <tr>
+        <td><code>functions.bicep</code></td>
+        <td>Azure Durable Functions</td>
+        <td>Consumption</td>
+        <td>Ingestion orchestrator, webhook receiver, delta sync timer</td>
+      </tr>
+      <tr>
+        <td><code>appservice.bicep</code></td>
+        <td>Azure App Service</td>
+        <td>B2 (~$26/mo)</td>
+        <td>FastAPI search API &mdash; dual-core, 3.5GB RAM, always-on (no cold start)</td>
+      </tr>
+      <tr>
+        <td><code>cosmos.bicep</code></td>
+        <td>Cosmos DB</td>
+        <td>Serverless</td>
+        <td>Conversations, sync tokens, webhooks, retry queue, duplicate clusters, feedback</td>
+      </tr>
+      <tr>
+        <td><code>staticwebapp.bicep</code></td>
+        <td>Azure Static Web Apps</td>
+        <td>Free / Standard</td>
+        <td>React SPA hosting with built-in Azure AD authentication</td>
+      </tr>
+      <tr>
+        <td><code>keyvault.bicep</code></td>
+        <td>Azure Key Vault</td>
+        <td>Standard</td>
+        <td>All API keys and secrets &mdash; App Service and Functions read secrets via Key Vault references</td>
+      </tr>
+      <tr>
+        <td><code>appinsights.bicep</code></td>
+        <td>Application Insights + Log Analytics Workspace</td>
+        <td>Pay-as-you-go</td>
+        <td>Latency instrumentation (p50/p95), health check events, query flight recorder, alerts</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h4>Application Insights Setup</h4>
+
+  <p>The <code>appinsights.bicep</code> module creates two resources: a Log Analytics workspace (where logs are stored and queried) and an Application Insights instance connected to it. This provides:</p>
 
   <ul>
-    <li><strong>Files.Read.All</strong> &mdash; permission to read all files across SharePoint.</li>
-    <li><strong>Sites.Read.All</strong> &mdash; permission to read site metadata and structure.</li>
+    <li><strong>Latency instrumentation</strong> &mdash; p50 and p95 timing for every pipeline stage (query classification, embedding, search, reranking, Claude synthesis).</li>
+    <li><strong>Health check events</strong> &mdash; degraded/recovered state transitions for Cohere, Voyage AI, and Neo4j.</li>
+    <li><strong>Query flight recorder</strong> &mdash; structured logs for every query including classification type, chunk counts, confidence level, and timing breakdown.</li>
+    <li><strong>Alert rules</strong> &mdash; automated alerts on health check failures (3+ consecutive), embedding fallback rate exceeding 10% over 1 hour, and latency SLA breaches.</li>
   </ul>
 
-  <p>These are <em>read-only</em> permissions. BSearch cannot modify, delete, or create files on SharePoint. The permissions also require <strong>admin consent</strong> &mdash; a firm administrator must explicitly approve them before BSearch can access anything.</p>
+  <h4>Secrets Management</h4>
 
-  <p>An important distinction: these application-level permissions are what BSearch uses to <em>ingest</em> documents (pull them into the search index). They are separate from the user-level permissions described in Section 8.3, which control what each person can <em>search</em>. The ingestion pipeline reads everything; the search query filters ensure each user only sees what they are authorized to see.</p>
+  <p>All API keys and credentials are stored in Key Vault. App Service and Azure Functions access them via Key Vault references (<code>@Microsoft.KeyVault(SecretUri=...)</code>) &mdash; no secrets appear in app settings or environment variables in Azure. The full set of secrets:</p>
+
+  <ul>
+    <li>Voyage AI API key</li>
+    <li>Cohere API key</li>
+    <li>Anthropic API key</li>
+    <li>Graph API: <code>client_id</code>, <code>client_secret</code>, <code>tenant_id</code></li>
+    <li>Neo4j: <code>uri</code>, <code>username</code>, <code>password</code></li>
+    <li>Cosmos DB connection string</li>
+    <li>Azure AI Search admin key</li>
+  </ul>
 
   <!-- ================================================================ -->
-  <!-- 8.6 What Would Change with Finer Permissions -->
+  <!-- 8.4 What to Tell Claude Code -->
   <!-- ================================================================ -->
-  <h2><span class="section-number">8.6</span> What Would Change with Finer Permissions</h2>
+  <h2><span class="section-number">8.4</span> What to Tell Claude Code</h2>
 
-  <p>The current model (5 folders, group-based access) is deliberately simple. If the firm ever needed sub-folder or file-level permissions, here is what would change:</p>
+  <div class="claude-prompt">
+    <div class="prompt-label">What to Tell Claude Code &mdash; Prompt 1: Project Scaffold</div>
+    <div class="prompt-text">Set up a Python monorepo for BSearch with this structure: src/shared/, src/ingestion/, src/api/, web/, infra/, tests/. Use a single pyproject.toml with these dependencies: fastapi, uvicorn, azure-functions, azure-functions-durable, azure-cosmos, azure-search-documents, azure-identity, azure-ai-formrecognizer, python-docx, openpyxl, python-pptx, voyageai, cohere, anthropic, pydantic-settings, neo4j. Dev dependencies: pytest, testcontainers-python.<br><br>Create src/shared/config.py with a Pydantic BaseSettings class. Follow the three-tier config approach:<br><br>Tier 1 (NOT in Settings): module-level constants for algorithm values &mdash; these live in the modules that use them later, not here.<br><br>Tier 3 (the Settings class, ~25 keys organized in sections):<br>- Infrastructure (required, no defaults, fail fast): azure_search_endpoint, azure_search_admin_key, cosmos_connection_string, voyage_api_key, cohere_api_key, anthropic_api_key, graph_client_id, graph_client_secret, graph_tenant_id, neo4j_uri, neo4j_username, neo4j_password<br>- Embedding Pipeline: embedding_provider="voyage", embedding_model="voyage-context-3", embedding_dimensions=1024, embedding_version="v1", active_index_name="bsearch-v1"<br>- Relevance Tuning: min_rerank_score=0.10, low_confidence_threshold=0.50, no_results_threshold=0.15, dedup_cosine_threshold=0.95<br>- Timeouts: classifier_timeout_ms=500, embedding_timeout_ms=500<br>- Resilience: reranker_degraded_top_k=12, reranker_health_check_interval_s=60, reranker_health_check_timeout_ms=2000, reranker_consecutive_failures_alert=3, embedding_health_check_interval_s=60, embedding_health_check_timeout_ms=500, neo4j_health_check_interval_s=60, neo4j_health_check_timeout_ms=2000, neo4j_health_check_failure_threshold=3, embedding_cache_max_size=1000, max_table_chunk_tokens=1500, deal_summary_debounce_minutes=5<br>- Operational Flags: reindex_in_progress=False, reindex_target_index=None<br><br>Create empty __init__.py files in src/, src/shared/, src/ingestion/, src/api/, and tests/. Create tests/conftest.py with a placeholder fixture. Add a .env.example showing all required env vars.</div>
+  </div>
 
-  <ol>
-    <li><strong>Sync SharePoint permissions to the search index.</strong> The ingestion pipeline would need to read the access control list (ACL) for each file in SharePoint and store it alongside the document in the index.</li>
-    <li><strong>Tag every chunk with an ACL field.</strong> Each chunk in the index would carry a list of users and groups permitted to see it.</li>
-    <li><strong>Query filter checks chunk-level ACLs.</strong> Instead of filtering by <code>source_folder</code>, the system would filter by <code>acl CONTAINS user_or_group</code> on every chunk.</li>
-    <li><strong>Permission sync becomes ongoing.</strong> SharePoint permissions can change at any time (someone is added to or removed from a file), so the system would need to detect and propagate those changes to the index.</li>
-  </ol>
+  <div class="claude-prompt">
+    <div class="prompt-label">What to Tell Claude Code &mdash; Prompt 2: Azure Infrastructure</div>
+    <div class="prompt-text">Create Bicep infrastructure templates in infra/ for BSearch. Create separate module files under infra/modules/ and a main.bicep that composes them. Add dev and prod parameter files under infra/parameters/.<br><br>Resources needed:<br>- Azure AI Search (S1 tier) &mdash; for the hybrid search index (vector + BM25)<br>- Azure App Service (B2 plan, ~$26/mo) &mdash; always-on, dual-core, 3.5GB RAM for FastAPI. Configure Key Vault references for secrets<br>- Azure Durable Functions (Consumption plan) &mdash; for ingestion orchestrator + webhook receiver + timer triggers<br>- Cosmos DB (serverless) &mdash; containers: conversations (partition key: user_id), delta_tokens (drive_id), webhooks (drive_id), retry_queue (deal_id), duplicate_clusters (source_folder), deal_summary_pending (deal_id), feedback (conversation_id)<br>- Azure Static Web Apps &mdash; for React frontend with built-in Azure AD auth<br>- Key Vault &mdash; store all API keys and secrets. Grant App Service and Functions access via managed identity<br>- Application Insights + Log Analytics workspace &mdash; connected to App Service and Functions. Add alert rules: health check failures (3+ consecutive), embedding fallback rate >10% over 1h<br><br>Use parameters for resource name prefix, environment (dev/prod), and location. Dev parameter file should use lower SKUs where possible.</div>
+  </div>
 
-  <p>This is all achievable, but it adds real complexity to both the ingestion pipeline and the search query logic. For v1 &mdash; 5 folders, 18 users &mdash; it is not needed. It would be the right investment if the firm expanded BSearch to more teams with overlapping, fine-grained access requirements.</p>
+  <!-- ================================================================ -->
+  <!-- 8.5 How to Verify -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">8.5</span> How to Verify</h2>
+
+  <div class="verify-checklist">
+    <div class="section-label">How to Verify</div>
+    <ol>
+      <li><strong>Config loads without error.</strong> Run:<br><code>python -c "from src.shared.config import settings; print(settings)"</code><br>This should either print all settings (if you have a <code>.env</code> file with the required values) or raise a clear <code>ValidationError</code> listing exactly which required fields are missing. Both outcomes confirm the config system is working.</li>
+      <li><strong>Bicep templates validate.</strong> Run:<br><code>az deployment group validate --resource-group bsearch-rg --template-file infra/main.bicep --parameters infra/parameters/dev.bicepparam</code><br>This validates the template syntax and parameter references without actually deploying anything. It should pass with no errors.</li>
+      <li><strong>Key Vault is accessible.</strong> After deploying the infrastructure, verify you can store and retrieve a test secret:<br><code>az keyvault secret set --vault-name bsearch-kv-dev --name test-secret --value "hello"</code><br><code>az keyvault secret show --vault-name bsearch-kv-dev --name test-secret</code><br>Both commands should succeed. Then delete the test secret.</li>
+      <li><strong>Application Insights resource appears in the Azure portal.</strong> Navigate to the resource group in the Azure portal. You should see both an Application Insights resource and a Log Analytics workspace. Click into Application Insights and confirm it shows "Connected to workspace" with the correct workspace name.</li>
+      <li><strong>Project structure is correct.</strong> Verify the directory tree matches the monorepo layout: <code>src/shared/config.py</code> exists, <code>infra/main.bicep</code> exists, <code>infra/modules/</code> contains all seven module files, <code>pyproject.toml</code> is at the root, and all <code>__init__.py</code> files are in place.</li>
+      <li><strong>Dependencies install.</strong> Run:<br><code>pip install -e ".[dev]"</code><br>All packages should install without conflicts. Verify with <code>python -c "import fastapi; import anthropic; import neo4j; print('OK')"</code>.</li>
+    </ol>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- 8.6 What Happens Next -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">8.6</span> What Happens Next</h2>
+
+  <p>With the project scaffold and Azure resources in place, Phase 2 builds the document parsers and chunking pipeline. That is where BSearch starts reading actual Word documents, Excel models, PowerPoint decks, and PDFs &mdash; turning raw files into the searchable chunks that the rest of the system depends on.</p>
 
   <div class="key-takeaway">
     <div class="callout-title">Key Takeaway</div>
-    <p>BSearch does not manage its own identities. It leverages the Microsoft accounts everyone already has, enforces folder-level access through Azure AD group memberships, and applies permission filters at the search-engine level so that unauthorized documents are never retrieved. The model is simple by design &mdash; 5 folders, group-based access, enforced at the data layer.</p>
+    <p>Phase 1 produces no user-visible functionality, but it establishes the three foundations everything else depends on: a monorepo with shared configuration (~25 Settings keys organized by purpose), Azure infrastructure defined as code (7 Bicep modules composable via <code>main.bicep</code>), and a secrets management pattern (Key Vault references, no credentials in code). If this phase is done right, every subsequent phase can focus on its own domain without fighting infrastructure issues.</p>
   </div>
 
   <nav class="chapter-nav bottom">
-    <a href="chapter-07.html">&larr; Previous</a>
+    <a href="chapter-07.html">&larr; Previous: When Things Go Wrong</a>
     <span class="nav-spacer">|</span>
     <a href="index.html">Contents</a>
     <span class="nav-spacer">|</span>
-    <a href="chapter-09.html">Next &rarr;</a>
+    <a href="chapter-09.html">Next: Phase 2 &mdash; Document Parsers &amp; Chunking &rarr;</a>
   </nav>
 </div>
+
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
 <script>mermaid.initialize({startOnLoad: true, theme: 'neutral'});</script>
 </body>

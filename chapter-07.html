@@ -4,566 +4,317 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="light only">
-  <title>Chapter 7: The Data Model — BSearch Technical Guide</title>
+  <title>Chapter 7: When Things Go Wrong &mdash; BSearch Technical Guide</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
 <div class="page-wrapper">
   <nav class="chapter-nav">
-    <a href="chapter-06.html">&larr; Previous: Relevance &amp; Quality Controls</a>
+    <a href="chapter-06.html">&larr; Previous: How BSearch Understands Deals &amp; Relationships</a>
     <span class="nav-spacer">|</span>
     <a href="index.html">Contents</a>
     <span class="nav-spacer">|</span>
-    <a href="chapter-08.html">Next: Auth &amp; Permissions &rarr;</a>
+    <a href="chapter-08.html">Next: Phase 1 &mdash; Project Setup &amp; Infrastructure &rarr;</a>
   </nav>
   <div class="chapter-header">
     <div class="chapter-number">Chapter 7</div>
-    <h1>The Data Model</h1>
-    <p class="chapter-subtitle">Where every piece of data lives, what it means, and how the three data stores work together.</p>
+    <h1>When Things Go Wrong</h1>
+    <p class="chapter-subtitle">How BSearch handles failures, communicates degradation, and recovers automatically.</p>
   </div>
 
-  <p>BSearch stores data in three places, each chosen for what it does best. Azure AI Search holds the searchable index. Cosmos DB stores operational data like conversation history and sync state. Neo4j holds the knowledge graph of deal relationships. This chapter walks through every field and collection so you understand exactly what the system is tracking and why.</p>
+  <p>No system runs perfectly all the time. External APIs time out, networks hiccup, services restart. The measure of a well-built system is not whether failures happen &mdash; it is how the system <em>responds</em> when they do. BSearch is designed so that most failures are invisible, a few trigger a gentle warning, and only a handful result in an actual error screen. This chapter walks through every failure category, the monitoring that detects problems, and the recovery paths that restore normal operation.</p>
 
   <div class="callout ib-analogy">
     <div class="callout-title">IB Analogy</div>
-    <p>Think of it like how a deal team organizes information. The search index is your filing system &mdash; every document catalogued and retrievable. Cosmos DB is your operational tracker &mdash; which deals are active, what synced last, what failed. Neo4j is your relationship map &mdash; who is advising whom, which companies are targets, who submitted an IOI. Different tools for different jobs.</p>
+    <p>Think of BSearch&rsquo;s resilience like a deal team&rsquo;s backup plan. If the MD is stuck in another meeting, the VP runs the call. If the model is not ready, the team presents from the memo. The deal does not stop &mdash; it continues with a slightly leaner team. Similarly, BSearch always tries to give you an answer, even if some of its best tools are temporarily unavailable.</p>
   </div>
 
   <!-- ================================================================ -->
-  <!-- 7.1 Azure AI Search Index Schema -->
+  <!-- 7.1 Three Categories of Failure -->
   <!-- ================================================================ -->
-  <h2><span class="section-number">7.1</span> Azure AI Search Index Schema</h2>
+  <h2><span class="section-number">7.1</span> Three Categories of Failure</h2>
+
+  <p>Everything that can go wrong in BSearch falls into one of three categories, defined by what the user experiences:</p>
 
   <div class="definition">
-    <p><span class="term">Index Schema</span> &mdash; The blueprint that defines every field in the search index: its name, its data type, and whether it is searchable, filterable, or sortable. Like a database table definition, but optimized for search rather than transactions.</p>
+    <p><span class="term">Graceful Degradation</span> &mdash; A design principle where the system continues to function at reduced quality when a component fails, rather than failing entirely. Like a car that loses power steering &mdash; harder to drive, but you can still get where you are going.</p>
   </div>
 
-  <p>Every chunk (Chapter 3, Section 3.6) stored in Azure AI Search carries the following fields. They are grouped by purpose:</p>
-
-  <h3>Core identification</h3>
-
-  <table>
-    <thead>
-      <tr>
-        <th>Field</th>
-        <th>Type</th>
-        <th>Purpose</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr>
-        <td><code>chunk_id</code></td>
-        <td>String (key)</td>
-        <td>Unique identifier for this chunk. The primary key of the index &mdash; no two chunks share the same ID.</td>
-      </tr>
-      <tr>
-        <td><code>file_id</code></td>
-        <td>String</td>
-        <td>Identifies which source file this chunk came from. All chunks from the same file share the same <code>file_id</code>.</td>
-      </tr>
-      <tr>
-        <td><code>chunk_index</code></td>
-        <td>Integer</td>
-        <td>Position of this chunk within its source file (0, 1, 2, ...). Lets the system reconstruct document order.</td>
-      </tr>
-    </tbody>
-  </table>
-
-  <h3>Content</h3>
+  <h3>Category 1: Silent, auto-handled</h3>
+  <p>The user never knows anything happened. The system catches the failure, applies a fallback, and continues. These are by far the most common failures, and they are invisible by design &mdash; showing an error for something that fixes itself in seconds would just be noise.</p>
 
   <table>
     <thead>
       <tr>
-        <th>Field</th>
-        <th>Type</th>
-        <th>Purpose</th>
+        <th>What Fails</th>
+        <th>What Happens Instead</th>
+        <th>User Experience</th>
       </tr>
     </thead>
     <tbody>
-      <tr>
-        <td><code>content</code></td>
-        <td>String (searchable)</td>
-        <td>The actual text of the chunk. This is what BM25 keyword search operates on.</td>
+      <tr class="failure-silent">
+        <td><strong>Embedding timeout</strong> (Voyage AI &gt;500ms)</td>
+        <td>Falls back to BM25-only search (keyword matching without semantic understanding)</td>
+        <td>Results still appear; slightly lower recall on queries phrased differently from document text</td>
       </tr>
-      <tr>
-        <td><code>content_vector</code></td>
-        <td>Vector (1024 dimensions)</td>
-        <td>The embedding &mdash; 1,024 numbers representing the meaning of the content (Chapter 3, Section 3.3). This is what vector search operates on.</td>
+      <tr class="failure-silent">
+        <td><strong>Neo4j timeout</strong> (at query time)</td>
+        <td>Search proceeds without entity filters, alias expansion, or deal context</td>
+        <td>Results still appear; entity-based features temporarily unavailable</td>
+      </tr>
+      <tr class="failure-silent">
+        <td><strong>Cached data serves stale</strong></td>
+        <td>Embedding cache returns a previously computed vector; delta sync catches up later</td>
+        <td>No visible impact; data refreshes within minutes to hours</td>
+      </tr>
+      <tr class="failure-silent">
+        <td><strong>Query classifier timeout</strong> (Haiku &gt;500ms)</td>
+        <td>Defaults to &ldquo;data extraction&rdquo; intent</td>
+        <td>Slightly less optimal retrieval strategy; next query works normally</td>
+      </tr>
+      <tr class="failure-silent">
+        <td><strong>Conversation log write failure</strong></td>
+        <td>Fire-and-forget with logging; one history entry lost</td>
+        <td>No visible impact; next conversation saves normally</td>
+      </tr>
+      <tr class="failure-silent">
+        <td><strong>Webhook missed</strong></td>
+        <td>Delta sync catches up within 12&ndash;24 hours</td>
+        <td>Brief window where a newly added file is not yet searchable</td>
       </tr>
     </tbody>
   </table>
 
-  <h3>File metadata</h3>
+  <h3>Category 2: Visible degradation with banners</h3>
+  <p>The user sees a colored banner warning that quality may be reduced, but still gets results. These failures are significant enough that the user should calibrate their trust in the output.</p>
 
   <table>
     <thead>
       <tr>
-        <th>Field</th>
-        <th>Type</th>
-        <th>Purpose</th>
+        <th>What Fails</th>
+        <th>What Happens Instead</th>
+        <th>What the User Sees</th>
       </tr>
     </thead>
     <tbody>
-      <tr>
-        <td><code>source_folder</code></td>
-        <td>String (filterable)</td>
-        <td>The SharePoint folder path. Used for filtering (&ldquo;only search this deal folder&rdquo;) and dedup grouping.</td>
+      <tr class="failure-graceful">
+        <td><strong>Reranker failure</strong> (Cohere down)</td>
+        <td>Skip reranking; reduce candidate pool from 20 to 12; force confidence to LOW (never HIGH); use Azure Search&rsquo;s built-in ranking</td>
+        <td>Orange banner: <em>&ldquo;Search quality may be reduced &mdash; results are ranked without AI reranking. Verify key details against source documents.&rdquo;</em></td>
       </tr>
-      <tr>
-        <td><code>file_name</code></td>
-        <td>String</td>
-        <td>Original filename. Displayed in citations (Chapter 6, Section 6.5).</td>
-      </tr>
-      <tr>
-        <td><code>file_type</code></td>
-        <td>String (filterable)</td>
-        <td>File extension &mdash; pdf, docx, pptx, xlsx, etc. Enables &ldquo;show only PowerPoint results.&rdquo;</td>
-      </tr>
-      <tr>
-        <td><code>m365_url</code></td>
-        <td>String</td>
-        <td>The Microsoft 365 deep link. Powers the &ldquo;Open in SharePoint&rdquo; citation links.</td>
-      </tr>
-      <tr>
-        <td><code>last_modified</code></td>
-        <td>DateTime (sortable)</td>
-        <td>When the source file was last modified. Used for recency boosting (Section 7.2) and determining canonical duplicates.</td>
+      <tr class="failure-graceful">
+        <td><strong>LOW confidence results</strong> (rerank scores 0.15&ndash;0.50)</td>
+        <td>Claude adds hedging language to its synthesis</td>
+        <td>Yellow banner: <em>&ldquo;Results may not fully answer your query&rdquo;</em></td>
       </tr>
     </tbody>
   </table>
 
-  <h3>Document classification</h3>
+  <div class="callout tip">
+    <div class="callout-title">Orange vs. Yellow Banners</div>
+    <p><strong>Orange</strong> means a system component failed and BSearch is running in a degraded mode &mdash; results are still useful but may not be as well-ranked. <strong>Yellow</strong> means the system is working normally but is not confident it found great results for your particular query. Both are informational &mdash; you can still trust and use the results. A query can trigger both banners simultaneously.</p>
+  </div>
+
+  <h3>Category 3: Hard errors</h3>
+  <p>The user sees an actual error message. These are rare and mean a core service is down with no workaround.</p>
 
   <table>
     <thead>
       <tr>
-        <th>Field</th>
-        <th>Type</th>
-        <th>Purpose</th>
+        <th>What Fails</th>
+        <th>What Happens</th>
+        <th>What the User Sees</th>
       </tr>
     </thead>
     <tbody>
-      <tr>
-        <td><code>chunk_type</code></td>
-        <td>String (filterable)</td>
-        <td>What kind of content this chunk contains: narrative text, table, slide, header, etc.</td>
+      <tr class="failure-visible">
+        <td><strong>Azure Search down</strong> (503)</td>
+        <td>The search index &mdash; the core of the system &mdash; is unreachable. There is nothing to search.</td>
+        <td><em>&ldquo;Service temporarily unavailable&rdquo;</em> error page</td>
       </tr>
-      <tr>
-        <td><code>doc_type</code></td>
-        <td>String (filterable)</td>
-        <td>The document category: CIM, engagement letter, financial model, pitch book, board presentation, etc. Enables &ldquo;show only CIMs.&rdquo;</td>
+      <tr class="failure-visible">
+        <td><strong>Claude API failure</strong></td>
+        <td>Raw search results are returned as clickable source cards without AI synthesis</td>
+        <td>Error message with retry option; source documents still accessible</td>
       </tr>
-      <tr>
-        <td><code>doc_section</code></td>
-        <td>String (filterable)</td>
-        <td>Which section of the document this chunk belongs to: executive summary, financial overview, risk factors, etc.</td>
+      <tr class="failure-visible">
+        <td><strong>Authentication token expired</strong></td>
+        <td>Azure AD session needs renewal</td>
+        <td>Brief redirect to the Microsoft login page</td>
+      </tr>
+      <tr class="failure-visible">
+        <td><strong>Embedding provider misconfigured</strong></td>
+        <td>App refuses to start entirely (fail-fast)</td>
+        <td>App is down until configuration is fixed</td>
       </tr>
     </tbody>
   </table>
 
-  <h3>Deal context</h3>
-
-  <table>
-    <thead>
-      <tr>
-        <th>Field</th>
-        <th>Type</th>
-        <th>Purpose</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr>
-        <td><code>deal_id</code></td>
-        <td>String (filterable)</td>
-        <td>Links this chunk to a specific deal in the Neo4j knowledge graph. Enables cross-referencing.</td>
-      </tr>
-      <tr>
-        <td><code>deal_name</code></td>
-        <td>String (searchable)</td>
-        <td>The deal&rsquo;s display name. Searchable so users can find chunks by deal name.</td>
-      </tr>
-      <tr>
-        <td><code>deal_aliases</code></td>
-        <td>String collection</td>
-        <td>Alternative names for the deal (project code names, ticker symbols). Ensures &ldquo;Project Falcon&rdquo; finds &ldquo;Acme Corp&rdquo; results.</td>
-      </tr>
-    </tbody>
-  </table>
-
-  <h3>Entity fields</h3>
-
-  <p>Entity fields are split into two categories that serve very different purposes (see Section 7.5 for the full explanation):</p>
-
-  <table>
-    <thead>
-      <tr>
-        <th>Field</th>
-        <th>Scope</th>
-        <th>Purpose</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr>
-        <td><code>companies</code></td>
-        <td>Chunk</td>
-        <td>Company names mentioned in this specific chunk. Varies per chunk. &ldquo;Which chunks mention Goldman?&rdquo;</td>
-      </tr>
-      <tr>
-        <td><code>people</code></td>
-        <td>Chunk</td>
-        <td>Person names mentioned in this specific chunk. Varies per chunk. &ldquo;Which chunks mention John Smith?&rdquo;</td>
-      </tr>
-      <tr>
-        <td><code>company_roles</code></td>
-        <td>Document</td>
-        <td>Company-to-role mappings for the whole document. Same for all chunks in a file. &ldquo;Chunks from deals where Goldman was advisor.&rdquo;</td>
-      </tr>
-      <tr>
-        <td><code>industries</code></td>
-        <td>Deal</td>
-        <td>Industry classifications for the deal. Same for all chunks in the deal. &ldquo;Chunks from healthcare deals.&rdquo;</td>
-      </tr>
-      <tr>
-        <td><code>deal_stage</code></td>
-        <td>Document</td>
-        <td>Current stage of the deal when this document was created. &ldquo;Chunks from deals in LOI stage.&rdquo;</td>
-      </tr>
-      <tr>
-        <td><code>deal_status</code></td>
-        <td>Deal</td>
-        <td>Current deal status (active, closed, terminated). Same for all chunks in the deal.</td>
-      </tr>
-    </tbody>
-  </table>
-
-  <h3>Deduplication fields</h3>
-
-  <table>
-    <thead>
-      <tr>
-        <th>Field</th>
-        <th>Type</th>
-        <th>Purpose</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr>
-        <td><code>duplicate_group_id</code></td>
-        <td>String (filterable)</td>
-        <td>Groups duplicate files together. All chunks from files in the same duplicate cluster share this ID.</td>
-      </tr>
-      <tr>
-        <td><code>is_canonical</code></td>
-        <td>Boolean (filterable)</td>
-        <td>Whether this chunk belongs to the canonical (most recent) version. Search filters on <code>is_canonical eq true</code> to hide duplicates (Chapter 6, Section 6.4).</td>
-      </tr>
-    </tbody>
-  </table>
-
-  <h3>Embedding provenance</h3>
-
-  <table>
-    <thead>
-      <tr>
-        <th>Field</th>
-        <th>Type</th>
-        <th>Purpose</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr>
-        <td><code>embedding_model</code></td>
-        <td>String</td>
-        <td>Which model produced the embedding (e.g., <code>voyage-context-3</code>). Critical for tracking when we upgrade models.</td>
-      </tr>
-      <tr>
-        <td><code>embedding_dimensions</code></td>
-        <td>Integer</td>
-        <td>Number of dimensions (1024). Ensures compatibility across index versions.</td>
-      </tr>
-      <tr>
-        <td><code>embedding_version</code></td>
-        <td>String</td>
-        <td>Version identifier. Lets us identify which chunks need re-embedding after a model upgrade.</td>
-      </tr>
-    </tbody>
-  </table>
+  <div class="callout tip">
+    <div class="callout-title">Why Fail Fast on Configuration?</div>
+    <p>If the embedding provider or API keys are wrong, BSearch refuses to start rather than producing garbage results. A misconfigured system that <em>appears</em> to work is far more dangerous than one that clearly says &ldquo;I cannot start &mdash; fix this first.&rdquo;</p>
+  </div>
 
   <!-- ================================================================ -->
-  <!-- 7.2 Scoring Profile -->
+  <!-- 7.2 Reranker Health Monitoring -->
   <!-- ================================================================ -->
-  <h2><span class="section-number">7.2</span> Scoring Profile</h2>
+  <h2><span class="section-number">7.2</span> Reranker Health Monitoring</h2>
 
   <div class="definition">
-    <p><span class="term">Scoring Profile</span> &mdash; A set of rules that adjust the relevance score of search results based on field values. In BSearch&rsquo;s case, it boosts scores for recently modified documents.</p>
+    <p><span class="term">Reranker</span> &mdash; The Cohere AI model that re-scores search results by reading each document against the query (Chapter 5). It is the quality bottleneck &mdash; the difference between Claude synthesizing from the best five chunks versus mediocre ones.</p>
   </div>
 
-  <p>Azure AI Search supports built-in scoring profiles that multiply the base relevance score based on field values. BSearch uses a recency profile on the <code>last_modified</code> field:</p>
+  <div class="definition">
+    <p><span class="term">Health Check</span> &mdash; A lightweight background task that periodically pings an external service to verify it is responding. Like a doctor&rsquo;s pulse check &mdash; fast, frequent, and catches problems before they affect the patient.</p>
+  </div>
 
-  <table>
-    <thead>
-      <tr>
-        <th>Recency Window</th>
-        <th>Score Multiplier</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr>
-        <td>Modified within 30 days</td>
-        <td>1.5&times;</td>
-      </tr>
-      <tr>
-        <td>Modified within 90 days</td>
-        <td>1.2&times;</td>
-      </tr>
-      <tr>
-        <td>Older than 90 days</td>
-        <td>1.0&times; (no boost)</td>
-      </tr>
-    </tbody>
-  </table>
+  <p>Silent reranker degradation is unacceptable in IB. A subtly wrong answer in a client deliverable is worse than a flagged one. So BSearch monitors the reranker proactively, not reactively.</p>
 
-  <p>The boost is a <strong>multiplier, not an override</strong>. A highly relevant document from last year will still outrank a barely relevant document from last week. But when two documents are equally relevant, the newer one wins.</p>
+  <h3>How it works</h3>
+
+  <p>A background task runs inside the BSearch application and pings the Cohere reranker every 60 seconds with a minimal test payload. The result is stored in memory &mdash; a simple status object tracking whether the service is healthy, when it was last checked, and how many consecutive failures have occurred.</p>
+
+  <p>When the health check fails:</p>
+
+  <ul>
+    <li><strong>Reranking is skipped</strong> &mdash; BSearch uses Azure Search&rsquo;s built-in ranking instead.</li>
+    <li><strong>The candidate pool shrinks</strong> &mdash; top-k drops from 20 to 12. Without the reranker to filter noise, a smaller pool produces cleaner results.</li>
+    <li><strong>Confidence is capped at LOW</strong> &mdash; the system never reports HIGH confidence without the reranker, because it cannot be sure the best documents were selected. This forces Claude to add hedging language.</li>
+    <li><strong>An orange banner appears</strong> &mdash; the user is told that search quality may be reduced and should verify key details against source documents.</li>
+    <li><strong>Application Insights fires an alert</strong> after three or more consecutive failures, notifying the operations team.</li>
+  </ul>
+
+  <h3>Recovery</h3>
+  <p>When the next 60-second health check succeeds, BSearch automatically resumes normal operation. The orange banner disappears. Confidence scoring returns to its full HIGH/LOW/NONE range. No manual intervention required.</p>
 
   <div class="callout ib-analogy">
     <div class="callout-title">IB Analogy</div>
-    <p>In IB, the latest version is almost always the right one. If there are three drafts of a purchase agreement, you want the one from yesterday, not the one from six months ago. The scoring profile automates this instinct: recent documents get a nudge up the rankings, reflecting how deal teams actually work.</p>
+    <p>Think of it like knowing when one of your analysts is out sick. You do not cancel the deal &mdash; you adjust the workload, tell the client you are working on it, and resume full capacity when they are back. The health check is the office checking in every hour. The orange banner is the &ldquo;we&rsquo;re working with a leaner team today&rdquo; note to the client. And when the analyst returns, everything goes back to normal automatically.</p>
   </div>
 
   <!-- ================================================================ -->
-  <!-- 7.3 Cosmos DB Collections -->
+  <!-- 7.3 Embedding Resilience -->
   <!-- ================================================================ -->
-  <h2><span class="section-number">7.3</span> Cosmos DB Collections</h2>
+  <h2><span class="section-number">7.3</span> Embedding Resilience</h2>
 
   <div class="definition">
-    <p><span class="term">Cosmos DB</span> &mdash; Microsoft&rsquo;s managed NoSQL database. &ldquo;NoSQL&rdquo; means it stores flexible documents (like JSON) rather than rigid rows-and-columns like a traditional database. Ideal for data that does not fit neatly into a spreadsheet.</p>
+    <p><span class="term">Embedding</span> &mdash; A list of numbers (a &ldquo;vector&rdquo;) that represents the meaning of a piece of text (Chapter 3). BSearch sends each query to the Voyage AI embedding service to convert the query text into a vector for semantic search.</p>
   </div>
 
   <div class="definition">
-    <p><span class="term">Partition Key</span> &mdash; The field Cosmos DB uses to distribute data across servers. All items with the same partition key are stored together for fast access. Choosing the right partition key is critical for performance.</p>
+    <p><span class="term">BM25</span> &mdash; A traditional keyword-matching algorithm (Chapter 3). It finds documents that contain the exact words in your query. Effective for literal matches, but does not understand synonyms or paraphrases the way vector search does.</p>
   </div>
 
-  <p>BSearch uses five Cosmos DB collections for operational data that does not belong in the search index:</p>
+  <p>The embedding service is a parallel step in the query pipeline &mdash; it runs at the same time as query classification. When it is fast (100&ndash;300ms typical), no one notices. When it spikes beyond 500ms, BSearch needs a plan.</p>
 
-  <h3>Conversations</h3>
-  <p><strong>Partition key:</strong> <code>user_id</code></p>
-  <p>Stores the full conversation history for each user &mdash; their queries, the system&rsquo;s responses, which documents were cited. Partitioning by <code>user_id</code> means all of one user&rsquo;s conversations are stored together, making retrieval fast. This enables features like conversation continuity (&ldquo;earlier you asked about Project Falcon...&rdquo;).</p>
+  <h3>Three layers of protection</h3>
 
-  <h3>Delta sync tokens</h3>
-  <p>Stores a sync token for each SharePoint drive. When BSearch checks for new or updated files, it sends the token to Microsoft Graph, which responds with only the changes since that token was issued. This is how BSearch does incremental sync &mdash; processing only new/changed files instead of re-scanning everything.</p>
-
-  <h3>Webhook subscriptions</h3>
-  <p>Tracks active Microsoft Graph webhook subscriptions. Each record includes:</p>
-  <ul>
-    <li><code>subscription_id</code> &mdash; the unique subscription identifier from Microsoft.</li>
-    <li><code>drive_id</code> &mdash; which SharePoint drive this subscription monitors.</li>
-    <li><code>expiration</code> &mdash; when the subscription expires (webhooks must be periodically renewed).</li>
-    <li><code>client_state</code> &mdash; a secret value used to verify that incoming webhook notifications are genuine (not spoofed).</li>
-  </ul>
-
-  <h3>Retry queue</h3>
-  <p>When a file fails to ingest (network timeout, parsing error, API rate limit), it goes into the retry queue rather than being silently dropped. The queue implements <strong>exponential backoff</strong> &mdash; the wait time between retries doubles each attempt (1 min, 2 min, 4 min, 8 min...) to avoid hammering a struggling service.</p>
-
-  <h3>Duplicate clusters</h3>
-  <p>Stores the deduplication groups from Chapter 6, Section 6.4. Each record contains:</p>
-  <ul>
-    <li><code>group_id</code> &mdash; the shared identifier for all duplicates of the same document.</li>
-    <li><code>normalized_name</code> &mdash; the filename after stripping version/copy markers.</li>
-    <li><code>members</code> &mdash; the list of files in this cluster, each with a canonical flag indicating which is the &ldquo;winner.&rdquo;</li>
-  </ul>
-
-  <!-- ================================================================ -->
-  <!-- 7.4 Neo4j Graph Schema -->
-  <!-- ================================================================ -->
-  <h2><span class="section-number">7.4</span> Neo4j Graph Schema</h2>
+  <p><strong>Layer 1: LRU cache (~1,000 entries).</strong> Before calling Voyage AI at all, BSearch checks an in-memory cache of recently computed embeddings. At 50&ndash;200 queries per day from 18 users, common patterns recur frequently (&ldquo;latest [deal] deck,&rdquo; &ldquo;what&rsquo;s [deal]&rsquo;s EBITDA?&rdquo;). Repeated queries skip the API call entirely &mdash; the embedding is served from memory in under a millisecond.</p>
 
   <div class="definition">
-    <p><span class="term">Graph Database</span> &mdash; A database designed to store and query relationships between entities. Instead of rows in tables, it stores <strong>nodes</strong> (things) and <strong>relationships</strong> (connections between things). Perfect for answering questions like &ldquo;which companies are connected to this deal, and in what roles?&rdquo;</p>
+    <p><span class="term">LRU Cache</span> &mdash; Least Recently Used cache. A fixed-size store that keeps the most recently accessed items and automatically discards the oldest when full. Like a desk that only has room for 1,000 folders &mdash; when you need to add a new one, the one you have not touched in the longest time gets filed away.</p>
   </div>
 
-  <p>Neo4j stores the knowledge graph &mdash; the web of relationships between deals, companies, people, and deal stages. This is the data layer that powers queries like &ldquo;show me all deals where Goldman was the buy-side advisor&rdquo; or &ldquo;which deals has John Smith worked on?&rdquo;</p>
+  <p><strong>Layer 2: 500ms hard timeout.</strong> If Voyage AI has not responded within 500 milliseconds, BSearch stops waiting and proceeds without the embedding. This prevents a slow external service from dragging down the entire query.</p>
 
-  <h3>Node types</h3>
+  <p><strong>Layer 3: BM25-only fallback.</strong> When the embedding is unavailable (timeout or API error), BSearch falls back to keyword-only search. This loses semantic matching &mdash; queries phrased differently from the document text will have lower recall. However, the quality degradation is bounded: static synonym expansion and query expansion from the classifier have already enriched the BM25 search terms, and the Cohere reranker still does full cross-encoder scoring on the actual text (not the vectors), compensating for lost semantic matching.</p>
 
-  <h4>Deal</h4>
-  <p>Represents an M&amp;A transaction or advisory engagement. Properties:</p>
-  <ul>
-    <li><code>deal_id</code>, <code>deal_name</code>, <code>deal_aliases</code> &mdash; identification and code names.</li>
-    <li><code>deal_status</code> &mdash; active, closed, or terminated. Inferred deterministically from stage history and last activity (not manually set).</li>
-    <li>Financial metrics: <code>revenue</code>, <code>ebitda</code>, <code>ev</code> (enterprise value), <code>ev_ebitda</code> (valuation multiple), <code>offer_price</code>.</li>
-    <li><code>last_activity</code> &mdash; timestamp of the most recent document or stage change.</li>
-  </ul>
+  <h3>File lookup queries skip embedding entirely</h3>
+  <p>When BSearch detects a file lookup query (&ldquo;find the Catalyst NDA&rdquo;), it skips the Voyage AI call altogether. File lookups use keyword-heavy search weighted on the filename field. Vector similarity adds negligible value for &ldquo;find me Report_v3.docx&rdquo;-style queries, so skipping the embedding call saves 100&ndash;300ms with no quality loss.</p>
 
-  <h4>Company</h4>
-  <p>Represents any company involved in a deal &mdash; target, acquirer, advisor, lender. Properties include <code>name</code>, <code>aliases</code>, and <code>industry</code>.</p>
+  <h3>Not surfaced to users</h3>
+  <p>Unlike reranker failure, embedding fallback does not trigger a banner. It is transient (per-query, not systemic) and BM25 plus the reranker is still a reasonable retrieval path. BSearch logs the event for monitoring instead. An Application Insights alert fires if the fallback rate exceeds 10% over any one-hour window, signaling that the Voyage AI service may be degraded and needs attention.</p>
 
-  <h4>Person</h4>
-  <p>Represents an individual &mdash; executive, deal team member, board member. Properties include <code>name</code>, <code>title</code>, and <code>email</code> where available.</p>
+  <!-- ================================================================ -->
+  <!-- 7.4 Pessimistic Health Init -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">7.4</span> Pessimistic Health Initialization</h2>
 
-  <h4>StageEntry</h4>
-  <p>A timestamped record of a deal reaching a particular stage. Properties: <code>stage_name</code>, <code>entered_at</code>, <code>source_file_id</code> (which document provided the evidence).</p>
+  <div class="definition">
+    <p><span class="term">Pessimistic Initialization</span> &mdash; A startup strategy where the system assumes all external services are down until proven otherwise. The opposite of optimistic (assuming everything works until it fails).</p>
+  </div>
 
-  <h3>Relationship types</h3>
+  <p>When BSearch starts up &mdash; after a deployment, a restart, or an infrastructure event &mdash; it does not assume that the Cohere reranker, Voyage AI embeddings, or Neo4j are available. All three are marked as <strong>unhealthy</strong> by default.</p>
 
-  <table>
-    <thead>
-      <tr>
-        <th>Relationship</th>
-        <th>From &rarr; To</th>
-        <th>Meaning</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr>
-        <td><code>TARGET_OF</code></td>
-        <td>Company &rarr; Deal</td>
-        <td>This company is the target (seller) in the deal.</td>
-      </tr>
-      <tr>
-        <td><code>POTENTIAL_ACQUIRER</code></td>
-        <td>Company &rarr; Deal</td>
-        <td>This company is a potential buyer. Carries an <code>engagement_level</code> property (see below).</td>
-      </tr>
-      <tr>
-        <td><code>ACQUIRER_OF</code></td>
-        <td>Company &rarr; Deal</td>
-        <td>This company is the confirmed acquirer (deal closed).</td>
-      </tr>
-      <tr>
-        <td><code>ADVISOR_ON</code></td>
-        <td>Company &rarr; Deal</td>
-        <td>This company (bank, law firm, etc.) is an advisor on the deal.</td>
-      </tr>
-      <tr>
-        <td><code>LENDER_ON</code></td>
-        <td>Company &rarr; Deal</td>
-        <td>This company is providing debt financing for the deal.</td>
-      </tr>
-      <tr>
-        <td><code>EXECUTIVE_AT</code></td>
-        <td>Person &rarr; Company</td>
-        <td>This person is an executive at the company.</td>
-      </tr>
-      <tr>
-        <td><code>APPEARED_IN</code></td>
-        <td>Person &rarr; Deal</td>
-        <td>This person appeared in documents related to the deal.</td>
-      </tr>
-      <tr>
-        <td><code>REACHED_STAGE</code></td>
-        <td>Deal &rarr; StageEntry</td>
-        <td>The deal reached this stage at the recorded timestamp.</td>
-      </tr>
-    </tbody>
-  </table>
+  <p>The first health check cycle runs immediately on startup, not after the first 60-second interval. Each service is only marked healthy after its first successful ping. Until that happens, BSearch operates in degraded mode for that service: BM25-only search (if Voyage AI has not yet been verified), no reranking (if Cohere has not responded), and no entity enrichment (if Neo4j has not confirmed availability).</p>
 
-  <h3>POTENTIAL_ACQUIRER engagement levels</h3>
-
-  <p>The <code>POTENTIAL_ACQUIRER</code> relationship carries an <code>engagement_level</code> property that tracks how far a potential buyer has progressed in the process:</p>
-
-  <ol>
-    <li><code>teaser_received</code> &mdash; the buyer received the initial teaser document.</li>
-    <li><code>cim_received</code> &mdash; the buyer received the CIM (signed an NDA, accessed the data room).</li>
-    <li><code>ioi_submitted</code> &mdash; the buyer submitted an Indication of Interest.</li>
-    <li><code>loi_submitted</code> &mdash; the buyer submitted a Letter of Intent.</li>
-  </ol>
-
-  <p>These levels map directly to the standard sell-side M&amp;A process. They enable queries like &ldquo;which potential acquirers submitted an IOI on Project Falcon?&rdquo;</p>
-
-  <h3>Deal status inference</h3>
-
-  <p>Deal status (<code>active</code>, <code>closed</code>, <code>terminated</code>) is <strong>not manually set</strong>. It is deterministically inferred from two inputs:</p>
-  <ul>
-    <li><strong>Stage history</strong> &mdash; the chain of <code>REACHED_STAGE</code> relationships. A deal that reached &ldquo;closing&rdquo; is closed.</li>
-    <li><strong>Last activity</strong> &mdash; the timestamp of the most recent document or stage change. A deal with no activity in an extended period may be inferred as terminated.</li>
-  </ul>
-
-  <p>This avoids the staleness problem of manual status tracking, where someone forgets to update a field and the data goes stale.</p>
-
-  <!-- Neo4j graph schema diagram -->
-  <h3>Neo4j Graph Schema</h3>
-
-  <pre class="mermaid">
-graph LR
-    D["Deal\n(deal_id, deal_name,\nstatus, financials)"]
-    C["Company\n(name, industry)"]
-    P["Person\n(name, title)"]
-    S["StageEntry\n(stage_name,\nentered_at)"]
-
-    C -- "TARGET_OF" --> D
-    C -- "POTENTIAL_ACQUIRER\n[engagement_level]" --> D
-    C -- "ACQUIRER_OF" --> D
-    C -- "ADVISOR_ON" --> D
-    C -- "LENDER_ON" --> D
-    P -- "EXECUTIVE_AT" --> C
-    P -- "APPEARED_IN" --> D
-    D -- "REACHED_STAGE" --> S
-
-    style D fill:#fff3e0,stroke:#D4793A
-    style C fill:#e3f2fd,stroke:#4A7FB5
-    style P fill:#e8f5e9,stroke:#2E7D5B
-    style S fill:#f3ece2,stroke:#8B7B6F
-  </pre>
+  <h3>Why this matters</h3>
+  <p>Without pessimistic initialization, there is a brief window after startup where BSearch would try to use services that may not be ready yet. If the reranker happens to be down during a deployment, a user querying in that first minute could get silently degraded results with no warning. Pessimistic initialization closes that gap: the system starts in its safest mode and upgrades to full capability only after verifying each dependency.</p>
 
   <div class="callout ib-analogy">
     <div class="callout-title">IB Analogy</div>
-    <p>The graph schema mirrors how deal teams already think about relationships. You know that on Project Falcon, Acme is the target, PE Fund X and Strategic Buyer Y are in the process, Goldman is the sell-side advisor, and Bank of America is the staple financing provider. The graph just codifies these relationships so a machine can traverse them. When you ask &ldquo;who else has PE Fund X looked at?&rdquo; the graph follows the edges from PE Fund X to every deal they have a <code>POTENTIAL_ACQUIRER</code> relationship with.</p>
+    <p>It is the principle of &ldquo;trust but verify.&rdquo; When you walk into the data room for the first time, you do not assume every document is organized and up to date &mdash; you check. You verify the CIM is the latest version, confirm the financial model ties out, and make sure the org chart reflects current management. Only after checking do you start working from those materials. BSearch applies the same discipline: do not assume the services are ready until you have confirmed it.</p>
   </div>
 
   <!-- ================================================================ -->
-  <!-- 7.5 Entity Field Distinction -->
+  <!-- 7.5 Recovery Paths -->
   <!-- ================================================================ -->
-  <h2><span class="section-number">7.5</span> Entity Field Distinction</h2>
+  <h2><span class="section-number">7.5</span> Recovery Paths</h2>
 
-  <p>This is one of the most important conceptual distinctions in the data model. The search index has entity fields at three different scopes, and confusing them leads to wrong queries. Here is the breakdown:</p>
+  <p>When a service goes down, how does BSearch get back to normal? Here are the specific recovery paths for each major failure scenario.</p>
 
-  <div class="comparison">
-    <div class="comparison-col">
-      <h4>Chunk-Scoped Fields</h4>
-      <p><code>companies</code>, <code>people</code></p>
-      <p><strong>Source:</strong> NER (Named Entity Recognition) &mdash; an AI model that reads each chunk and extracts names it finds.</p>
-      <p><strong>Varies per chunk.</strong> Chunk 3 of a CIM might mention Goldman Sachs; chunk 7 might not.</p>
-      <p><strong>Use case:</strong> &ldquo;Which chunks mention Goldman?&rdquo; &mdash; search relevance. Find the specific passages that reference a company or person.</p>
-    </div>
-    <div class="comparison-col">
-      <h4>Document-Scoped Fields</h4>
-      <p><code>company_roles</code>, <code>deal_stage</code></p>
-      <p><strong>Source:</strong> Haiku extraction &mdash; an AI model that reads the full document and extracts structured information.</p>
-      <p><strong>Same for all chunks in the file.</strong> Every chunk in a CIM shares the same <code>company_roles</code>.</p>
-      <p><strong>Use case:</strong> &ldquo;Chunks from deals where Goldman was advisor&rdquo; &mdash; role-based filtering. Not about which chunks <em>mention</em> Goldman, but which documents are <em>from deals where Goldman has a role</em>.</p>
-    </div>
+  <h3>Neo4j goes down</h3>
+  <p>Entity filters, alias expansion, and deal context become unavailable. But search still works &mdash; it just operates without graph intelligence. Queries degrade gracefully to text-only search: you can still find documents by content, but questions like &ldquo;deals where Goldman was the advisor&rdquo; or &ldquo;what has PE Fund X looked at?&rdquo; will not work until Neo4j recovers. When it comes back online, the health check detects recovery within 60 seconds, and full capability restores automatically. No manual steps needed.</p>
+
+  <h3>Azure Search returns 503</h3>
+  <p>This is a hard failure with no workaround. The search index <em>is</em> the search engine &mdash; without it, there is nothing to search. BSearch shows the &ldquo;service temporarily unavailable&rdquo; page. Behind the scenes, auto-retry with exponential backoff attempts to reconnect. Once Azure Search is reachable again, the next query works normally.</p>
+
+  <div class="definition">
+    <p><span class="term">Exponential Backoff</span> &mdash; A retry strategy where the wait time between attempts doubles each time (1 second, 2 seconds, 4 seconds, 8 seconds...). This avoids hammering a struggling service with rapid retries, giving it time to recover.</p>
   </div>
 
-  <h3>Deal-scoped fields</h3>
-  <p><code>industries</code>, <code>deal_status</code></p>
-  <p><strong>Source:</strong> Neo4j knowledge graph. These values are set at the deal level and propagated to every chunk in every document associated with that deal.</p>
-  <p><strong>Same for all chunks in the deal</strong> (across all documents). A deal classified as &ldquo;healthcare&rdquo; means every chunk from every file in that deal folder carries <code>industries: ["healthcare"]</code>.</p>
-  <p><strong>Use case:</strong> &ldquo;Chunks from healthcare deals&rdquo; or &ldquo;chunks from active deals&rdquo; &mdash; deal-level filtering.</p>
+  <h3>Reranker failure</h3>
+  <p>Covered in detail in Section 7.2 above. The health check detects the outage within 60 seconds, BSearch switches to degraded mode with the orange banner, and automatically resumes when Cohere recovers.</p>
 
-  <div class="callout warning">
-    <div class="callout-title">Why This Matters</div>
-    <p>Searching <code>companies</code> for &ldquo;Goldman Sachs&rdquo; returns chunks that <em>mention</em> Goldman by name. Filtering <code>company_roles</code> for Goldman as advisor returns chunks from deals where Goldman <em>has a role</em>, even if that specific chunk never mentions Goldman. These are fundamentally different questions, and using the wrong field gives you wrong results.</p>
+  <h3>Deal summary debouncing</h3>
+
+  <div class="definition">
+    <p><span class="term">Debouncing</span> &mdash; Waiting for a burst of activity to settle before taking action. Like waiting for all the dishes to hit the sink before starting the dishwasher, rather than running it after every plate.</p>
   </div>
+
+  <p>When many files in a deal update at once &mdash; like uploading 50 documents to a data room &mdash; BSearch does not regenerate the deal summary after each file. Instead, it waits five minutes after the last change before regenerating. This prevents unnecessary repeated work: without debouncing, a 50-file upload would trigger 50 consecutive summary regenerations, each one immediately obsoleted by the next.</p>
+
+  <p>The debounce state is stored in Cosmos DB (not in-memory), so it survives application restarts. A timer checks every minute for deals that have been quiet for at least five minutes and processes them. If the debounce timer is missed due to a process restart, the six-hour periodic refresh cycle catches up &mdash; the worst case is a deal summary that reflects the state from six hours ago, while individual document chunks remain current and searchable.</p>
 
   <div class="callout ib-analogy">
     <div class="callout-title">IB Analogy</div>
-    <p>Think about the difference between &ldquo;find pages that mention JPMorgan&rdquo; and &ldquo;find documents from deals where JPMorgan is the advisor.&rdquo; The first is a text search &mdash; does this page say &ldquo;JPMorgan&rdquo;? The second is a relationship query &mdash; is JPMorgan listed as an advisor on this deal? A page about market conditions might mention JPMorgan as a comp data source without JPMorgan being involved in the deal at all. The entity field distinction prevents that confusion.</p>
+    <p>When a seller uploads a batch of diligence materials to the data room, you do not update the summary memo after each individual file arrives. You wait until the upload is done, review everything together, and then produce one comprehensive update. Debouncing applies the same common sense to automated summaries.</p>
   </div>
+
+  <!-- ================================================================ -->
+  <!-- 7.6 Five Resilience Principles -->
+  <!-- ================================================================ -->
+  <h2><span class="section-number">7.6</span> Five Resilience Principles</h2>
+
+  <p>Every resilience decision in BSearch follows these five principles. They explain not just what the system does, but <em>why</em> it does it that way.</p>
+
+  <h3>1. Degrade gracefully, never silently fail</h3>
+  <p>If a service is down, reduce quality but keep working. And always tell the user when quality is reduced. The orange banner for reranker failure embodies this: BSearch does not pretend everything is fine when it is running without its best ranking tool. Silent degradation is unacceptable in IB &mdash; a subtly wrong answer in a client deliverable is worse than a flagged one.</p>
+
+  <h3>2. Pessimistic on startup, optimistic on recovery</h3>
+  <p>Assume everything is broken until proven healthy (Section 7.4). Once healthy, assume it stays healthy &mdash; with continuous monitoring via 60-second health checks. This is asymmetric by design: the cost of using an unhealthy service (bad results) is higher than the cost of briefly operating in degraded mode (slightly slower or less refined results).</p>
+
+  <h3>3. Cache what you can</h3>
+  <p>Query embeddings, health status, AD group memberships &mdash; caching reduces dependency on external services. Every cache hit is a call you did not have to make, which means one fewer opportunity for a timeout or error to affect the user. The embedding LRU cache (Section 7.3) is a prime example: at 10&ndash;15% hit rates, it meaningfully reduces the number of queries exposed to Voyage AI latency spikes.</p>
+
+  <h3>4. Fast fallbacks over slow retries</h3>
+  <p>A quick fallback is better than making the user wait for a retry that might also fail. When the embedding service times out after 500ms, BSearch immediately falls back to BM25-only search rather than retrying and potentially doubling the latency. The user gets results in under three seconds. The quality is slightly lower, but the experience is fast and functional.</p>
+
+  <h3>5. Monitor everything, alert on patterns</h3>
+  <p>Individual failures are noise. Patterns of failures are signals. A single embedding timeout is normal. Three consecutive reranker failures trigger an alert. A fallback rate above 10% over an hour signals a systemic issue. BSearch is instrumented to track every failure, every fallback, every degraded query &mdash; but alerts only fire on sustained patterns, not individual events. This keeps the operations team focused on real problems, not transient blips.</p>
 
   <div class="key-takeaway">
     <div class="callout-title">Key Takeaway</div>
-    <p>BSearch&rsquo;s data model is purpose-built for IB workflows. The search index stores every field needed for fast, filterable retrieval. Cosmos DB handles the operational plumbing (sync state, retries, conversations). Neo4j captures the relationship structure of deals in the same way deal teams already think about them. Entity fields exist at three scopes &mdash; chunk, document, and deal &mdash; because different questions require different levels of granularity. Understanding which field to query for which question is the key to getting accurate results.</p>
+    <p>BSearch is designed to bend, not break. The majority of failures are invisible and self-healing. The few that are visible are clearly communicated with banners. Even in the worst realistic scenario &mdash; embedding service down, reranker down, Neo4j unreachable &mdash; BSearch still returns results. They come from BM25 keyword matching with Azure Search&rsquo;s default ranking and no entity enrichment. That is a meaningfully worse experience than the full pipeline, but it still works. The floor is never zero.</p>
   </div>
 
   <nav class="chapter-nav bottom">
-    <a href="chapter-06.html">&larr; Previous</a>
+    <a href="chapter-06.html">&larr; Previous: How BSearch Understands Deals &amp; Relationships</a>
     <span class="nav-spacer">|</span>
     <a href="index.html">Contents</a>
     <span class="nav-spacer">|</span>
-    <a href="chapter-08.html">Next &rarr;</a>
+    <a href="chapter-08.html">Next: Phase 1 &mdash; Project Setup &amp; Infrastructure &rarr;</a>
   </nav>
 </div>
-<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
-<script>mermaid.initialize({startOnLoad: true, theme: 'neutral'});</script>
 </body>
 </html>
