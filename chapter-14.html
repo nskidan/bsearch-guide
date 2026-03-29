@@ -21,10 +21,10 @@
   <div class="chapter-header">
     <div class="chapter-number">Chapter 14</div>
     <h1>Design Decisions</h1>
-    <p class="chapter-subtitle">All 18 architecture decisions, why each was made, what was considered instead, and when to revisit.</p>
+    <p class="chapter-subtitle">All 20 architecture decisions, why each was made, what was considered instead, and when to revisit.</p>
   </div>
 
-  <p>Every system is the sum of its design decisions. This chapter documents all 18 architecture decisions that shape BSearch &mdash; not just what was chosen, but why, what the alternatives were, and under what conditions each decision should be reconsidered. Decisions are grouped into four categories: Infrastructure, Search Quality, Resilience, and AI Models.</p>
+  <p>Every system is the sum of its design decisions. This chapter documents all 20 architecture decisions that shape BSearch &mdash; not just what was chosen, but why, what the alternatives were, and under what conditions each decision should be reconsidered. Decisions are grouped into four categories: Infrastructure, Search Quality, Resilience, and AI Models.</p>
 
   <!-- ============================================================ -->
   <!-- 14.1 Infrastructure -->
@@ -45,12 +45,11 @@
 
   <!-- Decision 2 -->
   <details class="decision-card">
-    <summary>#2 &mdash; State Persistence: Cosmos DB + Neo4j Aura</summary>
-    <p><strong>Chosen:</strong> Cosmos DB (serverless) for operational state &mdash; conversations, delta sync tokens, webhook subscriptions, retry queue, duplicate clusters, deal summary pending flags, and feedback. Neo4j Aura for entity intelligence &mdash; deals, companies, people, relationships, financials, and stage history. Cosmos scales to zero (~$0 at 18 users); Neo4j Free tier for dev, ~$65/mo Pro for production.</p>
-    <p><strong>Why:</strong> BSearch has two fundamentally different data needs. Operational state (sync tokens, retry queues, webhook subscriptions) is simple key-value data that fits naturally in a document database &mdash; Cosmos DB's serverless tier means we pay essentially nothing at our scale. Entity intelligence (which companies are involved in which deals, who advises whom, how deals progress through stages) is inherently graph-shaped &mdash; a relational database would require complex JOIN chains to answer questions like "which advisors have worked on healthcare deals above $50M EBITDA." Neo4j makes these queries natural and fast with Cypher.</p>
-    <p><strong>Considered instead:</strong> Using Cosmos DB for everything (including entity data) would simplify the stack to one database, but relationship traversal in a document database requires application-level graph logic that is slow and fragile. Using only Neo4j for everything would force us to use a graph database for simple key-value lookups, which is wasteful. PostgreSQL with a graph extension was considered but does not match Neo4j's query expressiveness for multi-hop relationship traversals.</p>
-    <p><strong>When to revisit:</strong> If the entity graph becomes simple enough that it can be flattened into Cosmos documents without losing query capability, or if Azure Cosmos DB adds native graph traversal that matches Neo4j's Cypher expressiveness. Also revisit if the Neo4j ~$65/mo cost becomes a concern relative to the value the knowledge graph provides.</p>
-    <div class="decision-meta">Category: Infrastructure</div>
+    <summary>#2 &mdash; State Persistence: Cosmos DB + Azure PostgreSQL</summary>
+    <p><strong>Chosen:</strong> Cosmos DB (serverless) for operational state &mdash; conversations, delta sync tokens, webhook subscriptions, retry queues, duplicate clusters, deal summary pending flags, and feedback. Azure Database for PostgreSQL (Flexible Server) for entity intelligence &mdash; deals, companies, people, relationships, financials, and stage history.</p>
+    <p><strong>Why:</strong> Cosmos scales to zero at 18 users (~$0/month idle). PostgreSQL provides relational integrity for the deal-centric star schema, JSONB for provenance metadata, <code>INSERT ... ON CONFLICT</code> for alias accumulation, and native Azure integration with continuous backups (point-in-time recovery). The entity query patterns are star-schema JOINs, not multi-hop graph traversals &mdash; a relational model handles them cleanly at lower cost ($13&ndash;26/month vs. $65/month for Neo4j Aura Pro).</p>
+    <p><strong>Alternatives considered:</strong> Neo4j Aura (graph expressiveness not needed for deal-centric queries; higher cost; weaker Azure integration), Cosmos DB for both (no JOINs across containers, awkward for relationship queries), Azure SQL Database (higher cost than PostgreSQL Flexible Server for this workload).</p>
+    <p><strong>When to revisit:</strong> If relationship query patterns become truly graph-shaped (multi-hop traversals, path finding, recursive relationship discovery) rather than star-schema JOINs. If Azure Cosmos DB adds native graph traversal that matches SQL JOIN expressiveness for this use case.</p>
   </details>
 
   <!-- Decision 3 -->
@@ -234,12 +233,30 @@
     <div class="decision-meta">Category: AI Models</div>
   </details>
 
+  <!-- Decision 19 -->
+  <details class="decision-card">
+    <summary>#19 &mdash; Reranker Portability: Provider Abstraction with Normalized Scoring</summary>
+    <p><strong>Chosen:</strong> Abstract <code>RerankerProvider</code> interface with normalized 0&ndash;1 scoring. Config-driven factory function (<code>create_reranker_provider(config)</code>). Only Cohere in v1.</p>
+    <p><strong>Why:</strong> Confidence tier thresholds (HIGH &ge; 0.50, LOW &ge; 0.15, NONE &lt; 0.15) are critical to answer quality. Defining them against a normalized 0&ndash;1 scale means they survive provider swaps without recalibration. Each provider implements its own <code>normalize_score()</code> &mdash; Cohere&rsquo;s sigmoid output is already 0&ndash;1 (passthrough), but future providers may need min-max or sigmoid normalization. The abstraction also isolates the query pipeline from API-level differences between reranker vendors.</p>
+    <p><strong>Alternatives considered:</strong> Direct Cohere integration without abstraction (faster to build but creates vendor lock-in at the API level), provider-specific confidence thresholds (fragile &mdash; every provider swap requires threshold retuning).</p>
+    <p><strong>When to revisit:</strong> When adding a second reranker provider (Jina, Voyage, or LLM-based). The abstraction is designed for this &mdash; implement <code>rerank()</code> + <code>normalize_score()</code>, add to factory, update config.</p>
+  </details>
+
+  <!-- Decision 20 -->
+  <details class="decision-card">
+    <summary>#20 &mdash; Synthesis Portability: Provider Abstraction with Capability Flags</summary>
+    <p><strong>Chosen:</strong> Abstract <code>SynthesisProvider</code> interface with capability flags (e.g., <code>supports_thinking</code>). Config-driven factory function (<code>create_synthesis_provider(config)</code>). Only Anthropic (Claude) in v1.</p>
+    <p><strong>Why:</strong> Synthesis is the most expensive per-query cost. The abstraction decouples prompt construction and streaming from a specific LLM vendor, making it straightforward to benchmark alternatives. Extended thinking is modeled as an optional capability flag &mdash; Claude uses it for complex multi-document synthesis; providers without thinking support degrade gracefully. Prompt templates remain provider-agnostic plain text.</p>
+    <p><strong>Alternatives considered:</strong> Direct Anthropic SDK integration (simpler but locks prompt engineering to one vendor&rsquo;s API shape), LiteLLM / unified SDK (adds a dependency and abstraction layer we don&rsquo;t control).</p>
+    <p><strong>When to revisit:</strong> When adding a second synthesis provider (OpenAI GPT-4o, Gemini). Provider-specific prompt tuning is the main migration cost &mdash; the abstraction handles the API and streaming differences.</p>
+  </details>
+
   <!-- ============================================================ -->
   <!-- Key Takeaway -->
   <!-- ============================================================ -->
   <div class="key-takeaway">
     <div class="callout-title">Key Takeaway</div>
-    <p>These 18 decisions are not permanent. Each one was made for specific reasons under specific constraints &mdash; 18 users, 550K documents, sub-$500/month budget, and a priority on answer quality over raw scale. Every decision includes the conditions under which it should be reconsidered. When those conditions change, the decision should change too. The system is designed to make most of these changes cheap: embedding models can be swapped via the abstraction layer, confidence thresholds are environment variables, AI models are configurable, and the monorepo structure means changes propagate atomically.</p>
+    <p>These 20 decisions are not permanent. Each one was made for specific reasons under specific constraints &mdash; 18 users, 550K documents, sub-$500/month budget, and a priority on answer quality over raw scale. Every decision includes the conditions under which it should be reconsidered. When those conditions change, the decision should change too. The system is designed to make most of these changes cheap: embedding models can be swapped via the abstraction layer, confidence thresholds are environment variables, AI models are configurable, and the monorepo structure means changes propagate atomically.</p>
   </div>
 
   <nav class="chapter-nav bottom">

@@ -41,7 +41,7 @@ The architecture below reflects v1 scope only.
 │             │     │  │  ├─ company/person/industry  │    │     │     + expand      │
 │             │     │  │  └─ financials + deal stage  │    │     │     + entity intent│
 │             │     │  └──────────────────────────────┘    │     │  2. Entity context│
-│             │     │  ┌──────────────────────────────┐    │     │     (Neo4j)       │
+│             │     │  ┌──────────────────────────────┐    │     │     (PostgreSQL)   │
 │             │     │  │ Format-Aware Chunking        │    │     │  3. Hybrid search │
 │             │     │  │  ├─ Narrative: 800-1000tok   │    │     │     + entity filt │
 │             │     │  │  ├─ Tables: intact + desc    │    │     │  4. Cohere rerank │
@@ -51,9 +51,9 @@ The architecture below reflects v1 scope only.
                           │                                       │  Web App         │
                           ▼                                       └──────────────────┘
                     ┌──────────────────┐
-                    │  Neo4j Aura      │
-                    │  (knowledge      │
-                    │   graph)         │─ ─ ─ ─ entity context ─ ─ ▶ Search API
+                    │  PostgreSQL       │
+                    │  (entity         │
+                    │   store)         │─ ─ ─ ─ entity context ─ ─ ▶ Search API
                     │  deals,companies │
                     │  people,stage,   │
                     │  financials      │
@@ -138,17 +138,17 @@ Respond with JSON only:
 
 **Financial constraint parsing:** `financial_constraint` is a natural language string from Haiku (e.g., "EBITDA over $50M"). Python regex parses it into a structured filter `{metric: "ebitda", operator: "gt", value: 50000000}`. This is more reliable than asking Haiku to output structured numeric data.
 
-**Entity alias expansion:** When `company_name` is present, the query pipeline looks up the company's Neo4j entity record (~5-10ms) and adds all aliases to BM25 expansion terms. This adds ~10ms to the critical path (sequential dependency — aliases must be in the BM25 query before Azure AI Search fires).
+**Entity alias expansion:** When `company_name` is present, the query pipeline looks up the company's PostgreSQL entity record (~5-10ms) and adds all aliases to BM25 expansion terms. This adds ~10ms to the critical path (sequential dependency — aliases must be in the BM25 query before Azure AI Search fires).
 
 **Entity-aware filters:** Applied alongside existing `source_folder` permission filter and `is_canonical` filter on Azure AI Search:
 - `industry_filter` → `industries/any(i: i eq 'healthcare')`
 - `role_filter` → `company_roles/any(r: search.ismatch('advisor:*'))`
 - `deal_status_filter` → `deal_status eq 'active'`
-- `financial_constraint` → Neo4j query returns matching `deal_id` list → `deal_id` IN filter
+- `financial_constraint` → PostgreSQL query returns matching `deal_id` list → `deal_id` IN filter
 
 **Financial filter fallback:** If financial filter + other filters return <3 results, retry without the financial filter. Add note to Claude prompt: "Financial filter relaxed — not all results may match the stated financial criteria."
 
-**Entity context injection:** For queries with entity intent, Neo4j entity context (deal status, financials, company roles, stage progression, key contacts) is prepended to Claude's synthesis prompt alongside the retrieved document chunks. For cross-deal queries ("who has shown interest on space tech deals"), multiple entity profiles are injected from a composable Cypher query builder (not monolithic templates).
+**Entity context injection:** For queries with entity intent, PostgreSQL entity context (deal status, financials, company roles, stage progression, key contacts) is prepended to Claude's synthesis prompt alongside the retrieved document chunks. For cross-deal queries ("who has shown interest on space tech deals"), multiple entity profiles are injected from a composable SQL query builder (not monolithic templates).
 
 **Haiku failure/timeout handling:** 500ms timeout. On failure or timeout, default to `data_extraction`. Log the event.
 
@@ -282,20 +282,20 @@ Query → Regex fast path (<5ms) or Combined Haiku (classify + expand + entity i
      → Voyage AI query embedding (~100-300ms, 500ms timeout, LRU cache check first)
        └─ Skip entirely for regex-matched file_lookup
        └─ On timeout/failure → embedding_fallback=true, proceed BM25-only
-  → [if entity intent detected] Entity alias expansion via Neo4j (~5-10ms, sequential — blocks search)
-  → [parallel with search] Neo4j entity context retrieval (~10-20ms)
-  → [parallel with search] Neo4j cross-deal / financial filter query if needed (~20-50ms)
+  → [if entity intent detected] Entity alias expansion via PostgreSQL (~5-10ms, sequential — blocks search)
+  → [parallel with search] PostgreSQL entity context retrieval (~10-20ms)
+  → [parallel with search] PostgreSQL cross-deal / financial filter query if needed (~20-50ms)
   → Azure AI Search: hybrid (vector + BM25 + recency) or BM25-only if embedding_fallback
     → Filter: source_folder IN user's permitted folders
     → Filter: is_canonical eq true (exclude near-duplicate non-canonical files)
     → Filter: entity filters (industries, company_roles, deal_status, etc.) if entity intent detected
-    → Filter: deal_id IN [matching deals] if financial filter applied (from Neo4j pre-query)
+    → Filter: deal_id IN [matching deals] if financial filter applied (from PostgreSQL pre-query)
     → Return top-20 (or top-12 if reranker degraded)
   → [if reranker healthy] Cohere Rerank: score top-20 against original query → top-5 (or top-10 for multi-doc) (~200ms)
   → [if reranker degraded] Skip rerank, use Azure Search ranking on top-12, cap confidence at LOW
   → [if financial filter + <3 results] Fallback: retry without financial filter, add relaxation note
   → Relevance gate (HIGH/LOW/NONE)
-  → Claude API (streaming): synthesize from top-k chunks + entity context from Neo4j
+  → Claude API (streaming): synthesize from top-k chunks + entity context from PostgreSQL
     → Prompt strategy by query type (terse / precise / structured chain-of-thought)
     → Entity context prepended: deal status, financials, company roles, stage progression
     → Extended thinking enabled for multi_doc_synthesis only (~2000 token budget)
@@ -304,12 +304,37 @@ Query → Regex fast path (<5ms) or Combined Haiku (classify + expand + entity i
     → Stream to client (<3s TTFT for file_lookup/data_extraction, <5s for multi_doc_synthesis)
 ```
 
+### Reranker Provider Abstraction
+
+All reranking calls go through an abstract `RerankerProvider` interface. This follows the same
+pattern as `EmbeddingProvider` — config-driven factory, one concrete implementation per vendor,
+swappable without touching query pipeline code.
+
+**Key design: normalized scoring.** Each provider normalizes its raw scores to a 0-1 scale
+before returning results. This means the confidence tier thresholds (HIGH ≥0.50, LOW ≥0.15,
+NONE <0.15) are defined once against the normalized scale and survive provider swaps without
+recalibration.
+
+RerankerProvider protocol:
+- `rerank(query: str, chunks: list[str], top_k: int) → list[RankedChunk]` — RankedChunk
+  contains `chunk_index`, `score` (normalized 0-1), `raw_score` (provider-native)
+- `model_name: str` (read-only property, e.g., "cohere/rerank-v3")
+- `normalize_score(raw_score: float) → float` — provider-specific normalization. Cohere:
+  sigmoid already 0-1, passthrough. Future providers may need min-max or sigmoid normalization.
+
+`create_reranker_provider(config: Settings) → RerankerProvider` — factory function.
+Reads `config.reranker_provider` (default "cohere"). Only "cohere" supported in v1.
+
+CohereRerankerProvider(RerankerProvider) — wraps Cohere rerank API. Cohere scores are
+already roughly 0-1 (sigmoid output), so normalization is a passthrough in v1. Future
+providers implement their own normalization.
+
 ### Reranker Health & Degradation Handling
 
-Cohere rerank is the quality bottleneck — it's the difference between Claude synthesizing from the best 5 chunks vs. mediocre ones. Silent degradation is unacceptable in IB; a subtly wrong answer in a client deliverable is worse than a flagged one.
+The reranker is the quality bottleneck — it's the difference between Claude synthesizing from the best 5 chunks vs. mediocre ones. Silent degradation is unacceptable in IB; a subtly wrong answer in a client deliverable is worse than a flagged one.
 
 **Proactive Health Check:**
-- Background task in FastAPI pings Cohere rerank every 60 seconds with a minimal test payload (2 docs, 1 query)
+- Background task pings the active reranker provider every 60 seconds with a minimal test payload (2 docs, 1 query)
 - Stores result in an in-memory `RerankerHealthStatus` (last check time, healthy boolean, consecutive failure count)
 - Not stored in Cosmos — must be query-time fast (in-process memory read)
 - On ≥3 consecutive failures: fire Application Insights custom event `reranker_degraded` + alert rule
@@ -331,13 +356,40 @@ Cohere rerank is the quality bottleneck — it's the difference between Claude s
 
 **Relevance gate threshold calibration:** The confidence tier thresholds (HIGH ≥0.50 / LOW 0.15–0.50 / NONE <0.15, per-chunk floor 0.10) are initial defaults based on typical Cohere rerank score distributions, not empirical measurements against this corpus. These values must be calibrated against real Cohere rerank score distributions during Phase 6 acceptance testing — run 30+ queries across all query types on the full 550K doc set, manually verify correct vs. irrelevant results, and analyze which score ranges they fall into before finalizing thresholds. Thresholds should be re-evaluated quarterly as the document corpus grows and query patterns evolve, using the same score-distribution analysis methodology.
 
+### Synthesis Provider Abstraction
+
+All LLM synthesis calls go through an abstract `SynthesisProvider` interface. This
+decouples prompt construction and streaming from a specific LLM vendor.
+
+SynthesisProvider protocol:
+- `synthesize(system_prompt: str, context: str, query: str, stream: bool,
+  thinking_budget: int | None) → AsyncIterator[str]` — streams response tokens.
+  `thinking_budget` is optional: providers that support extended thinking (Claude) use it;
+  others ignore it.
+- `classify(prompt: str, timeout_ms: int) → dict` — fast classification call
+  (maps to Haiku-class models). Returns structured JSON.
+- `model_name: str` (e.g., "anthropic/claude-sonnet-4.6")
+- `supports_thinking: bool` — capability flag. True for Claude, False for others.
+- `fast_model_name: str` (e.g., "anthropic/claude-haiku-4.5") — model used for classify()
+
+`create_synthesis_provider(config: Settings) → SynthesisProvider` — factory function.
+Reads `config.synthesis_provider` (default "anthropic"). Only "anthropic" supported in v1.
+
+ClaudeSynthesisProvider(SynthesisProvider) — wraps Anthropic SDK. Uses Sonnet for
+synthesize(), Haiku for classify(). Implements thinking via Anthropic's `thinking` parameter.
+
+**Prompt templates are provider-agnostic.** The three synthesis prompt files
+(`synthesize_file_lookup.txt`, `synthesize_data_extraction.txt`, `synthesize_multi_doc.txt`)
+contain plain text instructions — not API-specific formatting. The provider handles mapping
+prompt text to its API's message format (system message, user message, etc.).
+
 ### Tiered Synthesis (query-type-aware Claude prompting)
 
 Different query types have fundamentally different reasoning demands. File lookups need a terse pointer. Data extraction needs precise fact retrieval. Multi-doc synthesis needs structured cross-document reasoning. The system uses a single Claude call for all types but varies the prompt strategy and timeout budget.
 
 **Per-type synthesis configuration:**
 
-| Query Type | Claude Prompt Strategy | Max Chunks in Context | TTFT Target | Extended Thinking |
+| Query Type | Claude Prompt Strategy | Max Chunks in Context | TTFT Target | Thinking Requested |
 |-----------|----------------------|----------------------|-------------|-------------------|
 | `file_lookup` | Terse — return file link + minimal context | 1-2 | <2s | No |
 | `data_extraction` | Precise — extract and cite specific data, direct answer | 5 | <3s | No |
@@ -383,7 +435,7 @@ answer that misses deals.
 ```
 
 **Extended thinking for multi-doc:**
-Multi-doc synthesis calls use `thinking` with a budget of ~2000 tokens. This gives Claude space for the structured extraction step without consuming output tokens. The thinking content is NOT streamed to the user — only the final synthesis is streamed.
+Multi-doc synthesis calls request extended thinking via `thinking_budget=2000`. Providers that support thinking (Claude) use it for structured extraction. Providers that don't support thinking ignore the parameter — the structured prompt instructions still guide the model to extract-then-synthesize. The thinking content is NOT streamed to the user — only the final synthesis is streamed.
 
 **Deal summary injection at query time:**
 For `multi_doc_synthesis` queries, after reranking, if any `deal_summary` chunks are in the top-10, they are placed first in Claude's context (before specific document chunks) with a label: `[Deal Overview: {deal_name}]`. If no deal summaries surfaced organically, no special injection occurs in v1 (see v2 TODO: deal summary active injection at query time).
@@ -489,46 +541,55 @@ Implementation: Filename/path pattern matching first (folder structure and namin
 
 Within the two deal root folders, every subfolder gets a `deal_id` assigned, regardless of whether it's a deal folder or a non-deal folder like "Templates" or "SaaS." Non-deal subfolders will naturally have empty or near-empty alias records because Haiku won't extract meaningful deal names from generic files. This is harmless — chunks get `deal_id` set but `deal_name` stays null (no canonical name to assign), deal summary generation requires both ≥3 documents AND a non-null `deal_name` so these folders never qualify, and search isn't polluted because `deal_name` is null and `deal_aliases` is empty. This eliminates any ongoing maintenance burden for classifying folders.
 
-**`deal_name`** — the canonical deal/project name (e.g., "Acme Corp"), or null if not deal-specific. This is NOT extracted per-file independently. Instead, it is the `canonical_name` from the deal's Deal node in Neo4j (see **Knowledge Graph** section below). All chunks for the same deal share a consistent `deal_name`, regardless of which name variant appears in each individual file.
+**`deal_name`** — the canonical deal/project name (e.g., "Acme Corp"), or null if not deal-specific. This is NOT extracted per-file independently. Instead, it is the `canonical_name` from the deal's row in the PostgreSQL entity store (see **Entity Store** section below). All chunks for the same deal share a consistent `deal_name`, regardless of which name variant appears in each individual file.
 
-### Knowledge Graph (Neo4j Aura)
+### Entity Store (PostgreSQL)
 
-BSearch maintains a knowledge graph in Neo4j Aura that encodes entity intelligence — deal relationships, company roles, people, financial profiles, deal status — as a deal-centric star schema. The graph is the competitive moat over generic enterprise search tools: IB-specific entity understanding that encodes tribal knowledge currently in bankers' heads.
+BSearch maintains an entity store in PostgreSQL that tracks deal relationships, company roles, people, financial profiles, and deal status. The entity store is the competitive moat over generic search — IB-specific entity understanding that encodes tribal knowledge.
 
-**Data flow:** Entity data is extracted at ingestion time, stored in Neo4j (source of truth), and denormalized onto Azure AI Search chunks for search-time filtering. At query time, the search API reads from both Neo4j (entity context, cross-deal queries) and Azure AI Search (document retrieval).
+**Data flow:** Entity data is extracted at ingestion time, stored in PostgreSQL (source of truth), and denormalized onto Azure AI Search chunks for search-time filtering. At query time, the search API reads from both PostgreSQL (entity context, cross-deal queries) and Azure AI Search (document retrieval).
 
-#### Graph Schema
+#### Relational Schema
 
-**Node types:**
+```sql
+-- Core tables
+deals (deal_id PK, canonical_name, folder_path, industries JSONB, deal_status, current_stage,
+       last_activity TIMESTAMPTZ, revenue NUMERIC, ebitda NUMERIC, ev NUMERIC, ev_ebitda NUMERIC,
+       offer_price NUMERIC, financials_meta JSONB)
+deal_aliases (deal_id FK, alias TEXT, UNIQUE(deal_id, alias))
 
-`Deal` — the hub entity. Properties: `deal_id`, `canonical_name`, `aliases[]`, `folder_path`, `industries[]`, `deal_status` (active|closed|on_hold|dead), `current_stage`, `last_activity`, key financial metrics as numeric properties (`revenue`, `ebitda`, `ev`, `ev_ebitda`, `offer_price`), and `financials_meta` (JSON string with period/confidence/source provenance).
+companies (normalized_name PK, canonical_name, aliases JSONB, industries JSONB,
+           first_seen TIMESTAMPTZ, last_seen TIMESTAMPTZ)
 
-`Company` — targets, acquirers, advisors, lenders. Properties: `canonical_name`, `normalized_name` (MERGE key: lowercase, stripped of Inc/Corp/LLC suffixes), `aliases[]`, `industries[]`, `first_seen`, `last_seen`.
+people (normalized_name PK, canonical_name, aliases JSONB, titles JSONB,
+        first_seen TIMESTAMPTZ, last_seen TIMESTAMPTZ)
 
-`Person` — executives, bankers, contacts. Properties: `canonical_name`, `normalized_name`, `aliases[]`, `titles[]`, `first_seen`, `last_seen`. Extracted from structured sections only (signature blocks, management team sections, cover pages) — NOT from narrative mentions.
+stage_entries (id SERIAL PK, deal_id FK, stage TEXT, entered TIMESTAMPTZ,
+               doc_type TEXT, source_file_id TEXT)
 
-`StageEntry` — deal stage transitions. Properties: `stage` (origination|marketing|bidding|negotiation|diligence|closing), `entered` (datetime), `doc_type`, `source_file_id`. Separate nodes (not list properties) for natural Cypher queryability.
+-- Relationship tables (with provenance)
+deal_companies (deal_id FK, company_normalized_name FK, relationship_type TEXT,
+                engagement TEXT, source_file_ids JSONB, since TIMESTAMPTZ,
+                PRIMARY KEY (deal_id, company_normalized_name, relationship_type))
 
-**Relationship types:**
+deal_people (deal_id FK, person_normalized_name FK, role TEXT,
+             source_file_ids JSONB, PRIMARY KEY (deal_id, person_normalized_name))
 
-```cypher
-// Company-Deal (core IB relationships)
-(:Company)-[:TARGET_OF         {source_file_ids: [...], since: datetime}]->(:Deal)
-(:Company)-[:POTENTIAL_ACQUIRER {engagement: str, source_file_ids: [...], doc_types_seen: [...], since: datetime}]->(:Deal)
-(:Company)-[:ACQUIRER_OF       {source_file_ids: [...], since: datetime}]->(:Deal)
-(:Company)-[:ADVISOR_ON        {side: "sell"|"buy", source_file_ids: [...], since: datetime}]->(:Deal)
-(:Company)-[:LENDER_ON         {source_file_ids: [...], since: datetime}]->(:Deal)
-(:Person)-[:EXECUTIVE_AT       {title: str, source_file_ids: [...], since: datetime}]->(:Company)
-(:Person)-[:APPEARED_IN        {role: str, source_file_ids: [...]}]->(:Deal)
-(:Deal)-[:REACHED_STAGE]->(:StageEntry)
+company_people (person_normalized_name FK, company_normalized_name FK,
+                title TEXT, source_file_ids JSONB,
+                PRIMARY KEY (person_normalized_name, company_normalized_name))
 ```
 
-`POTENTIAL_ACQUIRER` vs `ACQUIRER_OF`: when a deal closes and a company wins, the POTENTIAL_ACQUIRER edge is replaced with ACQUIRER_OF. Engagement levels on POTENTIAL_ACQUIRER: `teaser_received` → `cim_received` → `ioi_submitted` → `loi_submitted` (only upgrades, never downgrades). Every relationship has `source_file_ids` for provenance tracking (critical for cleanup on file deletion/update).
+`deals` is the hub table. `companies` stores targets, acquirers, advisors, lenders. `people` stores executives, bankers, contacts — extracted from structured sections only (signature blocks, management team sections, cover pages), NOT from narrative mentions. `stage_entries` tracks deal stage transitions as separate rows for natural SQL queryability.
+
+**Relationship types:** `deal_companies.relationship_type` enum values: `target`, `potential_acquirer`, `acquirer`, `advisor`, `lender`. Same provenance via `source_file_ids` JSONB array on every relationship row.
+
+`potential_acquirer` vs `acquirer`: when a deal closes and a company wins, the junction row is UPDATEd from `potential_acquirer` to `acquirer`. Engagement levels on `potential_acquirer`: `teaser_received` → `cim_received` → `ioi_submitted` → `loi_submitted` (only upgrades, never downgrades). Every relationship row has `source_file_ids` for provenance tracking (critical for cleanup on file deletion/update).
 
 #### Two-Tier Entity Extraction
 
 **Tier 1 — Document-level Haiku extraction (1 call per document, ~1000 tokens):**
-Extracts `doc_type`, `deal_name` (existing), plus: primary companies with roles and confidence (target, main advisor — usually stated early), primary industry classification. Does NOT extract financials, people, or secondary companies (these appear later in documents). Populates Neo4j graph: Deal node, primary Company nodes, primary relationships.
+Extracts `doc_type`, `deal_name` (existing), plus: primary companies with roles and confidence (target, main advisor — usually stated early), primary industry classification. Does NOT extract financials, people, or secondary companies (these appear later in documents). Writes to PostgreSQL entity tables: deals row, primary companies rows, primary relationship rows.
 
 **Tier 2 — High-value chunk extraction (Haiku, selective):**
 After chunking, Haiku runs on specific chunk types only:
@@ -537,10 +598,10 @@ After chunking, Haiku runs on specific chunk types only:
 - IOI/LOI body chunks → offer terms, acquirer details
 - Process letter chunks → potential acquirer lists
 
-Estimated ~1-3 additional Haiku calls per document. Many documents (memos, emails, board decks) get 0 additional calls. Populates Neo4j graph: financial metrics on Deal, Person nodes, additional Company-Deal relationships.
+Estimated ~1-3 additional Haiku calls per document. Many documents (memos, emails, board decks) get 0 additional calls. Writes to PostgreSQL entity tables: financial metrics on deals row, people rows, additional deal_companies relationship rows.
 
 **Tier 3 — Chunk-level NER (local, no API call):**
-Every chunk gets lightweight named entity recognition (regex patterns + heuristics): company names (capitalized phrases + entity suffixes, matched against cached known entities from Neo4j), person names (structured contexts only). No role classification — NER detects mentions, not relationships. Populates Azure AI Search chunk fields only (`companies`, `people`). NOT Neo4j.
+Every chunk gets lightweight named entity recognition (regex patterns + heuristics): company names (capitalized phrases + entity suffixes, matched against cached known entities from PostgreSQL), person names (structured contexts only). No role classification — NER detects mentions, not relationships. Populates Azure AI Search chunk fields only (`companies`, `people`). NOT PostgreSQL.
 
 **Extraction cost (bulk ingestion of 550K docs):** ~$750-950 total (Tier 1: ~$550, Tier 2: ~$200-400, Tier 3: $0 local).
 
@@ -566,34 +627,42 @@ Respond with JSON only.
 
 Tier 2 high-value chunk prompt adds: `people` (name, title, company — structured sections only) and `financials` (metric, value, period, currency, confidence — from financial summary tables and offer terms only, NOT from comp tables or illustrative scenarios).
 
-#### Deal Alias Accumulation (Neo4j)
+#### Deal Alias Accumulation (PostgreSQL)
 
 IB deals always have a code name ("Project Atlas") used in early docs and a real company name ("Acme Corp") in later docs. Per-file deal_name extraction would tag the same deal with different names, breaking deal-level aggregation, deal summaries, and multi-doc synthesis queries. Since all docs for a deal live in one deal subfolder, the folder is the stable identity.
 
-**Neo4j Deal node** stores aliases and canonical name. The `canonical_name` is the alias extracted from the most recently modified file in the folder (not most frequent — this naturally converges to the "real" company name as deals progress). New variants are appended automatically via Cypher MERGE — no manual maintenance.
+The PostgreSQL **deals table** stores the canonical name; the **deal_aliases table** stores all name variants. The `canonical_name` is the alias extracted from the most recently modified file in the folder (not most frequent — this naturally converges to the "real" company name as deals progress). New variants are appended automatically via `INSERT ON CONFLICT` — no manual maintenance.
 
 **Ingestion flow:**
 1. Determine `deal_id` from file's folder path (if inside a deal root subfolder)
 2. Haiku extracts a per-file deal name from filename/content (regex first, Haiku fallback)
-3. Neo4j MERGE on Deal node by `deal_id`:
-   - If extracted name is new (not in `aliases`): append to `aliases`
-   - If this file's `last_modified` is the most recent: update `canonical_name`
-4. For each extracted company (confidence ≥ medium): MERGE Company node, MERGE Company-Deal relationship edge with `source_file_id` provenance
+3. PostgreSQL upsert on deals table by `deal_id`:
+   ```sql
+   INSERT INTO deals (deal_id, folder_path, canonical_name, last_activity)
+   VALUES ($1, $2, $3, $4)
+   ON CONFLICT (deal_id) DO UPDATE SET
+     canonical_name = CASE WHEN $4 > deals.last_activity THEN $3 ELSE deals.canonical_name END,
+     last_activity = GREATEST($4, deals.last_activity);
+
+   INSERT INTO deal_aliases (deal_id, alias) VALUES ($1, $5)
+   ON CONFLICT DO NOTHING;
+   ```
+4. For each extracted company (confidence >= medium): upsert companies row, upsert deal_companies relationship row with `source_file_ids` provenance
 5. Update deal status: recompute from stage history + last_activity (deterministic — see **Deal Status Inference** below)
-6. If doc_type represents a new stage: create StageEntry node
-7. Populate chunk fields from Neo4j:
-   - `deal_name` = `canonical_name` from Deal node
-   - `deal_aliases` = space-separated concatenation of all aliases
+6. If doc_type represents a new stage: insert stage_entries row
+7. Populate chunk fields from PostgreSQL:
+   - `deal_name` = `canonical_name` from deals table
+   - `deal_aliases` = space-separated concatenation of all aliases from deal_aliases table
    - `company_roles` = "role:company_name" pairs from document-level extraction (propagated to all chunks in this document)
-   - `industries`, `deal_status` from Deal node (same for all chunks in deal)
+   - `industries`, `deal_status` from deals table (same for all chunks in deal)
    - `deal_stage` from doc_type mapping (deterministic, per-document)
    - `companies`, `people` from Tier 3 NER (per-chunk, what's in THIS chunk)
-8. If Haiku extracts `deal_name: null` for a file, skip the alias update — don't append null. The chunk still gets `deal_id` set and entity fields populated from the existing Deal node (if one exists)
+8. If Haiku extracts `deal_name: null` for a file, skip the alias update — don't append null. The chunk still gets `deal_id` set and entity fields populated from the existing deals row (if one exists)
 
 **Canonical name changes and existing chunk re-tagging:**
 When the `canonical_name` for a deal changes, the ingestion pipeline batch-updates the `deal_name` and `deal_aliases` fields on all existing chunks with that `deal_id` in Azure AI Search. Targeted bulk update (filter by `deal_id`, update fields only) — not a full re-ingestion. Log canonical name changes for monitoring.
 
-**Company alias accumulation** follows the same pattern: Company nodes accumulate `aliases` via MERGE. `normalized_name` (lowercase, suffix-stripped: "Inc.", "Corp.", "LLC", "Ltd.", "& Co.", "Group", "Holdings") is the MERGE key — prevents "Goldman Sachs", "Goldman Sachs & Co.", and "Goldman Sachs Group, Inc." from becoming separate nodes. `canonical_name` comes from the most recently modified document mentioning the company.
+**Company alias accumulation** follows the same pattern: companies rows accumulate aliases via JSONB append. `normalized_name` (lowercase, suffix-stripped: "Inc.", "Corp.", "LLC", "Ltd.", "& Co.", "Group", "Holdings") is the primary key — prevents "Goldman Sachs", "Goldman Sachs & Co.", and "Goldman Sachs Group, Inc." from becoming separate rows. `canonical_name` comes from the most recently modified document mentioning the company.
 
 **Search enhancement:**
 The `deal_aliases` field (searchable string in Azure AI Search) contains all known name variants for the deal. At query time, BM25 matches against both `deal_name` and `deal_aliases`, so a query for "Project Atlas" finds chunks tagged with canonical name "Acme Corp." Entity alias expansion at query time also covers company names — query for "GS" expands to include "Goldman Sachs" and "Goldman Sachs & Co."
@@ -610,7 +679,7 @@ The `deal_aliases` field (searchable string in Azure AI Search) contains all kno
 | `purchase_agreement` | `closing` |
 | `model`, `board_deck`, `memo`, `email`, `other` | `null` (no stage entry created) |
 
-Stage history tracked as StageEntry nodes connected to the Deal node. Deal's `current_stage` is the highest stage reached (closing > diligence > negotiation > bidding > marketing > origination).
+Stage history tracked as stage_entries rows linked to the deal. Deal's `current_stage` is the highest stage reached (closing > diligence > negotiation > bidding > marketing > origination).
 
 #### Deal Status Inference (deterministic, no LLM)
 
@@ -625,31 +694,31 @@ Recomputed on every file ingestion for the affected deal.
 
 #### Financial Metrics on Deal Nodes
 
-Key deal metrics extracted by Tier 2 from financial summary tables, IOI/LOI terms, and model output tabs. Stored as flat numeric properties on the Deal node for Cypher range queries (`WHERE d.ebitda > 50000000`). Provenance metadata (period, confidence, source_file_id) stored as a `financials_meta` JSON string property.
+Key deal metrics extracted by Tier 2 from financial summary tables, IOI/LOI terms, and model output tabs. Stored as numeric columns on the deals table for SQL range queries (`WHERE deals.ebitda > 50000000`). Provenance metadata (period, confidence, source_file_id) stored in the `financials_meta` JSONB column.
 
 **Metrics:** `revenue`, `ebitda`, `ev` (enterprise value), `ev_ebitda`, `ev_revenue`, `offer_price`, `purchase_price`, `total_debt`, `equity_value`.
 
-**Update rule:** Higher confidence replaces lower. Same confidence: more recent source_file wins. Low confidence metrics are logged but not stored on the Deal node.
+**Update rule:** Higher confidence replaces lower. Same confidence: more recent source_file wins. Low confidence metrics are logged but not stored on the deals table.
 
-#### Graph Cleanup on File Deletion / Update
+#### Entity Cleanup on File Deletion / Update
 
-Every graph edge has `source_file_ids` tracking provenance. On file deletion or update (atomic delete + re-ingest):
+Every relationship row has `source_file_ids` JSONB tracking provenance. On file deletion or update (atomic delete + re-ingest):
 
-1. Remove `file_id` from `source_file_ids` on all edges
-2. Delete edges where `source_file_ids` is now empty (no remaining evidence)
-3. Delete StageEntry nodes from this file
+1. Remove `file_id` from `source_file_ids` on all relationship rows: `UPDATE deal_companies SET source_file_ids = source_file_ids - $file_id::text WHERE source_file_ids ? $file_id` (JSONB containment)
+2. Delete relationship rows where `source_file_ids` is now empty (`source_file_ids = '[]'::jsonb`)
+3. Delete stage_entries rows from this file
 4. Recompute deal status (stage history may have changed)
 
-On file update: cleanup first, then normal ingestion with new content. Orphan Company/Person nodes (no remaining edges) are NOT deleted immediately — weekly cleanup job removes orphan nodes with `last_seen` > 90 days ago.
+On file update: cleanup first, then normal ingestion with new content. Orphan companies/people rows (no remaining relationship rows) are NOT deleted immediately — weekly cleanup job removes orphan rows with `last_seen` > 90 days ago.
 
-#### Dual-Write Consistency (Neo4j + Azure AI Search)
+#### Dual-Write Consistency (PostgreSQL + Azure AI Search)
 
-Write order: Neo4j first (entity source of truth), then Azure AI Search (denormalized chunks).
+Write order: PostgreSQL first (entity source of truth), then Azure AI Search (denormalized chunks).
 
 | Failure | Recovery |
 |---------|----------|
-| Neo4j write fails | Write chunks without entity fields. Queue file in Cosmos `retry_queue` with exponential backoff. On retry: write Neo4j, patch chunk entity fields in Azure AI Search. |
-| Azure AI Search write fails | Neo4j has entity data. Queue for retry. On retry: write chunks with entity fields from Neo4j. |
+| PostgreSQL write fails | Write chunks without entity fields. Queue file in Cosmos `retry_queue` with exponential backoff. On retry: write PostgreSQL, patch chunk entity fields in Azure AI Search. |
+| Azure AI Search write fails | PostgreSQL has entity data. Queue for retry. On retry: write chunks with entity fields from PostgreSQL. |
 
 #### Chunk vs. Document Entity Field Distinction
 
@@ -658,9 +727,9 @@ Write order: Neo4j first (entity source of truth), then Azure AI Search (denorma
 | `companies` | Tier 3 NER | Entities in THIS chunk | "Which chunks mention Goldman?" — search relevance |
 | `company_roles` | Tier 1 Haiku | Same for all chunks in document | "Chunks from deals where Goldman was advisor" — role filtering |
 | `people` | Tier 3 NER | Entities in THIS chunk | "Which chunks mention John Smith?" — search relevance |
-| `industries` | Neo4j Deal node | Same for all chunks in deal | "Chunks from healthcare deals" |
+| `industries` | PostgreSQL deals table | Same for all chunks in deal | "Chunks from healthcare deals" |
 | `deal_stage` | doc_type mapping | Per document | "Chunks from bidding-stage documents" |
-| `deal_status` | Neo4j Deal node | Same for all chunks in deal | "Chunks from active deals" |
+| `deal_status` | PostgreSQL deals table | Same for all chunks in deal | "Chunks from active deals" |
 
 ### Format-Aware Chunking
 
@@ -782,7 +851,7 @@ Multi-doc synthesis queries ("summarize our healthcare pipeline", "where do we s
 
 **Mechanism: Periodic Haiku-generated deal summaries aggregating per-document summaries.**
 
-For each `deal_id` with **≥3 indexed documents** AND a non-null `canonical_name` in the Neo4j Deal node, generate a ~400-token deal-level summary. The summary captures:
+For each `deal_id` with **≥3 indexed documents** AND a non-null `canonical_name` in the PostgreSQL deals table, generate a ~400-token deal-level summary. The summary captures:
 - Deal name (canonical + aliases) and current stage/status (as inferable from document types present)
 - Document inventory: what types of documents exist for this deal (CIM, model, teaser, LOI, etc.)
 - Key metrics mentioned across documents (EV, EBITDA, multiples, revenue)
@@ -1034,7 +1103,7 @@ Keep old index for 48h as rollback. If issues found, flip `ACTIVE_INDEX_NAME` ba
 |-------|-----------|-------|
 | Code (FastAPI + Functions) | Azure App Service deployment slots — instant swap-back | Create staging slot, deploy there, swap when validated |
 | Search index | Blue-green — flip `ACTIVE_INDEX_NAME` back to old index | Old index retained 48h |
-| Neo4j | Schema changes are additive-only in v1 (no destructive migrations) | No rollback needed |
+| PostgreSQL | Schema changes are additive-only in v1 (no destructive migrations) | No rollback needed |
 | Cosmos DB | No schema migrations — schemaless documents | No rollback needed |
 
 **Concurrent ingestion during re-indexing:**
@@ -1158,21 +1227,19 @@ Hits the FastAPI Search API backend.
 | Webhook receiver | Azure Functions HTTP Trigger |
 | Monitoring | Application Insights |
 | Secrets | Azure Key Vault |
-| Knowledge graph | **Neo4j Aura** (managed) |
+| Entity store | **Azure Database for PostgreSQL** (Flexible Server) |
 
 **External APIs:**
 - Claude API (Anthropic) — synthesis, query classification (Haiku)
 - Voyage AI API — `voyage-context-3` contextual embeddings
 - Cohere API — Rerank endpoint
-- Neo4j Aura — entity/relationship graph (bolt:// protocol, credentials in Key Vault)
+**Azure PostgreSQL (Flexible Server):**
+- Development: Burstable B1ms (~$13/mo)
+- Production: Burstable B2s (~$26/mo) — monitoring, automated backups, PITR
+- Python driver: `asyncpg` (async PostgreSQL driver, connection pooling via `asyncpg.create_pool()`)
+- All queries use parameterized SQL (injection-safe)
 
-**Neo4j Aura tiers:**
-- Development: Free tier (200K nodes, 400K relationships) — sufficient for ~100 deals, ~500 companies, ~1000 people
-- Production: Pro tier (~$65/month) — monitoring, backups, SLA
-- Python driver: `neo4j` package (official), built-in connection pooling
-- All queries use parameterized Cypher (injection-safe)
-
-**Cosmos DB scope (reduced):** Sync tokens, webhook subscriptions, conversation history, retry queue, duplicate clusters. Entity data (deals, companies, people, relationships, financials) lives in Neo4j.
+**Cosmos DB scope (reduced):** Sync tokens, webhook subscriptions, conversation history, retry queue, duplicate clusters. Entity data (deals, companies, people, relationships, financials) lives in PostgreSQL.
 
 ---
 
@@ -1180,10 +1247,10 @@ Hits the FastAPI Search API backend.
 
 Build in this order:
 
-1. **Infrastructure setup** — Azure resources + Neo4j Aura provisioning, neo4j_client.py (Neo4j driver wrapper with connection pooling), ms_graph_client.py (Microsoft Graph API client)
-2. **SharePoint/OneDrive file ingestion** — format-aware parsers (Word, Excel, PPT, PDF via Azure Doc Intelligence), doc_type/deal_id + entity extraction (two-tier: doc-level Haiku + high-value chunk Haiku + chunk-level NER), deal alias accumulation + company/person entity accumulation in Neo4j, chunking
+1. **Infrastructure setup** — Azure resources + Azure PostgreSQL provisioning, pg_client.py (PostgreSQL entity store via asyncpg), ms_graph_client.py (Microsoft Graph API client)
+2. **SharePoint/OneDrive file ingestion** — format-aware parsers (Word, Excel, PPT, PDF via Azure Doc Intelligence), doc_type/deal_id + entity extraction (two-tier: doc-level Haiku + high-value chunk Haiku + chunk-level NER), deal alias accumulation + company/person entity accumulation in PostgreSQL, chunking
 3. **Azure AI Search index** — full schema including doc_type, deal_id, deal_name, deal_aliases, companies, company_roles, people, industries, deal_stage, deal_status, recency scoring profile
-4. **Query pipeline** — classification router (regex + Haiku + entity intent), entity alias expansion via Neo4j, hybrid search with entity filters, recency boosting, Cohere rerank, entity context injection from Neo4j, Claude streaming synthesis, financial filter with fallback, cross-deal entity queries, latency instrumentation
+4. **Query pipeline** — classification router (regex + Haiku + entity intent), entity alias expansion via PostgreSQL, hybrid search with entity filters, recency boosting, Cohere rerank, entity context injection from PostgreSQL, Claude streaming synthesis, financial filter with fallback, cross-deal entity queries, latency instrumentation
 5. **Web app** — conversation history, streaming UI, source cards
 
 ---
@@ -1207,13 +1274,13 @@ Build in this order:
 13. **Embedding provenance metadata:** Ingest a test document. Verify all resulting chunks have `embedding_model`, `embedding_provider`, and `embedding_dimensions` fields populated matching the configured values (e.g., `"voyage/voyage-context-3"`, `"voyage"`, `1024`). Verify these fields are filterable in Azure AI Search (query `embedding_model eq 'voyage/voyage-context-3'` returns all chunks). Change `EMBEDDING_MODEL` config to a different value → verify newly ingested chunks reflect the new model name while existing chunks retain the old value.
 14. **Multi-doc synthesis quality:** Run multi-doc synthesis query ("summarize our active deal pipeline" or "where do we stand on healthcare deals"). Verify: response organizes information by deal (not by source chunk), includes citations per claim, flags any noted gaps or staleness. Verify `deep_search: true` in SSE stream. Verify "Searching across multiple documents..." indicator appears in frontend. Verify extended thinking is used (instrumentation logs thinking token count > 0). Verify thinking content is NOT streamed to user. Measure TTFT separately for multi-doc queries — confirm p95 < 5s.
 15. **Deal summary chunks:** After bulk ingestion, verify `deal_summary` chunks exist for deals with ≥3 documents and a non-null `canonical_name`. Verify `chunk_type: "deal_summary"`, `deal_id` populated, `deal_name` set to canonical name, and `deal_aliases` contains all known name variants. Verify synthetic `file_id` format (`deal_summary_{deal_id}`). Query for a deal pipeline overview → verify deal summary chunks appear in retrieval candidates. Verify deals with <3 documents have no `deal_summary` chunk. Verify deals with `deal_id` but null `canonical_name` (non-deal subfolders) have no `deal_summary` chunk. Update a constituent document → verify deal summary regenerated within 6h periodic refresh. Verify deal summary debounce: rapid multi-file ingestion for same deal → single regeneration after 5-minute quiet period.
-16. **Deal alias accumulation (Neo4j):** Ingest two files in the same deal subfolder — one with code name "Project Atlas" and one with real company name "Acme Corp" (with a more recent `last_modified`). Verify: Neo4j Deal node has `aliases: ["Project Atlas", "Acme Corp"]` and `canonical_name: "Acme Corp"`. Verify all chunks for both files have `deal_name: "Acme Corp"` (canonical, not per-file). Verify `deal_aliases` contains both names. Query for "Project Atlas" → verify chunks surface via `deal_aliases` BM25 match despite `deal_name` being "Acme Corp". Ingest a third file with a newer `last_modified` that Haiku tags with a new name variant → verify `canonical_name` updates and all existing chunks for that `deal_id` are batch-updated with the new `deal_name`. Verify files not in a deal root subfolder ("Banking - General" or "Private Equity - General") get `deal_id: null`. Verify files at the root of a deal root folder (not in a subfolder) get `deal_id: null`.
+16. **Deal alias accumulation (PostgreSQL):** Ingest two files in the same deal subfolder — one with code name "Project Atlas" and one with real company name "Acme Corp" (with a more recent `last_modified`). Verify: PostgreSQL deals table has `canonical_name: "Acme Corp"` and deal_aliases table contains both "Project Atlas" and "Acme Corp". Verify all chunks for both files have `deal_name: "Acme Corp"` (canonical, not per-file). Verify `deal_aliases` contains both names. Query for "Project Atlas" → verify chunks surface via `deal_aliases` BM25 match despite `deal_name` being "Acme Corp". Ingest a third file with a newer `last_modified` that Haiku tags with a new name variant → verify `canonical_name` updates and all existing chunks for that `deal_id` are batch-updated with the new `deal_name`. Verify files not in a deal root subfolder ("Banking - General" or "Private Equity - General") get `deal_id: null`. Verify files at the root of a deal root folder (not in a subfolder) get `deal_id: null`.
 17. **Entity extraction accuracy:** Ingest 50 representative docs (CIMs, engagement letters, IOIs, teasers, process letters). Verify: company names + roles at ≥85% precision (Tier 1), industries at ≥90%, financial metrics at ≥80% (Tier 2), people at ≥85% from structured sections (Tier 2). Verify Tier 3 NER catches company/person mentions in chunks at ≥75% recall.
-18. **Knowledge graph integrity:** After ingesting all docs for a deal, verify: Deal node has correct aliases, canonical_name, stage_history (StageEntry nodes), financials, deal_status. Company nodes have correct aliases, linked with correct relationship types and engagement levels. Person nodes linked to companies (EXECUTIVE_AT) and deals (APPEARED_IN). No duplicate nodes (normalization working). All edges have `source_file_ids` populated.
-19. **Entity-aware queries:** Test: "healthcare deals" → chunks filtered by `industries` → only healthcare deal chunks returned. "Deals where we advised the seller" → chunks filtered by `company_roles` containing `advisor:Berenson`. "What has Goldman worked on with us" → Neo4j alias expansion catches all name variants → entity context shows Goldman's deal history. "Who has shown consistent interest on space tech deals" → Neo4j cross-deal query returns companies with ≥2 POTENTIAL_ACQUIRER edges to space_tech deals → Claude synthesizes buyer patterns.
-20. **Financial queries:** "Deals with EBITDA over $50M" → Python parses constraint → Neo4j returns matching deal_ids → chunks filtered. Financial filter fallback: query with very restrictive constraint (EBITDA > $1B) → <3 results → retry without filter → results returned with relaxation note. "What was the multiple on Atlas?" → entity context includes EV/EBITDA from Deal node with source citation.
-21. **Temporal/status queries:** "What deals are currently active?" → `deal_status = 'active'` filter. "What's our pipeline?" → Neo4j returns all active deals with entity context. "When did Atlas move to bidding?" → StageEntry query returns bidding entry with date.
-22. **Graph traversal queries:** "Who was the CEO of the Acme target?" → Person -[:EXECUTIVE_AT]-> Company -[:TARGET_OF]-> Deal traversal returns result. "Which PE firms have been active acquirers?" → POTENTIAL_ACQUIRER edges across multiple deals, grouped by company.
-23. **File deletion / graph cleanup:** Delete a file. Verify: edges with only this file's ID in `source_file_ids` are deleted. Edges with multiple source files retain the remaining file IDs. StageEntry from this file's doc_type is removed. Deal status is recomputed correctly.
-24. **Dual-write consistency:** Simulate Neo4j failure during ingestion → chunks written without entity fields → verify retry queue picks up → on retry, Neo4j + Azure AI Search both updated correctly. Simulate Azure AI Search failure → Neo4j has entity data → retry writes chunks with correct entity fields.
-25. **Entity extraction noise handling:** Ingest doc with ambiguous company mentions (e.g., comp table company names). Verify low-confidence entities don't create Neo4j nodes. Ingest doc with financial data in a comp table (NOT the target's financials). Verify comp metrics don't overwrite target's financials on the Deal node.
+18. **Entity store integrity:** After ingesting all docs for a deal, verify: deals row has correct canonical_name, deal_aliases contain all variants, stage_entries rows track stage history, financials columns populated, deal_status correct. companies rows have correct aliases, linked via deal_companies with correct relationship types and engagement levels. people rows linked to companies (company_people) and deals (deal_people). No duplicate rows (normalization working). All relationship rows have `source_file_ids` populated.
+19. **Entity-aware queries:** Test: "healthcare deals" → chunks filtered by `industries` → only healthcare deal chunks returned. "Deals where we advised the seller" → chunks filtered by `company_roles` containing `advisor:Berenson`. "What has Goldman worked on with us" → PostgreSQL alias expansion catches all name variants → entity context shows Goldman's deal history. "Who has shown consistent interest on space tech deals" → PostgreSQL cross-deal query returns companies with ≥2 `potential_acquirer` relationship rows to space_tech deals → Claude synthesizes buyer patterns.
+20. **Financial queries:** "Deals with EBITDA over $50M" → Python parses constraint → PostgreSQL returns matching deal_ids → chunks filtered. Financial filter fallback: query with very restrictive constraint (EBITDA > $1B) → <3 results → retry without filter → results returned with relaxation note. "What was the multiple on Atlas?" → entity context includes EV/EBITDA from Deal node with source citation.
+21. **Temporal/status queries:** "What deals are currently active?" → `deal_status = 'active'` filter. "What's our pipeline?" → PostgreSQL returns all active deals with entity context. "When did Atlas move to bidding?" → StageEntry query returns bidding entry with date.
+22. **Entity relationship queries:** "Who was the CEO of the Acme target?" → JOIN company_people → deal_companies WHERE relationship_type = 'target' returns result. "Which PE firms have been active acquirers?" → `potential_acquirer` relationship rows across multiple deals, grouped by company.
+23. **File deletion / entity cleanup:** Delete a file. Verify: relationship rows with only this file's ID in `source_file_ids` are deleted. Rows with multiple source files retain the remaining file IDs. stage_entries row from this file's doc_type is removed. Deal status is recomputed correctly.
+24. **Dual-write consistency:** Simulate PostgreSQL failure during ingestion → chunks written without entity fields → verify retry queue picks up → on retry, PostgreSQL + Azure AI Search both updated correctly. Simulate Azure AI Search failure → PostgreSQL has entity data → retry writes chunks with correct entity fields.
+25. **Entity extraction noise handling:** Ingest doc with ambiguous company mentions (e.g., comp table company names). Verify low-confidence entities don't create PostgreSQL entity rows. Ingest doc with financial data in a comp table (NOT the target's financials). Verify comp metrics don't overwrite target's financials on the deals table.

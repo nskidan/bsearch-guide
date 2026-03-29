@@ -122,7 +122,7 @@ flowchart LR
       </tr>
       <tr>
         <td><strong>Azure Key Vault</strong></td>
-        <td>Stores API keys and secrets securely &mdash; Voyage AI, Cohere, Anthropic, Graph API credentials, Neo4j credentials, Cosmos connection strings</td>
+        <td>Stores API keys and secrets securely &mdash; Voyage AI, Cohere, Anthropic, Graph API credentials, PostgreSQL connection string, Cosmos connection strings</td>
         <td>Azure-native secrets management. No API keys stored in code or environment variables &mdash; App Service and Functions access secrets via Key Vault references</td>
       </tr>
       <tr>
@@ -131,20 +131,20 @@ flowchart LR
         <td>Alerts on degradation (e.g., embedding fallback rate &gt;10%, Cohere outage), powers the query flight recorder for debugging result quality</td>
       </tr>
       <tr>
-        <td><strong>Neo4j Aura</strong></td>
-        <td>Knowledge graph &mdash; stores relationships between deals, companies, people, financials, and deal stage history</td>
-        <td>Purpose-built graph database for traversing entity relationships (e.g., &ldquo;which deals involved Company X as a target?&rdquo;). Free tier for dev, ~$65/mo Pro for production with monitoring, backups, and SLA</td>
+        <td><strong>Azure Database for PostgreSQL</strong> (Flexible Server)</td>
+        <td>Entity store &mdash; stores deals, companies, people, relationships, financials, and deal stage history in relational tables with JSONB provenance metadata</td>
+        <td>Relational database with JSONB support for structured entity queries and relationship tracking. Burstable B1ms for dev (~$13/mo), B2s for production (~$26/mo) with continuous backups and point-in-time recovery</td>
       </tr>
     </tbody>
   </table>
 
   <div class="definition">
-    <p><span class="term">Knowledge graph:</span> A database that stores <em>things</em> (deals, companies, people) and the <em>relationships</em> between them. Unlike a spreadsheet where data lives in rows, a knowledge graph represents connections: Company A was the target in Deal B, which was advised by Person C. This makes relationship-traversal questions (&ldquo;who are the contacts on deals above $50M EBITDA?&rdquo;) fast and natural to answer.</p>
+    <p><span class="term">Entity store:</span> A dedicated PostgreSQL database that stores structured information about deals, companies, people, and the relationships between them. While the search index stores document chunks for retrieval, the entity store tracks higher-level facts: Company A was the target in Deal B, which was advised by Person C. Relationship tables with JSONB provenance metadata make cross-entity queries (&ldquo;who are the contacts on deals above $50M EBITDA?&rdquo;) fast and reliable.</p>
   </div>
 
   <div class="callout ib-analogy">
     <div class="callout-title">IB Analogy</div>
-    <p>The knowledge graph is like the firm&rsquo;s deal tracker combined with its contact database &mdash; but connected. Instead of flipping between a deal log and a CRM to figure out which people were on which deals for which companies, the graph stores all those connections in one place and can traverse them instantly.</p>
+    <p>The entity store is like the firm&rsquo;s deal tracker combined with its contact database &mdash; but connected. Instead of flipping between a deal log and a CRM to figure out which people were on which deals for which companies, the entity store keeps all those connections in one place and can query across them instantly.</p>
   </div>
 
   <!-- ============================================================ -->
@@ -231,7 +231,7 @@ flowchart TB
 
     subgraph Storage["Data Stores"]
         AIS["Azure AI Search\n(search index)"]
-        NEO["Neo4j Aura\n(knowledge graph)"]
+        NEO["Azure PostgreSQL\n(entity store)"]
         COSMOS["Cosmos DB\n(conversations,\nsync state)"]
     end
 
@@ -286,7 +286,7 @@ flowchart TB
   <!-- ============================================================ -->
   <h2><span class="section-number">2.6</span> Monthly Cost Breakdown</h2>
 
-  <p>BSearch&rsquo;s ongoing monthly cost is roughly <strong>$395&ndash;510</strong> at current usage (18 users, 50&ndash;200 queries/day). The largest fixed expense is the search index. AI API costs are modest at this scale &mdash; the per-query costs are fractions of a cent.</p>
+  <p>BSearch&rsquo;s ongoing monthly cost is roughly <strong>$343&ndash;471</strong> at current usage (18 users, 50&ndash;200 queries/day). The largest fixed expense is the search index. AI API costs are modest at this scale &mdash; the per-query costs are fractions of a cent.</p>
 
   <table>
     <thead>
@@ -303,9 +303,9 @@ flowchart TB
         <td>Fixed monthly fee regardless of usage &mdash; the single largest expense</td>
       </tr>
       <tr>
-        <td>Neo4j Aura Pro</td>
-        <td>~$65</td>
-        <td>Production tier with monitoring, daily backups, SLA</td>
+        <td>Azure PostgreSQL (B2s)</td>
+        <td>~$13&ndash;26</td>
+        <td>Burstable tier with continuous backups and point-in-time recovery</td>
       </tr>
       <tr>
         <td>Claude Sonnet (synthesis)</td>
@@ -361,7 +361,7 @@ flowchart TB
     <tfoot>
       <tr>
         <td><strong>Total ongoing</strong></td>
-        <td><strong>~$395&ndash;510</strong></td>
+        <td><strong>~$343&ndash;471</strong></td>
         <td></td>
       </tr>
     </tfoot>
@@ -404,7 +404,7 @@ flowchart TB
     <tbody>
       <tr>
         <td><code>src/shared/</code></td>
-        <td>Configuration, Pydantic data models, the Microsoft Graph API client, the health-check base class, and the embedding provider abstraction &mdash; code used by both pipelines</td>
+        <td>Configuration, Pydantic data models, the Microsoft Graph API client, the health-check base class, and provider abstractions (embedding, reranker, synthesis) &mdash; code used by both pipelines</td>
         <td>Python</td>
       </tr>
       <tr>
@@ -439,14 +439,14 @@ flowchart TB
     <p><span class="term">Bicep:</span> Azure&rsquo;s language for defining cloud infrastructure as code. Instead of clicking through the Azure portal to create a database or a web server, you write a template file that describes what you want. Running the template creates or updates the resources automatically and reproducibly &mdash; like a recipe rather than cooking from memory.</p>
   </div>
 
-  <p>The key architectural benefit of this layout is the <code>src/shared/</code> directory. Both the ingestion pipeline and the query API import from it, which means changes to shared models, configuration, or the embedding provider abstraction are automatically consistent across both pipelines. There is one definition of what a &ldquo;chunk&rdquo; looks like, one configuration schema, one Graph API client.</p>
+  <p>The key architectural benefit of this layout is the <code>src/shared/</code> directory. Both the ingestion pipeline and the query API import from it, which means changes to shared models, configuration, or provider abstractions (embedding, reranker, synthesis) are automatically consistent across both pipelines. There is one definition of what a &ldquo;chunk&rdquo; looks like, one configuration schema, one Graph API client.</p>
 
   <!-- ============================================================ -->
   <!-- Key Takeaway -->
   <!-- ============================================================ -->
   <div class="key-takeaway">
     <div class="callout-title">Key Takeaway</div>
-    <p>BSearch&rsquo;s architecture is two pipelines connected by a search index, supported by a knowledge graph. The <strong>ingestion pipeline</strong> (Durable Functions) continuously processes documents from SharePoint into searchable, AI-ready chunks. The <strong>query pipeline</strong> (FastAPI on App Service B2) classifies questions, searches the index, reranks results, enriches them with entity context from Neo4j, and streams AI-synthesized answers via Claude. Five external AI services each handle one job &mdash; embeddings (Voyage), reranking (Cohere), synthesis (Claude Sonnet), classification (Claude Haiku), and file access (Microsoft Graph). The embedding provider is abstracted so it can be swapped without pipeline changes. Total ongoing cost is <strong>$395&ndash;510/month</strong> for 18 users, with the search index as the largest fixed expense.</p>
+    <p>BSearch&rsquo;s architecture is two pipelines connected by a search index, supported by an entity store. The <strong>ingestion pipeline</strong> (Durable Functions) continuously processes documents from SharePoint into searchable, AI-ready chunks. The <strong>query pipeline</strong> (FastAPI on App Service B2) classifies questions, searches the index, reranks results, enriches them with entity context from PostgreSQL, and streams AI-synthesized answers via Claude. Five external AI services each handle one job &mdash; embeddings (Voyage), reranking (Cohere), synthesis (Claude Sonnet), classification (Claude Haiku), and file access (Microsoft Graph). The embedding provider is abstracted so it can be swapped without pipeline changes. Total ongoing cost is <strong>$343&ndash;471/month</strong> for 18 users, with the search index as the largest fixed expense.</p>
   </div>
 
   <nav class="chapter-nav bottom">

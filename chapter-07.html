@@ -58,7 +58,7 @@
         <td>Results still appear; slightly lower recall on queries phrased differently from document text</td>
       </tr>
       <tr class="failure-silent">
-        <td><strong>Neo4j timeout</strong> (at query time)</td>
+        <td><strong>PostgreSQL timeout</strong> (at query time)</td>
         <td>Search proceeds without entity filters, alias expansion, or deal context</td>
         <td>Results still appear; entity-based features temporarily unavailable</td>
       </tr>
@@ -234,9 +234,9 @@
     <p><span class="term">Pessimistic Initialization</span> &mdash; A startup strategy where the system assumes all external services are down until proven otherwise. The opposite of optimistic (assuming everything works until it fails).</p>
   </div>
 
-  <p>When BSearch starts up &mdash; after a deployment, a restart, or an infrastructure event &mdash; it does not assume that the Cohere reranker, Voyage AI embeddings, or Neo4j are available. All three are marked as <strong>unhealthy</strong> by default.</p>
+  <p>When BSearch starts up &mdash; after a deployment, a restart, or an infrastructure event &mdash; it does not assume that the Cohere reranker, Voyage AI embeddings, or PostgreSQL are available. All three are marked as <strong>unhealthy</strong> by default.</p>
 
-  <p>The first health check cycle runs immediately on startup, not after the first 60-second interval. Each service is only marked healthy after its first successful ping. Until that happens, BSearch operates in degraded mode for that service: BM25-only search (if Voyage AI has not yet been verified), no reranking (if Cohere has not responded), and no entity enrichment (if Neo4j has not confirmed availability).</p>
+  <p>The first health check cycle runs immediately on startup, not after the first 60-second interval. Each service is only marked healthy after its first successful ping. Until that happens, BSearch operates in degraded mode for that service: BM25-only search (if Voyage AI has not yet been verified), no reranking (if Cohere has not responded), and no entity enrichment (if PostgreSQL has not confirmed availability).</p>
 
   <h3>Why this matters</h3>
   <p>Without pessimistic initialization, there is a brief window after startup where BSearch would try to use services that may not be ready yet. If the reranker happens to be down during a deployment, a user querying in that first minute could get silently degraded results with no warning. Pessimistic initialization closes that gap: the system starts in its safest mode and upgrades to full capability only after verifying each dependency.</p>
@@ -253,8 +253,8 @@
 
   <p>When a service goes down, how does BSearch get back to normal? Here are the specific recovery paths for each major failure scenario.</p>
 
-  <h3>Neo4j goes down</h3>
-  <p>Entity filters, alias expansion, and deal context become unavailable. But search still works &mdash; it just operates without graph intelligence. Queries degrade gracefully to text-only search: you can still find documents by content, but questions like &ldquo;deals where Goldman was the advisor&rdquo; or &ldquo;what has PE Fund X looked at?&rdquo; will not work until Neo4j recovers. When it comes back online, the health check detects recovery within 60 seconds, and full capability restores automatically. No manual steps needed.</p>
+  <h3>PostgreSQL goes down</h3>
+  <p>Entity filters, alias expansion, and deal context become unavailable. But search still works &mdash; it just operates without entity intelligence. Queries degrade gracefully to document-only search: you can still find documents by content, but questions like &ldquo;deals where Goldman was the advisor&rdquo; or &ldquo;what has PE Fund X looked at?&rdquo; will not work until PostgreSQL recovers. When it comes back online, the health check detects recovery within 60 seconds, and full capability restores automatically. No manual steps needed.</p>
 
   <h3>Azure Search returns 503</h3>
   <p>This is a hard failure with no workaround. The search index <em>is</em> the search engine &mdash; without it, there is nothing to search. BSearch shows the &ldquo;service temporarily unavailable&rdquo; page. Behind the scenes, auto-retry with exponential backoff attempts to reconnect. Once Azure Search is reachable again, the next query works normally.</p>
@@ -305,7 +305,7 @@
 
   <div class="key-takeaway">
     <div class="callout-title">Key Takeaway</div>
-    <p>BSearch is designed to bend, not break. The majority of failures are invisible and self-healing. The few that are visible are clearly communicated with banners. Even in the worst realistic scenario &mdash; embedding service down, reranker down, Neo4j unreachable &mdash; BSearch still returns results. They come from BM25 keyword matching with Azure Search&rsquo;s default ranking and no entity enrichment. That is a meaningfully worse experience than the full pipeline, but it still works. The floor is never zero.</p>
+    <p>BSearch is designed to bend, not break. The majority of failures are invisible and self-healing. The few that are visible are clearly communicated with banners. Even in the worst realistic scenario &mdash; embedding service down, reranker down, PostgreSQL unreachable &mdash; BSearch still returns results. They come from BM25 keyword matching with Azure Search&rsquo;s default ranking and no entity enrichment. That is a meaningfully worse experience than the full pipeline, but it still works. The floor is never zero.</p>
   </div>
 
   <nav class="chapter-nav bottom">

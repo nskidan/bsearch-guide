@@ -31,9 +31,9 @@
 
   <p>This phase builds BSearch&rsquo;s document processing engine &mdash; the code that takes a raw file from SharePoint, reads its contents, and produces the structured, searchable chunks that feed the search index. Every search result BSearch returns traces back to a chunk created by this pipeline. If the parsers miss content or the chunker splits in the wrong places, search quality degrades no matter how good the embedding model or the reranker is.</p>
 
-  <p>The work falls into five areas: <strong>format-aware parsers</strong> that extract content from Word, Excel, PowerPoint, and PDF files while preserving document structure; a <strong>chunking engine</strong> that splits content into 800&ndash;1000 token pieces at logical boundaries; a <strong>hierarchical table splitter</strong> for large financial tables; <strong>summary generation</strong> at both the document and deal level; and <strong>metadata and entity extraction</strong> that classifies documents, identifies companies and people, and populates the knowledge graph.</p>
+  <p>The work falls into five areas: <strong>format-aware parsers</strong> that extract content from Word, Excel, PowerPoint, and PDF files while preserving document structure; a <strong>chunking engine</strong> that splits content into 800&ndash;1000 token pieces at logical boundaries; a <strong>hierarchical table splitter</strong> for large financial tables; <strong>summary generation</strong> at both the document and deal level; and <strong>metadata and entity extraction</strong> that classifies documents, identifies companies and people, and populates the entity store.</p>
 
-  <p>This is the most technically dense phase. It touches four file format libraries, an Azure AI service, an LLM (Haiku), a graph database (Neo4j), and a set of regex-based NER heuristics. But the output is straightforward: for every file BSearch processes, this code produces a list of chunks ready to be embedded and indexed.</p>
+  <p>This is the most technically dense phase. It touches four file format libraries, an Azure AI service, an LLM (Haiku), a relational database (PostgreSQL), and a set of regex-based NER heuristics. But the output is straightforward: for every file BSearch processes, this code produces a list of chunks ready to be embedded and indexed.</p>
 
   <!-- ================================================================ -->
   <!-- 9.2 Before You Start -->
@@ -46,9 +46,9 @@
       <li><strong>Phase 1 complete.</strong> Monorepo structure in place, Pydantic config working, Bicep templates deployed. You need the <code>src/ingestion/</code> directory and the shared config module.</li>
       <li><strong>Sample documents for each format.</strong> Get at least one Word document, one Excel model, one PowerPoint deck, and one PDF from a real deal folder. These should contain tables, headings, and multi-section content &mdash; not empty templates. Put them in <code>tests/fixtures/</code>.</li>
       <li><strong>Azure Document Intelligence resource provisioned.</strong> This is Azure&rsquo;s PDF parsing service (formerly called Form Recognizer). It uses AI to understand document layout &mdash; headers, paragraphs, tables, reading order &mdash; rather than just extracting raw text. Provision an S0 tier instance in the Azure portal and store the endpoint and key in your <code>.env</code> file. The free tier works for development but has a 2-page-per-minute rate limit.</li>
-      <li><strong>Neo4j Aura instance running.</strong> The Free tier is sufficient for development. You need the connection URI, username, and password in your <code>.env</code>. The knowledge graph stores deal entities, company relationships, and financial metrics extracted during ingestion.</li>
+      <li><strong>PostgreSQL instance running.</strong> A local or managed instance is sufficient for development. You need the connection string in your <code>.env</code>. The entity store holds deal entities, company relationships, and financial metrics extracted during ingestion.</li>
       <li><strong>Anthropic API key configured.</strong> Haiku is used for document summaries, entity extraction, and doc_type classification fallback. Add <code>ANTHROPIC_API_KEY</code> to your <code>.env</code>.</li>
-      <li><strong>Python dependencies installed.</strong> This phase requires <code>python-docx</code>, <code>openpyxl</code>, <code>python-pptx</code>, <code>azure-ai-formrecognizer</code>, <code>neo4j</code>, and <code>anthropic</code>. These should already be in your <code>pyproject.toml</code> from Phase 1.</li>
+      <li><strong>Python dependencies installed.</strong> This phase requires <code>python-docx</code>, <code>openpyxl</code>, <code>python-pptx</code>, <code>azure-ai-formrecognizer</code>, <code>asyncpg</code>, and <code>anthropic</code>. These should already be in your <code>pyproject.toml</code> from Phase 1.</li>
     </ul>
   </div>
 
@@ -345,7 +345,7 @@ class BaseParser(ABC):
       </tr>
       <tr>
         <td>Input</td>
-        <td>All <code>doc_summary</code> chunks for the deal + entity context from Neo4j</td>
+        <td>All <code>doc_summary</code> chunks for the deal + entity context from PostgreSQL</td>
       </tr>
       <tr>
         <td>Output</td>
@@ -441,28 +441,28 @@ class BaseParser(ABC):
         <td>Haiku (1 call/doc)</td>
         <td>Document-level</td>
         <td>Companies with roles and confidence, primary industry, deal name, doc_type</td>
-        <td>Neo4j (Deal, Company nodes, relationships)</td>
+        <td>PostgreSQL (deals, companies tables, relationships)</td>
       </tr>
       <tr>
         <td><strong>Tier 2</strong></td>
         <td>Haiku (selective)</td>
         <td>High-value chunks</td>
         <td>Financial metrics (revenue, EBITDA, EV, multiples), people with titles, additional company relationships</td>
-        <td>Neo4j (financial metrics on Deal, Person nodes, additional edges)</td>
+        <td>PostgreSQL (financial metrics on deals, people tables, additional relationships)</td>
       </tr>
       <tr>
         <td><strong>Tier 3</strong></td>
         <td>Regex / heuristics</td>
         <td>Every chunk</td>
         <td>Company name mentions, person name mentions, dollar amounts, percentages, dates</td>
-        <td>Azure AI Search chunk fields only (NOT Neo4j)</td>
+        <td>Azure AI Search chunk fields only (NOT PostgreSQL)</td>
       </tr>
     </tbody>
   </table>
 
   <h4>Tier 1 &mdash; Document-Level Haiku Extraction</h4>
 
-  <p>One Haiku call per document, using the first ~1000 tokens. Extracts the document type, deal name, primary companies with roles (<code>target</code>, <code>acquirer</code>, <code>advisor</code>, <code>lender</code>, <code>other</code>) and confidence levels (<code>high</code>, <code>medium</code>, <code>low</code>), and industry classification. Only high and medium confidence entities are written to Neo4j; low confidence entities populate chunk-level fields only.</p>
+  <p>One Haiku call per document, using the first ~1000 tokens. Extracts the document type, deal name, primary companies with roles (<code>target</code>, <code>acquirer</code>, <code>advisor</code>, <code>lender</code>, <code>other</code>) and confidence levels (<code>high</code>, <code>medium</code>, <code>low</code>), and industry classification. Only high and medium confidence entities are written to PostgreSQL; low confidence entities populate chunk-level fields only.</p>
 
   <h4>Tier 2 &mdash; High-Value Chunk Extraction</h4>
 
@@ -479,7 +479,7 @@ class BaseParser(ABC):
 
   <h4>Tier 3 &mdash; Local NER (No API Calls)</h4>
 
-  <p>Every chunk gets lightweight named entity recognition via regex and heuristics. Company names are detected by matching capitalized multi-word phrases followed by entity suffixes (Inc, Corp, LLC, Ltd, Partners, Capital, Group, Holdings). Person names are detected in structured contexts (after Mr./Ms./Dr., in &ldquo;Name, Title&rdquo; patterns). A cached set of known entity names from Neo4j improves recall &mdash; the cache is refreshed at the start of each ingestion batch.</p>
+  <p>Every chunk gets lightweight named entity recognition via regex and heuristics. Company names are detected by matching capitalized multi-word phrases followed by entity suffixes (Inc, Corp, LLC, Ltd, Partners, Capital, Group, Holdings). Person names are detected in structured contexts (after Mr./Ms./Dr., in &ldquo;Name, Title&rdquo; patterns). A cached set of known entity names from PostgreSQL improves recall &mdash; the cache is refreshed at the start of each ingestion batch.</p>
 
   <div class="callout info">
     <div class="callout-title">Why Three Tiers?</div>
@@ -487,17 +487,17 @@ class BaseParser(ABC):
   </div>
 
   <!-- ================================================================ -->
-  <!-- 9.7 The Spec — Deal Registry & Knowledge Graph -->
+  <!-- 9.7 The Spec — Deal Registry & Entity Store -->
   <!-- ================================================================ -->
-  <h2><span class="section-number">9.7</span> The Spec &mdash; Deal Registry &amp; Knowledge Graph</h2>
+  <h2><span class="section-number">9.7</span> The Spec &mdash; Deal Registry &amp; Entity Store</h2>
 
   <h3>Deal Alias Accumulation</h3>
 
-  <p>Investment banking deals always have multiple names: a code name (&ldquo;Project Atlas&rdquo;) in early documents and the real company name (&ldquo;Acme Corp&rdquo;) in later ones. BSearch handles this through alias accumulation in Neo4j. The Neo4j Deal node stores an <code>aliases</code> array and a <code>canonical_name</code>. Every time a file is ingested:</p>
+  <p>Investment banking deals always have multiple names: a code name (&ldquo;Project Atlas&rdquo;) in early documents and the real company name (&ldquo;Acme Corp&rdquo;) in later ones. BSearch handles this through alias accumulation in PostgreSQL. The <code>deals</code> table stores a <code>canonical_name</code>, and a separate <code>deal_aliases</code> table stores all known name variants. Every time a file is ingested:</p>
 
   <ol>
     <li>Haiku extracts a per-file deal name from the filename and content.</li>
-    <li>If the name is new (not already in <code>aliases</code>), it is appended via Cypher <code>MERGE</code>.</li>
+    <li>If the name is new, it is inserted via <code>INSERT INTO deal_aliases ... ON CONFLICT DO NOTHING</code>.</li>
     <li>If this file has the most recent <code>last_modified</code> timestamp, the <code>canonical_name</code> is updated. This naturally converges to the &ldquo;real&rdquo; company name as deals progress from code-name documents to formal ones.</li>
   </ol>
 
@@ -505,7 +505,7 @@ class BaseParser(ABC):
 
   <h3>Company Name Normalization</h3>
 
-  <p>Company nodes use a <code>normalized_name</code> as the <code>MERGE</code> key: lowercase, with suffixes stripped (Inc., Corp., LLC, Ltd., &amp; Co., Group, Holdings, International, Advisors, Partners, Capital). This prevents &ldquo;Goldman Sachs,&rdquo; &ldquo;Goldman Sachs &amp; Co.,&rdquo; and &ldquo;Goldman Sachs Group, Inc.&rdquo; from becoming separate nodes.</p>
+  <p>Company rows use <code>normalized_name</code> as the primary key: lowercase, with suffixes stripped (Inc., Corp., LLC, Ltd., &amp; Co., Group, Holdings, International, Advisors, Partners, Capital). This prevents &ldquo;Goldman Sachs,&rdquo; &ldquo;Goldman Sachs &amp; Co.,&rdquo; and &ldquo;Goldman Sachs Group, Inc.&rdquo; from becoming separate rows. New companies are inserted via <code>INSERT ... ON CONFLICT DO UPDATE</code>.</p>
 
   <h3>Deal Stage Inference</h3>
 
@@ -529,7 +529,7 @@ class BaseParser(ABC):
     </tbody>
   </table>
 
-  <p>The deal&rsquo;s <code>current_stage</code> is always the <em>highest</em> stage reached. Stage history is tracked as <code>StageEntry</code> nodes connected to the Deal node in Neo4j.</p>
+  <p>The deal&rsquo;s <code>current_stage</code> is always the <em>highest</em> stage reached. Stage history is tracked as rows in the <code>deal_stage_history</code> table linked to the deal by <code>deal_id</code>.</p>
 
   <h3>Deal Status Inference</h3>
 
@@ -569,15 +569,15 @@ class BaseParser(ABC):
 ├── doc_summary.py        # Haiku document summary generation
 ├── deal_summary.py       # Deal-level summary generation (periodic + event-triggered)
 ├── metadata.py           # doc_type classification + deal_id + entity extraction
-├── deal_registry.py      # Neo4j deal alias accumulation + canonical name resolution
-├── entity_registry.py    # Company + person entity writes to Neo4j
-├── graph_cleanup.py      # File deletion/update: remove provenance, delete orphans
+├── deal_registry.py      # PostgreSQL deal alias accumulation + canonical name resolution
+├── entity_registry.py    # Company + person entity writes to PostgreSQL
+├── entity_cleanup.py     # File deletion/update: remove provenance, delete orphans
 ├── pdf_dedup.py          # Skip PDFs with matching Office files
 ├── embeddings.py         # Voyage AI embedding provider abstraction
 └── __init__.py
 
 src/shared/
-├── neo4j_client.py       # Neo4j driver wrapper: Deal/Company/Person CRUD
+├── pg_client.py          # PostgreSQL client wrapper (asyncpg): Deal/Company/Person CRUD
 ├── ner.py                # Lightweight chunk-level NER (Tier 3, regex only)
 └── prompts/
     ├── doc_summary.txt   # Document summary prompt template
@@ -595,10 +595,10 @@ tests/
 ├── test_pdf_dedup.py
 ├── test_metadata.py
 ├── test_chunking.py
-├── test_neo4j_client.py
+├── test_pg_client.py
 ├── test_ner.py
 ├── test_entity_registry.py
-├── test_graph_cleanup.py
+├── test_entity_cleanup.py
 └── fixtures/
     ├── sample.docx               # With headings, tables, paragraphs
     ├── sample.xlsx               # Multiple sheets, formulas, headers
@@ -633,9 +633,9 @@ tests/
     <div class="prompt-label">Prompt 3 &mdash; Summaries, Metadata &amp; Entity Extraction</div>
     <div class="prompt-text">Add document and deal summary generation, metadata extraction, and entity extraction to BSearch.<br><br>
     <strong>Doc summaries</strong> (<code>src/ingestion/doc_summary.py</code>): for documents producing &ge;4 chunks, call Haiku with the first 2000 tokens to generate a ~200-token summary. Index as <code>chunk_type: "doc_summary"</code>, <code>chunk_index: -1</code>. Load prompt from <code>src/shared/prompts/doc_summary.txt</code>. 5s timeout, log and skip on failure.<br><br>
-    <strong>Deal summaries</strong> (<code>src/ingestion/deal_summary.py</code>): for deals with &ge;3 docs and non-null canonical_name, generate ~400-token deal overview using all doc_summary chunks + Neo4j entity context. Index as <code>chunk_type: "deal_summary"</code>. Debounce webhook-triggered regeneration with a 5-minute consolidation window via Cosmos DB. Periodic refresh every 6 hours. 8s timeout.<br><br>
+    <strong>Deal summaries</strong> (<code>src/ingestion/deal_summary.py</code>): for deals with &ge;3 docs and non-null canonical_name, generate ~400-token deal overview using all doc_summary chunks + PostgreSQL entity context. Index as <code>chunk_type: "deal_summary"</code>. Debounce webhook-triggered regeneration with a 5-minute consolidation window via Cosmos DB. Periodic refresh every 6 hours. 8s timeout.<br><br>
     <strong>Metadata</strong> (<code>src/ingestion/metadata.py</code>): classify doc_type via filename regex patterns with Haiku fallback. Compute deal_id as SHA-256 hash of first-level subfolder under deal root folders. Extract deal_name per-file via regex + Haiku.<br><br>
-    <strong>Entity extraction</strong>: Tier 1 doc-level Haiku (companies with roles/confidence, industry). Tier 2 selective Haiku on financial table chunks, people sections, IOI/LOI chunks. Tier 3 regex NER in <code>src/shared/ner.py</code> (company suffixes, person patterns, cached known entities from Neo4j). Write entities to Neo4j via <code>src/ingestion/entity_registry.py</code> and <code>src/ingestion/deal_registry.py</code> using MERGE for alias accumulation. Build <code>src/shared/neo4j_client.py</code> as the Neo4j driver wrapper with Deal/Company/Person CRUD.</div>
+    <strong>Entity extraction</strong>: Tier 1 doc-level Haiku (companies with roles/confidence, industry). Tier 2 selective Haiku on financial table chunks, people sections, IOI/LOI chunks. Tier 3 regex NER in <code>src/shared/ner.py</code> (company suffixes, person patterns, cached known entities from PostgreSQL). Write entities to PostgreSQL via <code>src/ingestion/entity_registry.py</code> and <code>src/ingestion/deal_registry.py</code> using INSERT ... ON CONFLICT for alias accumulation. Build <code>src/shared/pg_client.py</code> as the PostgreSQL client wrapper (asyncpg) with Deal/Company/Person CRUD.</div>
   </div>
 
   <!-- ================================================================ -->
@@ -652,14 +652,14 @@ tests/
       <li><strong>Chunk a large financial table.</strong> Parse <code>sample_hierarchical.xlsx</code> (a table with indented rows, bold category headers, and Total rows exceeding 1500 tokens). Verify: chunks split at category boundaries, each chunk has column headers repeated at the top, descriptive prefix includes row range and category name. Then test <code>sample_flat_table.xlsx</code> &mdash; verify the flat fallback produces ~25-row chunks.</li>
       <li><strong>Generate a document summary.</strong> Parse a 10+ chunk document (e.g., a multi-section CIM). Verify Haiku generates a summary. Verify the summary chunk has <code>chunk_type: "doc_summary"</code> and <code>chunk_index: -1</code>. Read the summary &mdash; it should mention key topics from different sections of the document. Verify a 3-chunk document does NOT generate a summary.</li>
       <li><strong>Run entity extraction on a sample CIM.</strong> Verify Tier 1 extracts the target company name, advisor, and industry with high or medium confidence. Verify doc_type is classified correctly. Verify Tier 2 runs on any financial table chunks and extracts metrics (revenue, EBITDA, etc.). Verify Tier 3 NER tags company mentions in individual chunks.</li>
-      <li><strong>Check Neo4j after extraction.</strong> Query Neo4j for the Deal node &mdash; verify it has the correct <code>deal_id</code>, <code>canonical_name</code>, and <code>aliases</code>. Verify Company nodes exist with correct <code>normalized_name</code> values. Verify relationship edges (TARGET_OF, ADVISOR_ON, etc.) have <code>source_file_ids</code> populated. Verify deal stage is inferred correctly from the doc_type.</li>
-      <li><strong>Test deal alias accumulation.</strong> Ingest two files from the same deal folder &mdash; one with code name &ldquo;Project Atlas&rdquo; and one with real name &ldquo;Acme Corp.&rdquo; Verify the Deal node&rsquo;s <code>aliases</code> array contains both names. Verify <code>canonical_name</code> matches the most recently modified file&rsquo;s extracted name.</li>
+      <li><strong>Check PostgreSQL after extraction.</strong> Query the <code>deals</code> table &mdash; verify the row has the correct <code>deal_id</code>, <code>canonical_name</code>, and that <code>deal_aliases</code> contains the expected variants. Verify <code>companies</code> rows exist with correct <code>normalized_name</code> values. Verify relationship rows (TARGET_OF, ADVISOR_ON, etc.) have <code>source_file_ids</code> populated. Verify deal stage is inferred correctly from the doc_type.</li>
+      <li><strong>Test deal alias accumulation.</strong> Ingest two files from the same deal folder &mdash; one with code name &ldquo;Project Atlas&rdquo; and one with real name &ldquo;Acme Corp.&rdquo; Verify the <code>deal_aliases</code> table contains both names for the deal. Verify <code>canonical_name</code> matches the most recently modified file&rsquo;s extracted name.</li>
     </ol>
   </div>
 
   <div class="key-takeaway">
     <div class="callout-title">Key Takeaway</div>
-    <p>Phase 2 builds the data quality foundation. Every search result traces back to a chunk created here. The format-aware parsers preserve document structure (tables as tables, slides as slides). The chunking engine splits at logical boundaries with section context preserved. Hierarchical table splitting handles the financial models that are central to the firm&rsquo;s work. And the three-tier entity extraction populates the knowledge graph that makes deal-aware, entity-aware search possible.</p>
+    <p>Phase 2 builds the data quality foundation. Every search result traces back to a chunk created here. The format-aware parsers preserve document structure (tables as tables, slides as slides). The chunking engine splits at logical boundaries with section context preserved. Hierarchical table splitting handles the financial models that are central to the firm&rsquo;s work. And the three-tier entity extraction populates the entity store that makes deal-aware, entity-aware search possible.</p>
   </div>
 
   <nav class="chapter-nav bottom">

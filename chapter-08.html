@@ -52,7 +52,7 @@
         </ul>
         All three are <em>application permissions</em> (not delegated), which means they require an Azure AD administrator to click "Grant admin consent" after you add them. These are read-only permissions &mdash; BSearch cannot change anything in your M365 tenant.
       </li>
-      <li><strong>Create a Neo4j Aura account</strong> at <code>neo4j.io</code>. The Free tier is sufficient for development (~200K nodes, 400K relationships &mdash; enough for ~100 deals). You will upgrade to Pro (~$65/month) for production. After creating an instance, save the connection URI, username, and password.</li>
+      <li><strong>Provision Azure Database for PostgreSQL</strong> (Flexible Server). Create a Burstable B1ms instance for development (~$13/month). Run the schema migration script to create entity tables (deals, deal_aliases, companies, people, stage_entries, deal_companies, deal_people, company_people). Save the connection string.</li>
       <li><strong>Get API keys</strong> for three external services:
         <ul>
           <li><strong>Anthropic</strong> &mdash; for Claude (the AI that reads documents and writes answers). You need an API key from <code>console.anthropic.com</code>.</li>
@@ -146,11 +146,11 @@
       </tr>
       <tr>
         <td>Config &amp; data</td>
-        <td><code>pydantic-settings</code>, <code>neo4j</code></td>
+        <td><code>pydantic-settings</code>, <code>asyncpg</code></td>
       </tr>
       <tr>
         <td>Dev / test</td>
-        <td><code>pytest</code>, <code>testcontainers-python</code> (Neo4j integration tests)</td>
+        <td><code>pytest</code>, <code>testcontainers-python</code> (PostgreSQL integration tests)</td>
       </tr>
     </tbody>
   </table>
@@ -270,9 +270,7 @@
     graph_client_id: str
     graph_client_secret: str
     graph_tenant_id: str
-    neo4j_uri: str
-    neo4j_username: str
-    neo4j_password: str
+    postgresql_connection_string: str
 
     # --- Embedding Pipeline ---
     embedding_provider: str = "voyage"
@@ -298,9 +296,9 @@
     reranker_consecutive_failures_alert: int = 3
     embedding_health_check_interval_s: int = 60
     embedding_health_check_timeout_ms: int = 500
-    neo4j_health_check_interval_s: int = 60
-    neo4j_health_check_timeout_ms: int = 2000
-    neo4j_health_check_failure_threshold: int = 3
+    pg_health_check_interval_s: int = 60
+    pg_health_check_timeout_ms: int = 2000
+    pg_health_check_failure_threshold: int = 3
     embedding_cache_max_size: int = 1000
     max_table_chunk_tokens: int = 1500
     deal_summary_debounce_minutes: int = 5
@@ -310,8 +308,8 @@
     reindex_target_index: str | None = None</code></pre>
 
   <div class="callout info">
-    <div class="callout-title">Why 12 required fields with no defaults?</div>
-    <p>The 12 infrastructure fields (connection strings, API keys, credentials) have no default values on purpose. If any one of them is missing, Pydantic raises a <code>ValidationError</code> at startup rather than letting the app start in a broken state. This is called "fail fast" &mdash; it is much better to get a clear error message on startup than to discover 30 minutes later that your API key is missing when someone tries to search.</p>
+    <div class="callout-title">Why 10 required fields with no defaults?</div>
+    <p>The 10 infrastructure fields (connection strings, API keys, credentials) have no default values on purpose. If any one of them is missing, Pydantic raises a <code>ValidationError</code> at startup rather than letting the app start in a broken state. This is called "fail fast" &mdash; it is much better to get a clear error message on startup than to discover 30 minutes later that your API key is missing when someone tries to search.</p>
   </div>
 
   <!-- 8.3.3 Bicep Templates -->
@@ -380,7 +378,7 @@
 
   <ul>
     <li><strong>Latency instrumentation</strong> &mdash; p50 and p95 timing for every pipeline stage (query classification, embedding, search, reranking, Claude synthesis).</li>
-    <li><strong>Health check events</strong> &mdash; degraded/recovered state transitions for Cohere, Voyage AI, and Neo4j.</li>
+    <li><strong>Health check events</strong> &mdash; degraded/recovered state transitions for Cohere, Voyage AI, and PostgreSQL.</li>
     <li><strong>Query flight recorder</strong> &mdash; structured logs for every query including classification type, chunk counts, confidence level, and timing breakdown.</li>
     <li><strong>Alert rules</strong> &mdash; automated alerts on health check failures (3+ consecutive), embedding fallback rate exceeding 10% over 1 hour, and latency SLA breaches.</li>
   </ul>
@@ -394,7 +392,7 @@
     <li>Cohere API key</li>
     <li>Anthropic API key</li>
     <li>Graph API: <code>client_id</code>, <code>client_secret</code>, <code>tenant_id</code></li>
-    <li>Neo4j: <code>uri</code>, <code>username</code>, <code>password</code></li>
+    <li>PostgreSQL: <code>connection string</code></li>
     <li>Cosmos DB connection string</li>
     <li>Azure AI Search admin key</li>
   </ul>
@@ -406,7 +404,7 @@
 
   <div class="claude-prompt">
     <div class="prompt-label">What to Tell Claude Code &mdash; Prompt 1: Project Scaffold</div>
-    <div class="prompt-text">Set up a Python monorepo for BSearch with this structure: src/shared/, src/ingestion/, src/api/, web/, infra/, tests/. Use a single pyproject.toml with these dependencies: fastapi, uvicorn, azure-functions, azure-functions-durable, azure-cosmos, azure-search-documents, azure-identity, azure-ai-formrecognizer, python-docx, openpyxl, python-pptx, voyageai, cohere, anthropic, pydantic-settings, neo4j. Dev dependencies: pytest, testcontainers-python.<br><br>Create src/shared/config.py with a Pydantic BaseSettings class. Follow the three-tier config approach:<br><br>Tier 1 (NOT in Settings): module-level constants for algorithm values &mdash; these live in the modules that use them later, not here.<br><br>Tier 3 (the Settings class, ~25 keys organized in sections):<br>- Infrastructure (required, no defaults, fail fast): azure_search_endpoint, azure_search_admin_key, cosmos_connection_string, voyage_api_key, cohere_api_key, anthropic_api_key, graph_client_id, graph_client_secret, graph_tenant_id, neo4j_uri, neo4j_username, neo4j_password<br>- Embedding Pipeline: embedding_provider="voyage", embedding_model="voyage-context-3", embedding_dimensions=1024, embedding_version="v1", active_index_name="bsearch-v1"<br>- Relevance Tuning: min_rerank_score=0.10, low_confidence_threshold=0.50, no_results_threshold=0.15, dedup_cosine_threshold=0.95<br>- Timeouts: classifier_timeout_ms=500, embedding_timeout_ms=500<br>- Resilience: reranker_degraded_top_k=12, reranker_health_check_interval_s=60, reranker_health_check_timeout_ms=2000, reranker_consecutive_failures_alert=3, embedding_health_check_interval_s=60, embedding_health_check_timeout_ms=500, neo4j_health_check_interval_s=60, neo4j_health_check_timeout_ms=2000, neo4j_health_check_failure_threshold=3, embedding_cache_max_size=1000, max_table_chunk_tokens=1500, deal_summary_debounce_minutes=5<br>- Operational Flags: reindex_in_progress=False, reindex_target_index=None<br><br>Create empty __init__.py files in src/, src/shared/, src/ingestion/, src/api/, and tests/. Create tests/conftest.py with a placeholder fixture. Add a .env.example showing all required env vars.</div>
+    <div class="prompt-text">Set up a Python monorepo for BSearch with this structure: src/shared/, src/ingestion/, src/api/, web/, infra/, tests/. Use a single pyproject.toml with these dependencies: fastapi, uvicorn, azure-functions, azure-functions-durable, azure-cosmos, azure-search-documents, azure-identity, azure-ai-formrecognizer, python-docx, openpyxl, python-pptx, voyageai, cohere, anthropic, pydantic-settings, asyncpg. Dev dependencies: pytest, testcontainers-python.<br><br>Create src/shared/config.py with a Pydantic BaseSettings class. Follow the three-tier config approach:<br><br>Tier 1 (NOT in Settings): module-level constants for algorithm values &mdash; these live in the modules that use them later, not here.<br><br>Tier 3 (the Settings class, ~25 keys organized in sections):<br>- Infrastructure (required, no defaults, fail fast): azure_search_endpoint, azure_search_admin_key, cosmos_connection_string, voyage_api_key, cohere_api_key, anthropic_api_key, graph_client_id, graph_client_secret, graph_tenant_id, postgresql_connection_string<br>- Embedding Pipeline: embedding_provider="voyage", embedding_model="voyage-context-3", embedding_dimensions=1024, embedding_version="v1", active_index_name="bsearch-v1"<br>- Relevance Tuning: min_rerank_score=0.10, low_confidence_threshold=0.50, no_results_threshold=0.15, dedup_cosine_threshold=0.95<br>- Timeouts: classifier_timeout_ms=500, embedding_timeout_ms=500<br>- Resilience: reranker_degraded_top_k=12, reranker_health_check_interval_s=60, reranker_health_check_timeout_ms=2000, reranker_consecutive_failures_alert=3, embedding_health_check_interval_s=60, embedding_health_check_timeout_ms=500, pg_health_check_interval_s=60, pg_health_check_timeout_ms=2000, pg_health_check_failure_threshold=3, embedding_cache_max_size=1000, max_table_chunk_tokens=1500, deal_summary_debounce_minutes=5<br>- Operational Flags: reindex_in_progress=False, reindex_target_index=None<br><br>Create empty __init__.py files in src/, src/shared/, src/ingestion/, src/api/, and tests/. Create tests/conftest.py with a placeholder fixture. Add a .env.example showing all required env vars.</div>
   </div>
 
   <div class="claude-prompt">
@@ -427,7 +425,7 @@
       <li><strong>Key Vault is accessible.</strong> After deploying the infrastructure, verify you can store and retrieve a test secret:<br><code>az keyvault secret set --vault-name bsearch-kv-dev --name test-secret --value "hello"</code><br><code>az keyvault secret show --vault-name bsearch-kv-dev --name test-secret</code><br>Both commands should succeed. Then delete the test secret.</li>
       <li><strong>Application Insights resource appears in the Azure portal.</strong> Navigate to the resource group in the Azure portal. You should see both an Application Insights resource and a Log Analytics workspace. Click into Application Insights and confirm it shows "Connected to workspace" with the correct workspace name.</li>
       <li><strong>Project structure is correct.</strong> Verify the directory tree matches the monorepo layout: <code>src/shared/config.py</code> exists, <code>infra/main.bicep</code> exists, <code>infra/modules/</code> contains all seven module files, <code>pyproject.toml</code> is at the root, and all <code>__init__.py</code> files are in place.</li>
-      <li><strong>Dependencies install.</strong> Run:<br><code>pip install -e ".[dev]"</code><br>All packages should install without conflicts. Verify with <code>python -c "import fastapi; import anthropic; import neo4j; print('OK')"</code>.</li>
+      <li><strong>Dependencies install.</strong> Run:<br><code>pip install -e ".[dev]"</code><br>All packages should install without conflicts. Verify with <code>python -c "import fastapi; import anthropic; import asyncpg; print('OK')"</code>.</li>
     </ol>
   </div>
 

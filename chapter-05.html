@@ -40,7 +40,7 @@ flowchart TD
     A["User submits query"] --> B["1. Classification\n~0-250ms"]
     A --> E["4. Embedding\n~100-300ms"]
     B --> C["2. Query Expansion\n~0ms added"]
-    B --> D["3. Entity Context\nfrom Neo4j ~10ms"]
+    B --> D["3. Entity Context\nfrom PostgreSQL ~10ms"]
     B -.- E
     C --> F["5. Hybrid Search\n~100-200ms"]
     D --> F
@@ -153,28 +153,28 @@ flowchart TD
     <p><span class="term">BM25</span> &mdash; A keyword-matching algorithm used in search engines. It finds documents containing your exact words (and their expansions) and scores them based on how frequently and prominently those words appear. Fast and precise for exact terms, but blind to meaning &mdash; it would not know that "what did we pay" and "enterprise value" are related.</p>
   </div>
 
-  <!-- Step 3: Entity Context from Neo4j -->
-  <h2><span class="section-number">5.4</span> Step 3 &mdash; Entity Context Retrieval from Neo4j</h2>
+  <!-- Step 3: Entity Context Retrieval -->
+  <h2><span class="section-number">5.4</span> Step 3 &mdash; Entity Context Retrieval</h2>
 
-  <p>When your query mentions a company name, BSearch does not just search for that name &mdash; it consults the knowledge graph to understand everything it knows about that entity.</p>
+  <p>When your query mentions a company name, BSearch does not just search for that name &mdash; it consults the entity store to understand everything it knows about that entity.</p>
 
   <div class="definition">
-    <p><span class="term">Neo4j</span> &mdash; A graph database that stores relationships between entities (companies, deals, people) as a web of connections. BSearch uses it to understand that "GS" and "Goldman Sachs" refer to the same entity, that "Project Atlas" is the code name for a specific acquisition target, and that a particular company is connected to a specific deal.</p>
+    <p><span class="term">Entity store (PostgreSQL)</span> &mdash; A dedicated PostgreSQL database that stores structured information about entities (companies, deals, people) and the relationships between them. BSearch uses it to understand that &ldquo;GS&rdquo; and &ldquo;Goldman Sachs&rdquo; refer to the same entity, that &ldquo;Project Atlas&rdquo; is the code name for a specific acquisition target, and that a particular company is connected to a specific deal.</p>
   </div>
 
   <h3>Alias expansion</h3>
 
-  <p>IB deals always have a code name ("Project Atlas") used in early documents and a real company name ("Acme Corp") in later ones. If you search for "Acme," BSearch looks up that company in the knowledge graph, finds all its aliases &mdash; "Project Atlas," "Acme Corporation," "Acme Corp" &mdash; and adds them to the BM25 search terms. This way, documents that use the code name are not missed.</p>
+  <p>IB deals always have a code name ("Project Atlas") used in early documents and a real company name ("Acme Corp") in later ones. If you search for "Acme," BSearch looks up that company in the entity store, finds all its aliases &mdash; "Project Atlas," "Acme Corporation," "Acme Corp" &mdash; and adds them to the BM25 search terms. This way, documents that use the code name are not missed.</p>
 
   <h3>Financial constraint filtering</h3>
 
-  <p>For queries with financial constraints (<em>"deals with EBITDA over $50M"</em>), BSearch queries Neo4j for all deals matching that criterion. Neo4j returns a list of qualifying deal identifiers, which are then passed as a hard filter to the search engine. Only documents from those deals appear in the results.</p>
+  <p>For queries with financial constraints (<em>"deals with EBITDA over $50M"</em>), BSearch queries PostgreSQL for all deals matching that criterion. PostgreSQL returns a list of qualifying deal identifiers, which are then passed as a hard filter to the search engine. Only documents from those deals appear in the results.</p>
 
   <p>If this filter is too restrictive &mdash; fewer than three results come back &mdash; BSearch automatically retries without the financial filter and adds a note to the AI: <em>"Financial filter relaxed &mdash; not all results may match the stated financial criteria."</em></p>
 
   <h3>Entity context for synthesis</h3>
 
-  <p>Neo4j also retrieves structured context about the entities in your query: deal status (active, closed, on hold), financial metrics, company roles (target, acquirer, advisor), stage progression, and key contacts. This context is injected into the AI's prompt later (in Step 8) so it can produce more accurate answers without needing to infer facts from document fragments alone.</p>
+  <p>The entity store also retrieves structured context about the entities in your query: deal status (active, closed, on hold), financial metrics, company roles (target, acquirer, advisor), stage progression, and key contacts. This context is injected into the AI's prompt later (in Step 8) so it can produce more accurate answers without needing to infer facts from document fragments alone.</p>
 
   <p>This entire step adds roughly <strong>10 milliseconds</strong>. The alias expansion must complete before search begins (because the aliases need to be in the search query), but the entity context retrieval for synthesis runs in parallel with search &mdash; it does not block anything.</p>
 
@@ -207,7 +207,7 @@ gantt
     section Parallel
     Haiku classify + expand + entity intent : a1, 0, 250
     Voyage AI query embedding               : a2, 0, 300
-    Entity alias expansion (Neo4j)           : a3, 250, 10
+    Entity alias expansion (PostgreSQL)       : a3, 250, 10
 
     section Sequential
     Azure AI Search (hybrid)                 : a4, 260, 200
@@ -215,7 +215,7 @@ gantt
     Claude synthesis (TTFT)                  : a6, 810, 800
   </pre>
 
-  <p>The key insight: Haiku classification and the embedding run concurrently. The critical path through the parallel stage is determined by whichever finishes last, not the sum of both. Entity alias expansion from Neo4j is sequential &mdash; it must wait for Haiku to identify the entities before looking up their aliases. But entity <em>context</em> retrieval (deal status, financials) for synthesis runs in parallel with Azure AI Search, adding no time to the critical path.</p>
+  <p>The key insight: Haiku classification and the embedding run concurrently. The critical path through the parallel stage is determined by whichever finishes last, not the sum of both. Entity alias expansion from PostgreSQL is sequential &mdash; it must wait for Haiku to identify the entities before looking up their aliases. But entity <em>context</em> retrieval (deal status, financials) for synthesis runs in parallel with Azure AI Search, adding no time to the critical path.</p>
 
   <!-- Step 5: Hybrid Search -->
   <h2><span class="section-number">5.6</span> Step 5 &mdash; Hybrid Search</h2>
@@ -243,7 +243,7 @@ gantt
     <li><strong>Permission filter.</strong> Users only see results from folders they have access to. This is enforced as a hard filter at the search level &mdash; no exceptions, no leakage.</li>
     <li><strong>Canonical filter.</strong> Only the latest version of near-duplicate documents is returned, preventing the same CIM draft from appearing five times in results.</li>
     <li><strong>Entity filters.</strong> If Haiku detected industry, company role, deal status, deal stage, or financial constraints in your query, those are applied as search filters. <em>"Active healthcare deals"</em> automatically filters for healthcare industry and active status.</li>
-    <li><strong>Financial filter.</strong> If Neo4j returned a list of deal identifiers matching a financial constraint (<em>"EBITDA over $50M"</em>), only documents from those deals are included.</li>
+    <li><strong>Financial filter.</strong> If PostgreSQL returned a list of deal identifiers matching a financial constraint (<em>"EBITDA over $50M"</em>), only documents from those deals are included.</li>
   </ul>
 
   <p>The search returns the <strong>top 20 candidates</strong> for reranking.</p>
@@ -258,6 +258,8 @@ gantt
   </div>
 
   <p>Using the original query for reranking is deliberate. Query expansion (Step 2) may have added marginal terms like "comparable companies" that surface loosely related documents. The reranker evaluates each result against what you <em>actually</em> asked, so those marginal matches get dropped. This is why aggressive expansion is safe &mdash; the reranker acts as a noise filter.</p>
+
+  <p>Reranking goes through a <strong>provider abstraction layer</strong> (<code>RerankerProvider</code>). Cohere is the only provider in v1, but all scores are normalized to a 0&ndash;1 scale so that confidence thresholds (HIGH, LOW, NONE) are defined once and survive provider swaps without recalibration.</p>
 
   <div class="callout ib-analogy">
     <div class="callout-title">IB Analogy</div>
@@ -325,7 +327,9 @@ gantt
   <!-- Step 8: Tiered Synthesis -->
   <h2><span class="section-number">5.9</span> Step 8 &mdash; Tiered Synthesis</h2>
 
-  <p>This is where the search results become an actual answer. Claude Sonnet receives the top-ranked document chunks, the original query, entity context from Neo4j, and a prompt strategy tailored to the query type. The response streams to the user in real time.</p>
+  <p>This is where the search results become an actual answer. Claude Sonnet receives the top-ranked document chunks, the original query, entity context from the entity store, and a prompt strategy tailored to the query type. The response streams to the user in real time.</p>
+
+  <p>Synthesis goes through a <strong>provider abstraction layer</strong> (<code>SynthesisProvider</code>). Claude (Sonnet for synthesis, Haiku for classification) is the only provider in v1. The abstraction supports optional extended thinking &mdash; Claude uses it for complex multi-document synthesis; future providers that lack thinking support degrade gracefully.</p>
 
   <p>The synthesis approach varies significantly by query type because different questions have fundamentally different reasoning demands:</p>
 
@@ -355,7 +359,7 @@ gantt
 
   <h3>Entity context injection</h3>
 
-  <p>Before the AI generates its response, BSearch prepends entity context from Neo4j: deal status, financial metrics, company roles, stage progression, and key contacts. This structured information helps the AI produce more accurate and grounded answers without needing to infer facts from document excerpts alone.</p>
+  <p>Before the AI generates its response, BSearch prepends entity context from the entity store: deal status, financial metrics, company roles, stage progression, and key contacts. This structured information helps the AI produce more accurate and grounded answers without needing to infer facts from document excerpts alone.</p>
 
   <h3>Citations</h3>
 
@@ -429,7 +433,7 @@ gantt
         <td>max(Haiku, embedding)</td>
       </tr>
       <tr>
-        <td>Entity alias expansion (Neo4j)</td>
+        <td>Entity alias expansion (PostgreSQL)</td>
         <td class="fast">~10ms</td>
         <td class="fast">~10ms</td>
         <td>Sequential (after Haiku)</td>
@@ -535,7 +539,7 @@ gantt
   <p>Original terms are boosted higher than expansion terms, so the search prioritizes exact matches.</p>
 
   <h3>Step 3 &mdash; Entity Context (150&ndash;160ms)</h3>
-  <p>"Catalyst" is queried in the knowledge graph. It resolves to "Catalyst Technologies, Inc." and "Catalyst Tech" &mdash; aliases used in different documents. These are added to BM25 search terms. Neo4j also begins retrieving entity context (deal status: closed, Q3 2024, sell-side advisor), which will be injected into Claude's prompt later.</p>
+  <p>"Catalyst" is queried in the entity store. It resolves to "Catalyst Technologies, Inc." and "Catalyst Tech" &mdash; aliases used in different documents. These are added to BM25 search terms. The entity store also begins retrieving entity context (deal status: closed, Q3 2024, sell-side advisor), which will be injected into Claude's prompt later.</p>
 
   <h3>Step 4 &mdash; Embedding (0&ndash;150ms, parallel with Step 1)</h3>
   <p>Simultaneously, the original query is converted into a 1,024-number vector that captures its meaning: "what valuation multiple was applied in a deal involving a company called Catalyst." The cache misses (nobody asked this exact question recently), so a fresh embedding is generated in about 150ms.</p>
@@ -550,7 +554,7 @@ gantt
   <p>Top reranker score is 0.82 &mdash; well above the 0.50 threshold. Confidence tier: <strong>HIGH</strong>. All five chunks score above the 0.10 per-chunk floor. No chunks dropped, no banner, full confidence. Proceed to synthesis.</p>
 
   <h3>Step 8 &mdash; Synthesis (480&ndash;980ms TTFT)</h3>
-  <p>Claude receives the original query, five ranked document chunks, Neo4j entity context (Catalyst Technologies, closed deal, sell-side, Q3 2024), and the data_extraction prompt strategy (be precise, cite sources, no extended thinking). It begins streaming its response at roughly 980ms:</p>
+  <p>Claude receives the original query, five ranked document chunks, entity store context (Catalyst Technologies, closed deal, sell-side, Q3 2024), and the data_extraction prompt strategy (be precise, cite sources, no extended thinking). It begins streaming its response at roughly 980ms:</p>
 
   <div class="callout info">
     <div class="callout-title">Example Response</div>

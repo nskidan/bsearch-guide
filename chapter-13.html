@@ -46,7 +46,7 @@
       <li><strong>All previous phases complete.</strong> Phases 1&ndash;5 are done and working individually. The config loads, parsers handle all four formats, the ingestion pipeline processes documents end-to-end, the query API returns streaming answers, and the frontend renders results with citations.</li>
       <li><strong>Full SharePoint access confirmed.</strong> The Azure AD app registration has <code>Sites.Read.All</code>, <code>Files.Read.All</code>, and <code>User.Read.All</code> permissions &mdash; all with admin consent granted by IT. Test this by running a Graph API call that lists all SharePoint sites in the tenant. If you get a 403, stop here and get IT to grant consent.</li>
       <li><strong>Confirm bulk ingestion timing.</strong> The full ingestion takes an estimated 18&ndash;36 hours. Plan to start it on a Friday evening or Saturday morning so it can run over a weekend. Durable Functions checkpointing means it survives restarts, but you want an uninterrupted window for the initial load.</li>
-      <li><strong>Budget approved for one-time ingestion cost.</strong> The bulk ingestion costs approximately $11,000&ndash;$12,000. The largest component is Azure Document Intelligence for PDF parsing (~$9,200 after pre-parse PDF deduplication), followed by Claude Haiku entity extraction (~$1,200&ndash;$1,800) and Voyage AI bulk embedding (~$500&ndash;$1,000). This is a one-time cost &mdash; ongoing monthly costs are ~$395&ndash;$510. Get explicit sign-off before starting.</li>
+      <li><strong>Budget approved for one-time ingestion cost.</strong> The bulk ingestion costs approximately $11,000&ndash;$12,000. The largest component is Azure Document Intelligence for PDF parsing (~$9,200 after pre-parse PDF deduplication), followed by Claude Haiku entity extraction (~$1,200&ndash;$1,800) and Voyage AI bulk embedding (~$500&ndash;$1,000). This is a one-time cost &mdash; ongoing monthly costs are ~$343&ndash;$471. Get explicit sign-off before starting.</li>
     </ul>
   </div>
 
@@ -190,7 +190,7 @@
         <td>~1&ndash;6 hours (~2.2M chunks)</td>
       </tr>
       <tr>
-        <td>Neo4j entity writes</td>
+        <td>PostgreSQL entity writes</td>
         <td>~500 operations/second</td>
         <td>~1&ndash;2 hours</td>
       </tr>
@@ -204,7 +204,7 @@
 
   <div class="key-takeaway">
     <div class="callout-title">Total Wall Time</div>
-    <p><strong>18&ndash;36 hours estimated.</strong> The bottleneck is Graph API download + embedding. Plan for a 2-day weekend window with checkpoint/resume via Durable Functions. Progress is monitored through Application Insights. Neo4j Aura Pro (~$65/month) is required for bulk load &mdash; the Free tier's 200K node limit is exceeded by the full entity graph.</p>
+    <p><strong>18&ndash;36 hours estimated.</strong> The bottleneck is Graph API download + embedding. Plan for a 2-day weekend window with checkpoint/resume via Durable Functions. Progress is monitored through Application Insights. Azure PostgreSQL Flexible Server (B2s, ~$26/month) handles the bulk load comfortably.</p>
   </div>
 
   <div class="callout info">
@@ -225,13 +225,13 @@
       <strong>Provision Azure resources via Bicep.</strong> Deploy <code>infra/main.bicep</code> with the production parameter file. This creates Azure AI Search (S1), App Service (B2), Durable Functions (Consumption), Cosmos DB (serverless), Key Vault, Static Web Apps, and Application Insights. Verify all resources appear in the Azure portal.
     </li>
     <li>
-      <strong>Store API keys in Key Vault.</strong> Populate Key Vault with all secrets: Voyage AI, Cohere, Anthropic API keys; Graph API credentials (<code>client_id</code>, <code>client_secret</code>, <code>tenant_id</code>); Neo4j credentials (<code>uri</code>, <code>username</code>, <code>password</code>); Cosmos DB connection string; Azure AI Search admin key. Verify App Service and Functions can read secrets via managed identity.
+      <strong>Store API keys in Key Vault.</strong> Populate Key Vault with all secrets: Voyage AI, Cohere, Anthropic API keys; Graph API credentials (<code>client_id</code>, <code>client_secret</code>, <code>tenant_id</code>); PostgreSQL connection string; Cosmos DB connection string; Azure AI Search admin key. Verify App Service and Functions can read secrets via managed identity.
     </li>
     <li>
       <strong>Deploy Azure Functions + App Service code.</strong> Deploy the ingestion pipeline (Durable Functions) and the query API (FastAPI on App Service). Verify the <code>/health</code> endpoint returns 200 on the App Service.
     </li>
     <li>
-      <strong>Create Neo4j Aura Pro instance.</strong> Create the instance, run the index creation script (constraints and indexes for Deal, Company, Person nodes), and verify connectivity from the Azure Functions environment.
+      <strong>Provision Azure PostgreSQL Flexible Server.</strong> Deploy via Bicep template, run the schema migration (creates deals, deal_aliases, companies, people, stage_entries, deal_companies, deal_people, company_people tables with indexes), and verify connectivity from the Azure Functions environment.
     </li>
     <li>
       <strong>Run bulk ingestion (18&ndash;36 hours, NO webhooks yet).</strong> Start the Durable Functions bulk ingestion orchestrator. It enumerates all documents across all SharePoint sites via Graph API delta queries, fans out to parse/chunk/embed/index activity functions, and writes progress to Cosmos DB. Webhooks are not registered yet &mdash; this prevents noise during the initial load. Monitor progress via Application Insights.
@@ -274,9 +274,9 @@
         <td>Hybrid search index for 2.2M chunks. The largest fixed cost &mdash; required for vector search at this scale.</td>
       </tr>
       <tr>
-        <td>Neo4j Aura Pro</td>
-        <td>~$65</td>
-        <td>Knowledge graph hosting. Required (Free tier exceeded by bulk load).</td>
+        <td>Azure PostgreSQL (B2s)</td>
+        <td>~$26</td>
+        <td>Entity store hosting with continuous backups.</td>
       </tr>
       <tr>
         <td>Claude Sonnet (synthesis)</td>
@@ -328,7 +328,7 @@
 
   <div class="key-takeaway">
     <div class="callout-title">Monthly Total</div>
-    <p><strong>~$395&ndash;510/month ongoing.</strong> Azure AI Search S1 is the dominant cost (~50% of the total). Everything else is consumption-based and scales with usage volume, which is low at 18 users.</p>
+    <p><strong>~$343&ndash;471/month ongoing.</strong> Azure AI Search S1 is the dominant cost (~50% of the total). Everything else is consumption-based and scales with usage volume, which is low at 18 users.</p>
   </div>
 
   <h4>One-Time Bulk Ingestion Cost</h4>
@@ -370,9 +370,9 @@
 
   <p>Three failure scenarios require specific recovery procedures:</p>
 
-  <h4>Neo4j Data Loss</h4>
+  <h4>PostgreSQL Data Loss</h4>
 
-  <p>If Neo4j data is lost, search continues without entity intelligence. The full entity graph can be rebuilt from scratch by re-running the ingestion orchestrator on all indexed files &mdash; Azure AI Search retains all document content, so no data is truly lost.</p>
+  <p>If PostgreSQL data is lost, search continues without entity intelligence. Azure PostgreSQL Flexible Server provides continuous backups with point-in-time recovery (PITR) &mdash; restore to any point within the retention window takes minutes, not hours. As a last resort, the full entity store can be rebuilt from scratch by re-running the ingestion orchestrator on all indexed files.</p>
 
   <table>
     <thead>
@@ -385,18 +385,18 @@
     <tbody>
       <tr>
         <td>RPO (Recovery Point Objective)</td>
-        <td>24 hours</td>
-        <td>Neo4j Aura Pro provides daily automated backups. Worst case, you lose one day of entity changes.</td>
+        <td>Seconds to minutes</td>
+        <td>Azure PostgreSQL Flexible Server provides continuous backups with point-in-time recovery. Worst case, you lose seconds to minutes of entity changes.</td>
       </tr>
       <tr>
         <td>RTO (Recovery Time Objective)</td>
-        <td>18&ndash;36 hours</td>
-        <td>Full re-ingestion from Azure AI Search content to rebuild the graph.</td>
+        <td>Minutes</td>
+        <td>Point-in-time restore (minutes). Full re-ingestion only as last resort.</td>
       </tr>
       <tr>
         <td>Degradation during rebuild</td>
         <td>Document-only search</td>
-        <td>Entity-aware queries fall back to document-only search. No entity context in Claude prompts. <code>neo4j_fallback</code> logged. Users see normal results without entity enrichment.</td>
+        <td>Entity-aware queries fall back to document-only search. No entity context in Claude prompts. <code>postgresql_fallback</code> logged. Users see normal results without entity enrichment.</td>
       </tr>
     </tbody>
   </table>
@@ -507,8 +507,8 @@
         <td>Run manual delta sync. If webhook subscription expired, it is re-created on the next renewal cycle.</td>
       </tr>
       <tr>
-        <td>Neo4j down</td>
-        <td>Aura dashboard</td>
+        <td>PostgreSQL down</td>
+        <td>Azure Portal &rarr; PostgreSQL Flexible Server metrics</td>
         <td>Entity enrichment degrades, search still works in document-only mode. Wait for recovery.</td>
       </tr>
       <tr>
@@ -544,12 +544,12 @@
 
   <div class="claude-prompt">
     <div class="prompt-label">What to Tell Claude Code &mdash; Prompt 2: Bulk Ingestion Job</div>
-    <div class="prompt-text">Implement the bulk ingestion job for BSearch. The Durable Functions orchestrator should:<br><br>1. Enumerate all documents across all SharePoint sites via Graph API delta queries<br>2. Fan out to activity functions that parse/chunk/embed/index each document<br>3. Respect Graph API rate limits (~10K requests per 10-minute window) and Voyage AI embedding throughput<br>4. Write progress to Cosmos DB for resumability via Durable Functions checkpointing<br>5. Skip _Archive folders and pre-parse PDF companions (PDFs that have matching Office source files in the same folder)<br>6. Run near-duplicate detection (normalize filenames, compare first-chunk embeddings at cosine similarity &ge;0.95, mark canonical versions)<br>7. Write entity data to Neo4j (deals, companies, people, relationships) with dual-write retry if Neo4j is temporarily unavailable<br>8. Generate doc summaries (for documents with &ge;4 chunks) and deal summaries (for deals with &ge;3 documents)<br><br>Concurrency: cap concurrent file activities to avoid provider rate limits. If any provider returns 429, halve concurrency and auto-restore after a quiet period. Target: &lt;1% error rate across the full 550K document set. Estimated total time: 18&ndash;36 hours for ~550K docs producing ~2.2M chunks.</div>
+    <div class="prompt-text">Implement the bulk ingestion job for BSearch. The Durable Functions orchestrator should:<br><br>1. Enumerate all documents across all SharePoint sites via Graph API delta queries<br>2. Fan out to activity functions that parse/chunk/embed/index each document<br>3. Respect Graph API rate limits (~10K requests per 10-minute window) and Voyage AI embedding throughput<br>4. Write progress to Cosmos DB for resumability via Durable Functions checkpointing<br>5. Skip _Archive folders and pre-parse PDF companions (PDFs that have matching Office source files in the same folder)<br>6. Run near-duplicate detection (normalize filenames, compare first-chunk embeddings at cosine similarity &ge;0.95, mark canonical versions)<br>7. Write entity data to PostgreSQL (deals, companies, people, relationships) with retry if PostgreSQL is temporarily unavailable<br>8. Generate doc summaries (for documents with &ge;4 chunks) and deal summaries (for deals with &ge;3 documents)<br><br>Concurrency: cap concurrent file activities to avoid provider rate limits. If any provider returns 429, halve concurrency and auto-restore after a quiet period. Target: &lt;1% error rate across the full 550K document set. Estimated total time: 18&ndash;36 hours for ~550K docs producing ~2.2M chunks.</div>
   </div>
 
   <div class="claude-prompt">
     <div class="prompt-label">What to Tell Claude Code &mdash; Prompt 3: Bootstrap Deployment Script</div>
-    <div class="prompt-text">Create the bootstrap deployment script for BSearch. Each step verifies success before proceeding to the next:<br><br>1. Create Azure AD app registration (Sites.Read.All, Files.Read.All, User.Read.All, admin consent)<br>2. Provision Azure resources via Bicep (AI Search S1, Functions Consumption, App Service B2, Cosmos DB serverless, Key Vault, Static Web Apps, Application Insights)<br>3. Store API keys in Key Vault (Voyage, Cohere, Anthropic, Graph API secrets, Neo4j credentials, Cosmos connection string, AI Search admin key)<br>4. Deploy Azure Functions + App Service code<br>5. Create Neo4j Aura Pro instance + run index creation script<br>6. Start bulk ingestion (NO webhooks yet &mdash; prevents noise during initial load)<br>7. After bulk ingestion completes: register Graph API webhook subscriptions<br>8. Deploy Static Web App (React frontend with Azure AD auth)<br>9. Smoke test: /health endpoint, acceptance test query #1, Application Insights live stream<br><br>Each step should log what it is doing, verify its output, and fail clearly if something goes wrong. Include a --dry-run flag that validates without executing.</div>
+    <div class="prompt-text">Create the bootstrap deployment script for BSearch. Each step verifies success before proceeding to the next:<br><br>1. Create Azure AD app registration (Sites.Read.All, Files.Read.All, User.Read.All, admin consent)<br>2. Provision Azure resources via Bicep (AI Search S1, Functions Consumption, App Service B2, Cosmos DB serverless, Key Vault, Static Web Apps, Application Insights)<br>3. Store API keys in Key Vault (Voyage, Cohere, Anthropic, Graph API secrets, PostgreSQL connection string, Cosmos connection string, AI Search admin key)<br>4. Deploy Azure Functions + App Service code<br>5. Provision Azure PostgreSQL Flexible Server + run schema migration<br>6. Start bulk ingestion (NO webhooks yet &mdash; prevents noise during initial load)<br>7. After bulk ingestion completes: register Graph API webhook subscriptions<br>8. Deploy Static Web App (React frontend with Azure AD auth)<br>9. Smoke test: /health endpoint, acceptance test query #1, Application Insights live stream<br><br>Each step should log what it is doing, verify its output, and fail clearly if something goes wrong. Include a --dry-run flag that validates without executing.</div>
   </div>
 
   <!-- ================================================================ -->
@@ -565,7 +565,7 @@
       <li><strong>Permission filtering works.</strong> Test with a user who has limited folder access (e.g., only one of the five top-level folders). Query for content that exists in a restricted folder &mdash; verify it does not appear in results. Then query for content in the user's accessible folder &mdash; verify it does appear.</li>
       <li><strong>Document versioning works.</strong> Update a file in SharePoint (add a sentence to a Word doc). Wait for the webhook to trigger re-ingestion (should happen within minutes). Query for the new content &mdash; verify old chunks are replaced and the new content appears in results.</li>
       <li><strong>Reranker degradation and recovery.</strong> Block the Cohere API (e.g., via firewall rule or mock). Verify: health check detects failure within 60 seconds, subsequent queries return <code>degraded_reranker: true</code> in the SSE stream, frontend renders orange degraded banner, confidence is capped at LOW. Unblock Cohere. Verify: health check recovers within 60 seconds, next query returns <code>degraded_reranker: false</code>, orange banner disappears. Confirm <code>reranker_degraded</code> event appears in Application Insights.</li>
-      <li><strong>Full ingestion completes without errors (or with &lt;1% error rate).</strong> After the 550K document ingestion, check Application Insights for failed files. A small number of failures is expected (corrupt files, unsupported formats), but the overall error rate should be below 1%. Verify chunk count in Azure AI Search is approximately 2.2M. Verify Neo4j contains deal, company, and person nodes with relationships.</li>
+      <li><strong>Full ingestion completes without errors (or with &lt;1% error rate).</strong> After the 550K document ingestion, check Application Insights for failed files. A small number of failures is expected (corrupt files, unsupported formats), but the overall error rate should be below 1%. Verify chunk count in Azure AI Search is approximately 2.2M. Verify PostgreSQL contains deal, company, and person rows with relationship entries.</li>
     </ol>
   </div>
 
@@ -578,7 +578,7 @@
 
   <div class="key-takeaway">
     <div class="callout-title">Key Takeaway</div>
-    <p>Phase 6 is where BSearch goes from &ldquo;it works in dev&rdquo; to &ldquo;it works for real.&rdquo; The five acceptance test queries prove the system answers the questions Berenson users actually ask. The bulk ingestion of 550K documents is a one-time, 18&ndash;36 hour operation costing ~$11&ndash;12K. After that, ongoing monthly cost is ~$395&ndash;510 for 18 users. The bootstrap deployment sequence ensures everything comes up in the right order, and the blue-green re-indexing strategy means future embedding model swaps happen with zero downtime.</p>
+    <p>Phase 6 is where BSearch goes from &ldquo;it works in dev&rdquo; to &ldquo;it works for real.&rdquo; The five acceptance test queries prove the system answers the questions Berenson users actually ask. The bulk ingestion of 550K documents is a one-time, 18&ndash;36 hour operation costing ~$11&ndash;12K. After that, ongoing monthly cost is ~$343&ndash;471 for 18 users. The bootstrap deployment sequence ensures everything comes up in the right order, and the blue-green re-indexing strategy means future embedding model swaps happen with zero downtime.</p>
   </div>
 
   <nav class="chapter-nav bottom">

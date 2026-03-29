@@ -33,7 +33,7 @@
 
   <p>The orchestrator is the most complex piece. It uses Azure Durable Functions &mdash; a framework that lets you write multi-step workflows with built-in checkpointing and retry logic. A single orchestrator handles both the initial bulk load (all 550,000 documents) and ongoing incremental sync (individual file changes triggered by webhooks). Same code path, same retry behavior, same error handling.</p>
 
-  <p>By the end of this phase, you can ingest a batch of documents, query them in Azure AI Search, see their entities in Neo4j, and watch a file change in SharePoint automatically propagate through the pipeline into the index. Near-duplicate detection ensures that &ldquo;Deal Summary v3 FINAL (2).docx&rdquo; does not clutter search results alongside &ldquo;Deal Summary v3 FINAL.docx.&rdquo;</p>
+  <p>By the end of this phase, you can ingest a batch of documents, query them in Azure AI Search, see their entities in PostgreSQL, and watch a file change in SharePoint automatically propagate through the pipeline into the index. Near-duplicate detection ensures that &ldquo;Deal Summary v3 FINAL (2).docx&rdquo; does not clutter search results alongside &ldquo;Deal Summary v3 FINAL.docx.&rdquo;</p>
 
   <!-- ================================================================ -->
   <!-- 10.2 Before You Start -->
@@ -45,7 +45,7 @@
     <ul>
       <li>Azure AI Search (S1) provisioned via Phase 1 Bicep templates</li>
       <li>Cosmos DB (serverless) provisioned via Phase 1 Bicep</li>
-      <li>Neo4j Aura instance provisioned (Free tier for dev, Pro for prod)</li>
+      <li>PostgreSQL (Azure Flexible Server) provisioned via Phase 1 Bicep templates</li>
       <li>Phase 2 parsers working and tested &mdash; Word, Excel, PowerPoint, and PDF parsers produce correct chunks from real documents</li>
       <li>Embedding provider abstraction implemented (Phase 2) &mdash; <code>EmbeddingProvider</code> interface, Voyage AI implementation, factory function</li>
       <li>Graph API client working (Phase 1) &mdash; can authenticate and list files from SharePoint drives</li>
@@ -204,7 +204,7 @@
         <td><code>deal_name</code></td>
         <td>Edm.String</td>
         <td>filterable, searchable</td>
-        <td>Canonical deal name from Neo4j. Same for all chunks in the deal</td>
+        <td>Canonical deal name from PostgreSQL. Same for all chunks in the deal</td>
       </tr>
       <tr>
         <td><code>deal_aliases</code></td>
@@ -260,7 +260,7 @@
         <td><code>industries</code></td>
         <td>Collection(Edm.String)</td>
         <td>filterable, searchable</td>
-        <td>Deal-scoped &mdash; from Neo4j Deal node. Same for all chunks in the deal</td>
+        <td>Deal-scoped &mdash; from PostgreSQL deals row. Same for all chunks in the deal</td>
       </tr>
     </tbody>
   </table>
@@ -412,7 +412,7 @@
     <li><strong>Fetch file</strong> &mdash; Download from SharePoint via Graph API</li>
     <li><strong>Parse</strong> &mdash; Format-aware parser (Word, Excel, PPT, or PDF via Azure Document Intelligence)</li>
     <li><strong>Extract metadata</strong> &mdash; Determine <code>doc_type</code>, compute <code>deal_id</code> from folder path, extract per-file <code>deal_name</code>, run Tier 1 entity extraction (companies, roles, industry, deal stage)</li>
-    <li><strong>Write to Neo4j</strong> &mdash; MERGE Deal node (aliases, canonical_name, industries), MERGE Company nodes, MERGE relationship edges with <code>source_file_id</code> provenance, update deal status, create StageEntry if applicable</li>
+    <li><strong>Write to PostgreSQL</strong> &mdash; UPSERT deal row (aliases, canonical_name, industries), UPSERT company rows, UPSERT relationship rows with <code>source_file_ids</code> JSONB provenance, update deal status, insert stage_entries row if applicable</li>
     <li><strong>Chunk</strong> &mdash; Split into content, table, and slide chunks using Phase 2 chunking logic. Generate doc summary if chunk count is above threshold</li>
     <li><strong>Entity extraction (per chunk)</strong> &mdash; Tier 3 NER on every chunk (company/person mentions). Tier 2 Haiku extraction on high-value chunks only (financial tables, structured people sections, IOI/LOI body)</li>
     <li><strong>Embed</strong> &mdash; All chunks (including summary) embedded via Voyage AI <code>voyage-context-3</code> with full document text as context. Stamp embedding provenance metadata from provider instance</li>
@@ -457,7 +457,7 @@
 
   <ol>
     <li><code>dedup.handle_file_deletion(file_id)</code> &mdash; remove from duplicate cluster, promote next-most-recent if deleted file was canonical</li>
-    <li><code>graph_cleanup.cleanup_file_from_graph(file_id, deal_id)</code> &mdash; remove <code>source_file_id</code> from Neo4j edges, delete edges with no remaining provenance, delete StageEntry nodes from this file, recompute deal status</li>
+    <li><code>entity_cleanup.cleanup_file_from_entities(file_id, deal_id)</code> &mdash; remove <code>source_file_id</code> from PostgreSQL relationship rows, delete rows with no remaining provenance, delete stage_entries rows from this file, recompute deal status</li>
     <li><code>indexer.delete_by_file_id(file_id)</code> &mdash; atomically delete all chunks for this file from Azure AI Search</li>
   </ol>
 
@@ -497,15 +497,15 @@
   <hr>
 
   <!-- -------------------------------- -->
-  <!-- Dual-Write Neo4j + Search -->
+  <!-- Dual-Write PostgreSQL + Search -->
   <!-- -------------------------------- -->
-  <h3>Neo4j Dual-Write</h3>
+  <h3>PostgreSQL Dual-Write</h3>
 
-  <p>Every file ingestion writes to two data stores: Neo4j (entity relationships) and Azure AI Search (document chunks). The write order matters for consistency.</p>
+  <p>Every file ingestion writes to two data stores: PostgreSQL (entity relationships) and Azure AI Search (document chunks). The write order matters for consistency.</p>
 
   <div class="callout info">
-    <div class="callout-title">Write Order: Neo4j First, Then Search</div>
-    <p>Neo4j is the source of truth for entity data. Chunks in Azure AI Search carry denormalized copies of entity fields (<code>deal_name</code>, <code>companies</code>, <code>industries</code>, etc.) copied from Neo4j at ingestion time. Writing Neo4j first ensures entity fields on chunks are always current.</p>
+    <div class="callout-title">Write Order: PostgreSQL First, Then Search</div>
+    <p>PostgreSQL is the source of truth for entity data. Chunks in Azure AI Search carry denormalized copies of entity fields (<code>deal_name</code>, <code>companies</code>, <code>industries</code>, etc.) copied from PostgreSQL at ingestion time. Writing PostgreSQL first ensures entity fields on chunks are always current.</p>
   </div>
 
   <table>
@@ -517,12 +517,12 @@
     </thead>
     <tbody>
       <tr>
-        <td>Neo4j write fails</td>
-        <td>Write chunks to Azure AI Search <em>without</em> entity fields. Queue file in Cosmos DB <code>retry_queue</code> with exponential backoff (1min, 5min, 30min, 2hr). On retry: write to Neo4j, then patch chunk entity fields in Search. After 5 failures: alert + manual intervention</td>
+        <td>PostgreSQL write fails</td>
+        <td>Write chunks to Azure AI Search <em>without</em> entity fields. Queue file in Cosmos DB <code>retry_queue</code> with exponential backoff (1min, 5min, 30min, 2hr). On retry: write to PostgreSQL, then patch chunk entity fields in Search. After 5 failures: alert + manual intervention</td>
       </tr>
       <tr>
         <td>Azure AI Search write fails</td>
-        <td>Neo4j already has entity data. Queue chunk for retry. On retry: write chunks with entity fields populated from Neo4j</td>
+        <td>PostgreSQL already has entity data. Queue chunk for retry. On retry: write chunks with entity fields populated from PostgreSQL</td>
       </tr>
     </tbody>
   </table>
@@ -846,7 +846,7 @@
       <tr>
         <td><code>retry_queue</code></td>
         <td><code>deal_id</code></td>
-        <td>Failed items queued for retry with exponential backoff. Used when Neo4j or Search writes fail</td>
+        <td>Failed items queued for retry with exponential backoff. Used when PostgreSQL or Search writes fail</td>
       </tr>
       <tr>
         <td><code>duplicate_clusters</code></td>
@@ -908,7 +908,7 @@ tests/
 
   <div class="claude-prompt">
     <div class="prompt-label">Prompt 2 &mdash; Ingestion Orchestrator + Webhooks + Delta Sync</div>
-    <p class="prompt-text">&ldquo;Build the Durable Functions ingestion orchestrator. The orchestrator should: receive a list of file changes from webhooks or delta sync, fan out to activity functions (fetch &rarr; parse &rarr; extract metadata &rarr; write to Neo4j &rarr; chunk &rarr; per-chunk entity extraction &rarr; embed with Voyage AI contextual embeddings &rarr; check dedup &rarr; write to Azure AI Search), with checkpointing and retry logic (exponential backoff). On file update/delete: run cleanup first (dedup removal, graph cleanup, Search delete), then re-ingest. Create the webhook receiver HTTP trigger at <em>/api/webhooks/graph</em> with <em>clientState</em> validation &mdash; echo <em>validationToken</em> on GET, validate and respond 202 on POST, then start delta sync orchestrator. Create the delta sync timer trigger (every 12h) that queries Graph API delta endpoint with stored Cosmos DB tokens. Create subscription management (create, renew every 12h, delete). Implement three-layer rate limiting: orchestrator concurrency cap (50 bulk / 200 delta), per-provider asyncio semaphores (Haiku 80, Voyage 50, Graph 20), and adaptive backpressure (halve on 5% 429 rate, restore after 5min clean). Write Neo4j first, then Search. If Neo4j fails, write chunks without entity fields and queue retry. If Search fails, queue retry.&rdquo;</p>
+    <p class="prompt-text">&ldquo;Build the Durable Functions ingestion orchestrator. The orchestrator should: receive a list of file changes from webhooks or delta sync, fan out to activity functions (fetch &rarr; parse &rarr; extract metadata &rarr; write to PostgreSQL &rarr; chunk &rarr; per-chunk entity extraction &rarr; embed with Voyage AI contextual embeddings &rarr; check dedup &rarr; write to Azure AI Search), with checkpointing and retry logic (exponential backoff). On file update/delete: run cleanup first (dedup removal, entity cleanup, Search delete), then re-ingest. Create the webhook receiver HTTP trigger at <em>/api/webhooks/graph</em> with <em>clientState</em> validation &mdash; echo <em>validationToken</em> on GET, validate and respond 202 on POST, then start delta sync orchestrator. Create the delta sync timer trigger (every 12h) that queries Graph API delta endpoint with stored Cosmos DB tokens. Create subscription management (create, renew every 12h, delete). Implement three-layer rate limiting: orchestrator concurrency cap (50 bulk / 200 delta), per-provider asyncio semaphores (Haiku 80, Voyage 50, Graph 20), and adaptive backpressure (halve on 5% 429 rate, restore after 5min clean). Write PostgreSQL first, then Search. If PostgreSQL fails, write chunks without entity fields and queue retry. If Search fails, queue retry.&rdquo;</p>
   </div>
 
   <div class="claude-prompt">
@@ -926,12 +926,12 @@ tests/
     <ol>
       <li><strong>Index creation.</strong> Run <code>create_index()</code> &mdash; verify the index appears in Azure portal with all 25+ fields, HNSW vector configuration at 1024 dimensions, and the <code>recency_boost</code> scoring profile.</li>
       <li><strong>Bulk ingestion.</strong> Ingest ~100 test documents through the pipeline. Query Azure AI Search directly and verify all documents appear with correct metadata &mdash; <code>file_name</code>, <code>doc_type</code>, <code>deal_id</code>, <code>chunk_type</code>, <code>source_folder</code>, and entity fields all populated.</li>
-      <li><strong>Neo4j graph.</strong> Check Neo4j for Deal and Company nodes. Verify relationship edges (TARGET_OF, ADVISOR_ON, etc.) have correct <code>source_file_ids</code> provenance. Verify <code>canonical_name</code> on Deal nodes matches the most recently modified file&rsquo;s deal name.</li>
+      <li><strong>PostgreSQL entity store.</strong> Check PostgreSQL for deal and company rows. Verify relationship rows (TARGET_OF, ADVISOR_ON, etc.) have correct <code>source_file_ids</code> JSONB provenance. Verify <code>canonical_name</code> on deal rows matches the most recently modified file&rsquo;s deal name.</li>
       <li><strong>Near-duplicate detection.</strong> Upload two similar files with different names (e.g., &ldquo;Deal Summary v3 FINAL.docx&rdquo; and &ldquo;Deal Summary v3 FINAL (2).docx&rdquo;) to the same folder. Verify dedup detects them as duplicates: both should have the same <code>duplicate_group_id</code>, and only the most recent should have <code>is_canonical = true</code>.</li>
       <li><strong>Webhook sync.</strong> Upload a file to SharePoint. Verify it appears in the Azure AI Search index within 2 minutes. Check that the webhook receiver logged the notification and started the delta sync orchestrator.</li>
       <li><strong>Cosmos DB state.</strong> Verify <code>sync_tokens</code> contains a delta token for each monitored drive. Verify <code>webhook_subscriptions</code> contains an active subscription for each drive with a valid expiration.</li>
-      <li><strong>File update.</strong> Modify an already-indexed file in SharePoint. Verify old chunks are deleted and new chunks appear with updated content. Verify Neo4j edges are cleaned up and re-created.</li>
-      <li><strong>File deletion.</strong> Delete a file from SharePoint. Verify all its chunks are removed from Azure AI Search, its edges are cleaned from Neo4j, and any duplicate cluster membership is updated.</li>
+      <li><strong>File update.</strong> Modify an already-indexed file in SharePoint. Verify old chunks are deleted and new chunks appear with updated content. Verify PostgreSQL relationship rows are cleaned up and re-created.</li>
+      <li><strong>File deletion.</strong> Delete a file from SharePoint. Verify all its chunks are removed from Azure AI Search, its relationship rows are cleaned from PostgreSQL, and any duplicate cluster membership is updated.</li>
       <li><strong>Embedding provenance.</strong> Query chunks in Azure AI Search and verify <code>embedding_model</code>, <code>embedding_dimensions</code>, and <code>embedding_version</code> are all populated correctly.</li>
     </ol>
   </div>
@@ -968,9 +968,9 @@ tests/
         <td>Delta queries are inherently ordered by change sequence. The orchestrator processes the complete delta, not individual notifications</td>
       </tr>
       <tr>
-        <td>Neo4j + Search consistency</td>
-        <td>Entity data in Neo4j could disagree with denormalized fields in Search</td>
-        <td>Write Neo4j first. Queue retries in Cosmos DB with exponential backoff. Eventually consistent within retry window</td>
+        <td>PostgreSQL + Search consistency</td>
+        <td>Entity data in PostgreSQL could disagree with denormalized fields in Search</td>
+        <td>Write PostgreSQL first. Queue retries in Cosmos DB with exponential backoff. Eventually consistent within retry window</td>
       </tr>
       <tr>
         <td>Dedup false positives</td>

@@ -161,7 +161,7 @@
     <li>BSearch connects to Microsoft 365 via the <span class="jargon-box"><span class="jargon-term">Graph API</span></span> (Microsoft's official interface for accessing M365 data).</li>
     <li>Each document is parsed by a format-aware parser &mdash; Word, Excel, PowerPoint, and PDF each get specialized treatment to preserve structure (tables stay as tables, slides stay as slides).</li>
     <li>The content is split into searchable chunks, converted into mathematical representations called <span class="jargon-box"><span class="jargon-term">embeddings</span></span> (numbers that capture meaning), and stored in Azure AI Search.</li>
-    <li>Deal-level entities (company names, deal stages, financial metrics) are extracted and stored in a knowledge graph for richer query understanding.</li>
+    <li>Deal-level entities (company names, deal stages, financial metrics) are extracted and stored in the entity store for richer query understanding.</li>
     <li>For each deal with enough documents, Haiku 4.5 generates a deal summary &mdash; a pre-digested intelligence brief that makes pipeline-level queries possible.</li>
     <li>When files change, BSearch detects the update via webhooks (real-time notifications from Microsoft) and re-indexes only what changed &mdash; including refreshing the relevant deal summary.</li>
   </ol>
@@ -271,7 +271,7 @@ flowchart LR
         <li>Format-aware parsing (Word, Excel, PPT, PDF)</li>
         <li>Hybrid search (keyword + semantic)</li>
         <li>AI-synthesized answers via Claude Sonnet 4.6</li>
-        <li>Deal and entity extraction (knowledge graph)</li>
+        <li>Deal and entity extraction (entity store)</li>
         <li>Deal summary chunks (Haiku-generated intelligence per deal)</li>
         <li>Near-real-time sync via webhooks</li>
         <li>Web app with Azure AD authentication</li>
@@ -307,7 +307,7 @@ flowchart LR
     <tbody>
       <tr>
         <td><strong>Monthly ongoing</strong></td>
-        <td>~$395&ndash;510/month</td>
+        <td>~$343&ndash;471/month</td>
         <td>Search infrastructure, AI model usage (50&ndash;200 queries/day), database, hosting, and monitoring.</td>
       </tr>
       <tr>
